@@ -7,11 +7,13 @@ This allows the telephony layer to remain agnostic to specific providers.
 from stt.transcriber import Transcriber
 from tts.synthesizer import Synthesizer
 from orchestrator.manager import VoiceOrchestrator
-from logging import CallLogger
+from orchestrator.session_manager import SessionManager
+from agent_logging import CallLogger
 from typing import Optional
 
 
-def create_default_orchestrator(call_logger: Optional[CallLogger] = None) -> VoiceOrchestrator:
+def create_default_orchestrator(call_logger: Optional[CallLogger] = None, 
+                                session_manager: Optional[SessionManager] = None) -> VoiceOrchestrator:
     """
     Factory method to create a VoiceOrchestrator with default providers.
     
@@ -20,6 +22,7 @@ def create_default_orchestrator(call_logger: Optional[CallLogger] = None) -> Voi
     
     Args:
         call_logger: Optional CallLogger instance for call event tracking
+        session_manager: Optional shared SessionManager
         
     Returns:
         VoiceOrchestrator: Fully configured orchestrator with default providers
@@ -36,7 +39,8 @@ def create_default_orchestrator(call_logger: Optional[CallLogger] = None) -> Voi
     return VoiceOrchestrator(
         stt_provider=stt_provider,
         tts_provider=tts_provider,
-        call_logger=call_logger
+        call_logger=call_logger,
+        session_manager=session_manager
     )
 
 

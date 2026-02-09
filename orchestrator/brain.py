@@ -55,7 +55,7 @@ class Brain(LLMEngine):
 
             genai.configure(api_key=self.api_key)
             
-            self.model_name = 'gemini-2.5-flash'
+            self.model_name = 'gemini-2.0-flash'
             self.model = genai.GenerativeModel(
                 model_name=self.model_name,
                 system_instruction=self.system_instruction,
@@ -93,7 +93,7 @@ class Brain(LLMEngine):
                 logger.warning("RAG Decision: No relevant documents found. Falling back to LLM knowledge.")
                 context_text = "No specific documents found."
             
-            logger.debug(f"RAG Context for '{text}': {context_text[:200]}...")
+            logger.info(f"RAG Context for '{text}': {context_text[:200]}...")
 
             # 2. AUGMENT PROMPT
             rag_prompt = f"""[CONTEXT FROM DATABASE]\n{context_text}\n\n[USER QUESTION]\n{text}\n\nAnswer the user based on the context above."""
@@ -166,23 +166,23 @@ class Brain(LLMEngine):
             if full_ai_text.strip():
                 history.append({"role": "model", "parts": [full_ai_text.strip()]})
 
-        except ResourceExhausted as quota_error:
-            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
-            logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
-            yield "I am currently at capacity, please try again later."
+        except ResourceExhausted:
+            logger.warning("Gemini Quota Exceeded during streaming.")
+            yield "My AI brain has reached its free-tier limit. I will be back in a minute!"
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
-            logger.error(f"!!! Error in Brain: {e}")
 
             # Error Recovery: Rollback the 'user' message so we don't break the [User, Model] alternation
             if history and history[-1].get("role") == "user":
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
-                yield "I am currently overloaded with requests. Please try again in a few seconds."
+                yield "My brain is currently resting due to high traffic (Quota reached). Please try again soon."
+            elif "404" in str(e):
+                yield "I am currently undergoing a structural update. Check back in a few minutes!"
             else:
-                yield "I'm having trouble connecting to my knowledge base right now."
+                yield "I am having a moment of silence (Internal Error). Please try again later."
 
     async def generate_response(self, text, history=None):
         """
