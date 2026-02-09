@@ -9,6 +9,7 @@ from orchestrator.interfaces import STTProvider, TTSProvider
 from crm.client import CRMClient
 from contracts.policy import ResponsePolicyEngine
 from contracts.schemas import CallContext
+from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from logging import log_conversation_turn, CallLogger
 
@@ -36,6 +37,9 @@ class VoiceOrchestrator:
         # Policy Engine
         self.policy = ResponsePolicyEngine()
         
+        # State Machine
+        self.state = StateMachine(call_logger=call_logger)
+        
         # Audio Recorder
         self.recorder = None
 
@@ -48,6 +52,9 @@ class VoiceOrchestrator:
         # Define the callback: What happens when STT hears text?
         async def on_transcript(text):
             if not text.strip(): return
+            
+            # STATE: Transcribing
+            self.state.transition_to(CallState.TRANSCRIBING)
             
             logger.info(f"USER: {text}")
             log_conversation_turn(self.sid, "USER", text)
@@ -85,16 +92,24 @@ class VoiceOrchestrator:
                     self.sid = data['start']['streamSid']
                     logger.info(f"Telephony Stream Started: {self.sid}")
                     
+                    # STATE: Init
+                    self.state.transition_to(CallState.CALL_INIT)
+
                     # Start Recording
                     self.recorder = CallRecorder(self.sid)
                     self.recorder.start()
 
                     logger.debug(f"Telephony Stream Started: {self.sid}")
-                    # Initial Greeting - Just introduce, don't ask "how can I help" (user will speak naturally)
+                    # Initial Greeting
                     greeting = "Hello! I am CILA from GD College."
                     self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
 
                 elif data['event'] == 'media':
+                    # STATE: Listening (Implicitly, every time we get audio, we are listening)
+                    if self.state.get_state() != CallState.SPEAKING:
+                         # Don't flap state if speaking
+                         self.state.transition_to(CallState.LISTENING)
+
                     payload = base64.b64decode(data['media']['payload'])
                     if self.recorder:
                         self.recorder.write_chunk(payload)
@@ -122,6 +137,9 @@ class VoiceOrchestrator:
                     sentence = await audio_queue.get()
                     if sentence is None: break
                     
+                    # STATE: Speaking
+                    self.state.transition_to(CallState.SPEAKING)
+                    
                     tts_start_time = time.time()
                     first_chunk_received = False
                     
@@ -135,16 +153,24 @@ class VoiceOrchestrator:
                                                            meta={"text": sentence[:50]})
                         await self.send_audio_response(chunk)
                     audio_queue.task_done()
+                
+                # Back to Listening when done speaking
+                self.state.transition_to(CallState.LISTENING)
 
             worker_task = asyncio.create_task(tts_worker())
 
             # 0. Check for Escalation (Policy)
+            # STATE: Intent Eval
+            self.state.transition_to(CallState.INTENT_EVAL)
+            
             escalation = self.policy.check_escalation(text)
             if escalation:
+                self.state.transition_to(CallState.ESCALATION)
                 escalation_msg = "ID 402: Transferring you to a human agent now."
                 await audio_queue.put(escalation_msg)
                 full_ai_text = escalation_msg
             elif is_greeting:
+                self.state.transition_to(CallState.INTENT_EVAL) # Re-confirm state logic
                 await audio_queue.put(text)
                 full_ai_text = text
                 # Sync hardcoded greeting with chat history so LLM knows it has already introduced itself
@@ -155,25 +181,28 @@ class VoiceOrchestrator:
                 if self.call_logger:
                     self.call_logger.log_event("orchestrator", "llm_request_start")
                 
+                # We are technically in RAG/Eval state before generating
+                # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
+                
                 async for sentence in self.brain.generate_stream(text, self.chat_history):
                     # Policy Check per sentence
+                    self.state.transition_to(CallState.RESPONSE_VALIDATION)
+                    
                     context = CallContext(
                         session_id=self.sid or "unknown",
                         caller_number="unknown",
                         start_time=0.0
                     )
                     if self.policy.validate_response(context, sentence):
+                        if not full_ai_text: # First sentence logic
+                            llm_latency = int((time.time() - llm_start_time) * 1000)
+                            if self.call_logger:
+                                self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency)
+                        
                         full_ai_text += sentence + " "
                         await audio_queue.put(sentence)
                     else:
                         logger.warning(f"Policy Blocked Sentence: {sentence}")
-                    if not full_ai_text: # First sentence
-                        llm_latency = int((time.time() - llm_start_time) * 1000)
-                        if self.call_logger:
-                            self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency)
-                    
-                    full_ai_text += sentence + " "
-                    await audio_queue.put(sentence)
 
             await audio_queue.put(None)
             await worker_task
@@ -227,6 +256,12 @@ class VoiceOrchestrator:
     async def cleanup(self):
         """Final session archival and resource release."""
         logger.info(f"Cleanup started for session {self.sid}. CallLogger present: {self.call_logger is not None}")
+        
+        # STATE: Call End
+        try:
+            self.state.transition_to(CallState.CALL_END)
+        except:
+            pass # Swallow errors during cleanup
         
         # 1. Cancel background response task if still running
         if self.response_task and not self.response_task.done():
