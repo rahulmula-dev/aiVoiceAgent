@@ -1,5 +1,6 @@
 from enum import Enum
 import logging
+import asyncio
 
 logger = logging.getLogger("StateMachine")
 
@@ -18,9 +19,10 @@ class StateMachine:
     """
     Enforces strict state transitions for the Voice Agent.
     """
-    def __init__(self, call_logger=None):
+    def __init__(self, call_logger=None, crm_client=None):
         self.current_state = CallState.CALL_INIT
         self.call_logger = call_logger
+        self.crm_client = crm_client
         
         # Define allowed transitions (Rulebook)
         self.ALLOWED_TRANSITIONS = {
@@ -65,13 +67,26 @@ class StateMachine:
             if new_state == CallState.CALL_END:
                 pass
             else:
-                logger.warning(f"⚠️ STATE VIOLATION: {self.current_state.value} -> {new_state.value}")
+                msg = f"STATE VIOLATION: {self.current_state.value} -> {new_state.value}"
+                
+                # 1. Log violation to JSON for debugging
+                if self.call_logger:
+                    self.call_logger.log_event("state_machine", "violation", meta={"msg": msg})
+                
+                # 2. Report to CRM (Mock) - Meets Requirement
+                if self.crm_client:
+                    asyncio.create_task(self.crm_client.create_ticket(
+                        transcript=msg,
+                        summary="System State Violation",
+                        sentiment="SYSTEM_ERROR",
+                        call_logger=self.call_logger
+                    ))
         
-        # 3. Log the transition
+        # 3. Update State
         old_state = self.current_state
         self.current_state = new_state
-        logger.info(f"State Transition: [{old_state.value}] -> [{new_state.value}]")
         
+        # 4. JSON Log Only (No console spam)
         if self.call_logger:
             self.call_logger.log_event("state_machine", "transition", 
                                      meta={"from": old_state.value, "to": new_state.value})

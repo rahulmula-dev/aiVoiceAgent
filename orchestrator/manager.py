@@ -38,7 +38,7 @@ class VoiceOrchestrator:
         self.policy = ResponsePolicyEngine()
         
         # State Machine
-        self.state = StateMachine(call_logger=call_logger)
+        self.state = StateMachine(call_logger=call_logger, crm_client=self.crm)
         
         # Audio Recorder
         self.recorder = None
