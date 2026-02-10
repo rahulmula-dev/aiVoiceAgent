@@ -4,8 +4,10 @@ import logging
 import uvicorn
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, Request, Response
+from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
-from orchestrator.factory import create_default_orchestrator
+from orchestrator.factory import create_default_orchestrator, create_custom_orchestrator
+from orchestrator.mocks import MockSTT, MockTTS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -84,6 +86,34 @@ async def handle_media_stream(websocket: WebSocket):
         # which is called in manager.handle_audio_stream's own finally block.
         # This provides better guarantees for archival.
         pass
+
+@app.get("/chat-ui", response_class=HTMLResponse)
+async def chat_ui():
+    """
+    Serves a simple HTML interface for testing the agent via text.
+    """
+    with open("test_chat.html", "r") as f:
+        return f.read()
+
+@app.websocket("/chat")
+async def handle_chat_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint for Text-based testing (Mock STT/TTS).
+    """
+    await websocket.accept()
+    
+    # Use Mock Providers
+    manager = create_custom_orchestrator(
+        stt_provider_class=MockSTT,
+        tts_provider_class=MockTTS,
+        call_logger=None # Optional: Add logger if needed for debugging
+    )
+    
+    try:
+        await manager.handle_text_stream(websocket)
+    except Exception as e:
+        print(f"Chat Error: {e}")
+
 
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", 8000))

@@ -26,9 +26,9 @@ class StateMachine:
         
         # Define allowed transitions (Rulebook)
         self.ALLOWED_TRANSITIONS = {
-            CallState.CALL_INIT: [CallState.LISTENING, CallState.SPEAKING, CallState.CALL_END],
+            CallState.CALL_INIT: [CallState.LISTENING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL],
             
-            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION],
+            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION],
             
             CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION],
             

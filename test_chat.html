@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CILA AI Agent Tester (No-Cost)</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; display: flex; justify-content: center; height: 100vh; margin: 0; }
+        .chat-container { width: 400px; background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); display: flex; flex-direction: column; overflow: hidden; margin-top: 20px; margin-bottom: 20px;}
+        .header { background: #0078d4; color: white; padding: 15px; text-align: center; font-weight: bold; }
+        .messages { flex: 1; padding: 15px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+        .message { padding: 10px 15px; border-radius: 18px; max-width: 80%; line-height: 1.4; }
+        .message.ai { background: #e9e9eb; align-self: flex-start; border-bottom-left-radius: 4px; }
+        .message.user { background: #0078d4; color: white; align-self: flex-end; border-bottom-right-radius: 4px; }
+        .input-area { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 10px; background: #fafafa; }
+        input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 20px; outline: none; transition: border 0.2s; }
+        input:focus { border-color: #0078d4; }
+        button { padding: 10px 20px; background: #0078d4; color: white; border: none; border-radius: 20px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #006abc; }
+        .status { font-size: 12px; color: #666; text-align: center; padding: 5px; background: #eee; }
+    </style>
+</head>
+<body>
+
+<div class="chat-container">
+    <div class="header">CILA Voice Agent (Text Mode)</div>
+    <div id="status" class="status">Connecting...</div>
+    <div id="messages" class="messages"></div>
+    <div class="input-area">
+        <input type="text" id="userInput" placeholder="Type a message..." disabled>
+        <button id="sendBtn" disabled>Send</button>
+    </div>
+</div>
+
+<script>
+    const messagesDiv = document.getElementById('messages');
+    const input = document.getElementById('userInput');
+    const btn = document.getElementById('sendBtn');
+    const statusDiv = document.getElementById('status');
+    let ws;
+
+    function connect() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${window.location.host}/chat`);
+
+        ws.onopen = () => {
+            statusDiv.textContent = "Connected | Logic Active | Zero Cost";
+            statusDiv.style.color = "green";
+            input.disabled = false;
+            btn.disabled = false;
+            input.focus();
+        };
+
+        ws.onmessage = (event) => {
+            addMessage(event.data, 'ai');
+        };
+
+        ws.onclose = () => {
+            statusDiv.textContent = "Disconnected. Refresh to retry.";
+            statusDiv.style.color = "red";
+            input.disabled = true;
+            btn.disabled = true;
+        };
+        
+        ws.onerror = (e) => {
+            console.error(e);
+            statusDiv.textContent = "Connection Error";
+        }
+    }
+
+    function addMessage(text, sender) {
+        const msgDiv = document.createElement('div');
+        msgDiv.className = `message ${sender}`;
+        msgDiv.textContent = text;
+        messagesDiv.appendChild(msgDiv);
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function sendMessage() {
+        const text = input.value.trim();
+        if (text && ws && ws.readyState === WebSocket.OPEN) {
+            addMessage(text, 'user');
+            ws.send(text);
+            input.value = '';
+        }
+    }
+
+    btn.onclick = sendMessage;
+    input.onkeypress = (e) => {
+        if (e.key === 'Enter') sendMessage();
+    };
+
+    // Connect immediately
+    connect();
+</script>
+
+</body>
+</html>
