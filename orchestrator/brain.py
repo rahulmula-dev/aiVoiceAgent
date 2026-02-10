@@ -13,6 +13,10 @@ load_dotenv()
 
 from contracts.interfaces import LLMEngine
 
+# Pillar 2: Anti-Freeze Timeouts
+LLM_TIMEOUT = 12.0
+RAG_TIMEOUT = 5.0
+
 class Brain(LLMEngine):
     def __init__(self, call_logger=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -55,7 +59,7 @@ class Brain(LLMEngine):
 
             genai.configure(api_key=self.api_key)
             
-            self.model_name = 'gemini-2.0-flash'
+            self.model_name = 'gemini-2.5-flash'
             self.model = genai.GenerativeModel(
                 model_name=self.model_name,
                 system_instruction=self.system_instruction,
@@ -88,7 +92,15 @@ class Brain(LLMEngine):
 
         try:
             # 1. RETRIEVE KNOWLEDGE
-            context_text = await asyncio.to_thread(self.kb.search, text, self.call_logger)
+            try:
+                context_text = await asyncio.wait_for(
+                    asyncio.to_thread(self.kb.search, text, self.call_logger),
+                    timeout=RAG_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
+                context_text = "No specific documents found due to timeout."
+            
             if not context_text: 
                 logger.warning("RAG Decision: No relevant documents found. Falling back to LLM knowledge.")
                 context_text = "No specific documents found."
@@ -103,10 +115,17 @@ class Brain(LLMEngine):
 
             # 4. STREAM GENERATE (with graceful quota handling)
             try:
-                response_stream = await self.model.generate_content_async(
-                    contents=history,
-                    stream=True
+                response_stream = await asyncio.wait_for(
+                    self.model.generate_content_async(
+                        contents=history,
+                        stream=True
+                    ),
+                    timeout=LLM_TIMEOUT
                 )
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
+                yield "I am taking too long to think. Please ask again."
+                return
             except ResourceExhausted as quota_error:
                 # GRACEFUL HANDLING: Log single line instead of full traceback
                 logger.warning("Gemini Quota Exceeded (429). Triggering fallback.")

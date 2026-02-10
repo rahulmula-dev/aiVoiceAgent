@@ -127,7 +127,18 @@ class VoiceOrchestrator:
                     logger.debug("Telephony Stream Stopped before start event?")
                     break
         except Exception as e:
-            logger.error(f"Orchestrator Error: {e}")
+            logger.error(f"CRITICAL ORCHESTRATOR CRASH: {e}", exc_info=True)
+            if self.session:
+                self.session.termination_reason = "system_failure"
+            
+            # Attempt to play goodbye message if socket still open
+            try:
+                if self.websocket:
+                    goodbye_text = "I am having technical trouble. Please wait while I reconnect you or try calling back later. Goodbye."
+                    async for chunk in self.synthesizer.speak(goodbye_text):
+                        await self.send_audio_response(chunk)
+            except:
+                pass
         finally:
             await self.cleanup()
 
@@ -280,11 +291,21 @@ class VoiceOrchestrator:
             if self.session and self.session.conversation_history:
                 logger.debug("Cleanup: Logging full session to CRM")
                 history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
+                
+                # Pillar 3: Safety Net - Check for system failure
+                reason = self.session.termination_reason
+                priority = "normal"
+                if reason == "system_failure":
+                    priority = "high"
+                    logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
+
                 await self.crm.create_ticket(
                     transcript=history_text,
-                    summary="Full Call Session Log (V2 Session Manager)",
+                    summary=f"Call Session Log ({reason})",
                     sentiment="Final",
-                    call_logger=self.call_logger
+                    call_logger=self.call_logger,
+                    reason=reason,
+                    priority=priority
                 )
                 
             if self.recorder:

@@ -35,6 +35,9 @@ class Session(BaseModel):
     # Barge-In Snapshot (Pillar 1)
     interruption_snapshot: Optional[Dict[str, Any]] = None
 
+    # Resilience Tracking (Pillar 2 & 3)
+    termination_reason: str = "normal"
+
     class Config:
         arbitrary_types_allowed = True
 
