@@ -262,8 +262,8 @@ class VoiceOrchestrator:
                 # We are technically in RAG/Eval state before generating
                 # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
                 
-                async for sentence in self.brain.generate_stream(text, self.chat_history):
-                    # Policy Check per sentence
+                async for sentence, metadata in self.brain.generate_stream(text, self.chat_history):
+                    # Policy Check per sentence (Story S1-4)
                     self.state.transition_to(CallState.RESPONSE_VALIDATION)
                     
                     context = CallContext(
@@ -271,7 +271,19 @@ class VoiceOrchestrator:
                         caller_number="unknown",
                         start_time=0.0
                     )
-                    if self.policy.validate_response(context, sentence):
+                    
+                    is_safe = self.policy.validate_response(context, sentence)
+                    
+                    # Log Brain Performance
+                    if self.call_logger:
+                         self.call_logger.log_event("brain", "chunk_generated", meta={
+                             "text": sentence[:20], 
+                             "rag_score": metadata.get("rag_score", 0),
+                             "grounding": metadata.get("has_grounding", False),
+                             "validation_pass": is_safe
+                         })
+
+                    if is_safe:
                         if not full_ai_text: # First sentence logic
                             llm_latency = int((time.time() - llm_start_time) * 1000)
                             if self.call_logger:
@@ -280,10 +292,36 @@ class VoiceOrchestrator:
                         full_ai_text += sentence + " "
                         await audio_queue.put(sentence)
                     else:
-                        logger.warning(f"Policy Blocked Sentence: {sentence}")
+                        logger.warning(f"Response Validation Failed: '{sentence}'")
+                        
+                        # FAILURE ACTION: End Call (Story S1-4)
+                        # We stop the stream, speak specific failure message, and hang up.
+                        failure_msg = "I can only respond in English and provide factual information."
+                        await audio_queue.put(failure_msg)
+                        full_ai_text += failure_msg
+                        
+                        asyncio.create_task(self.crm.create_ticket(
+                            transcript=f"Blocked Response: {sentence}\nUser Query: {text}",
+                            summary="Quality Validation Failure (Speculation/Hallucination)",
+                            sentiment="QUALITY_FAILURE",
+                            call_logger=self.call_logger
+                        ))
+                        
+                        # Signal loop termination
+                        break
 
             await audio_queue.put(None)
             await worker_task
+            
+            # If we broke out due to validation failure, trigger Call End
+            if "I can only respond in English" in full_ai_text:
+                 self.state.transition_to(CallState.CALL_END)
+                 # Close connection after speaking is done
+                 # In a real scenario, we might wait for the 'speaking' event to finish, 
+                 # but for now we let the worker finish the failure message and then close.
+                 if self.websocket:
+                     await asyncio.sleep(3) # Give time to speak
+                     await self.websocket.close()
             
             logger.info(f"AI: {full_ai_text.strip()}")
             log_conversation_turn(self.sid, "AI", full_ai_text.strip())
