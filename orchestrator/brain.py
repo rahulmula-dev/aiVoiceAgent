@@ -13,6 +13,10 @@ load_dotenv()
 
 from contracts.interfaces import LLMEngine
 
+# Pillar 2: Anti-Freeze Timeouts
+LLM_TIMEOUT = 12.0
+RAG_TIMEOUT = 5.0
+
 class Brain(LLMEngine):
     def __init__(self, call_logger=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -96,12 +100,22 @@ class Brain(LLMEngine):
             rag_score = 0.8 # Dummy score if KB doesn't return one yet. In real app, KB should return score.
             
             if not context_text or context_text == "No specific documents found.": 
+            try:
+                context_text = await asyncio.wait_for(
+                    asyncio.to_thread(self.kb.search, text, self.call_logger),
+                    timeout=RAG_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
+                context_text = "No specific documents found due to timeout."
+            
+            if not context_text: 
                 logger.warning("RAG Decision: No relevant documents found. Falling back to LLM knowledge.")
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
             
-            logger.debug(f"RAG Context for '{text}': {context_text[:200]}...")
+            logger.info(f"RAG Context for '{text}': {context_text[:200]}...")
 
             # Metadata for Policy Engine
             sent_metadata = {
@@ -117,10 +131,17 @@ class Brain(LLMEngine):
 
             # 4. STREAM GENERATE (with graceful quota handling)
             try:
-                response_stream = await self.model.generate_content_async(
-                    contents=history,
-                    stream=True
+                response_stream = await asyncio.wait_for(
+                    self.model.generate_content_async(
+                        contents=history,
+                        stream=True
+                    ),
+                    timeout=LLM_TIMEOUT
                 )
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
+                yield "I am taking too long to think. Please ask again."
+                return
             except ResourceExhausted as quota_error:
                 # GRACEFUL HANDLING: Log single line instead of full traceback
                 logger.warning("Gemini Quota Exceeded (429). Triggering fallback.")
@@ -186,10 +207,12 @@ class Brain(LLMEngine):
             # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
             logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
             yield ("I am currently at capacity, please try again later.", {"error": True})
+        except ResourceExhausted:
+            logger.warning("Gemini Quota Exceeded during streaming.")
+            yield "My AI brain has reached its free-tier limit. I will be back in a minute!"
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
-            logger.error(f"!!! Error in Brain: {e}")
 
             # Error Recovery: Rollback the 'user' message so we don't break the [User, Model] alternation
             if history and history[-1].get("role") == "user":
@@ -199,6 +222,11 @@ class Brain(LLMEngine):
                 yield ("I am currently overloaded with requests. Please try again in a few seconds.", {"error": True})
             else:
                 yield ("I'm having trouble connecting to my knowledge base right now.", {"error": True})
+                yield "My brain is currently resting due to high traffic (Quota reached). Please try again soon."
+            elif "404" in str(e):
+                yield "I am currently undergoing a structural update. Check back in a few minutes!"
+            else:
+                yield "I am having a moment of silence (Internal Error). Please try again later."
 
     async def generate_response(self, text, history=None):
         """

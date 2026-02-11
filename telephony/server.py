@@ -8,13 +8,23 @@ from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
 from orchestrator.factory import create_default_orchestrator, create_custom_orchestrator
 from orchestrator.mocks import MockSTT, MockTTS
+from orchestrator.factory import create_default_orchestrator
+from orchestrator.session_manager import default_session_manager
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from logging import bind_call_context, CallLogger
+# Configure logging
+logger = logging.getLogger("Server")
+
+from agent_logging import bind_call_context, CallLogger
 
 app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    """Start-time background workers."""
+    default_session_manager.start_collector()
 
 @app.get("/")
 async def root():
@@ -35,7 +45,7 @@ async def handle_incoming_call(request: Request):
         call_sid = "UnknownSID"
         from_number = "Unknown"
     
-    logging.getLogger("Server").debug(f"DEBUG: Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
+    logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
     
     # Determine public ngrok URL (from environment variable)
     public_url = os.getenv("NGROK_URL")
@@ -53,39 +63,43 @@ async def handle_media_stream(websocket: WebSocket):
     Handles the WebSocket lifecycle.
     Delegates all intelligence and audio logic to the VoiceOrchestrator.
     """
+    # 1. EARLY INITIALIZATION (Forensic Pillar 1)
+    # Generate ID immediately before anything else
     import uuid
-    
-    await websocket.accept()
-    
-    # Generate a unique short session ID
     session_id = str(uuid.uuid4())[:8]
     
-    # Try to extract from query params first (passed from TwiML)
+    # Try to extract query params (best effort)
     query_params = websocket.query_params
+    call_sid = query_params.get("sid", "unknown_call")
     from_number = query_params.get("from", "Unknown")
 
-    # BIND CONTEXT TO LOGGER (using contextvars)
-    bind_call_context(session_id, from_number)
-    
-    # Initialize the Black-Box Call Logger
+    # Initialize Logger - PILLAR 3 will now create the Ghost File on disk immediately
     call_logger = CallLogger(call_id=session_id, caller_number=from_number)
-    call_logger.log_event("telephony", "call_connected")
-    
-    # Use factory to create orchestrator (decoupled from provider implementations)
-    manager = create_default_orchestrator(call_logger=call_logger)
-    
+    bind_call_context(session_id, from_number)
+    call_logger.log_event("telephony", "call_connected", meta={"call_sid": call_sid})
+
     try:
+        await websocket.accept()
+        
+        # Use factory with shared session manager
+        manager = create_default_orchestrator(call_logger=call_logger, session_manager=default_session_manager)
+        
         await manager.handle_audio_stream(websocket)
         call_logger.log_event("telephony", "call_ended", meta={"reason": "websocket_closed"})
+        
+    except asyncio.CancelledError:
+        logger.warning(f"WebSocket {session_id} cancelled (likely disconnection).")
+        call_logger.reason = "user_hangup"
     except Exception as e:
-        status = "failed"
         call_logger.log_event("telephony", "call_failed", meta={"error": str(e)})
-        raise
+        logger.error(f"Media stream error for {session_id}: {e}", exc_info=True)
+        call_logger.reason = "error"
     finally:
-        # Final cleanup is now handled inside manager.cleanup()
-        # which is called in manager.handle_audio_stream's own finally block.
-        # This provides better guarantees for archival.
-        pass
+        # 2. EMERGENCY FLUSH (Forensic Pillar 2) - Mandatory execution
+        # Regardless of how we exit (crash, cancel, success), save the audit trace.
+        call_logger.generate_summary_line()
+        call_logger.save_log()
+        logger.info(f"Forensic Audit trace finalized for {session_id}")
 
 @app.get("/chat-ui", response_class=HTMLResponse)
 async def chat_ui():

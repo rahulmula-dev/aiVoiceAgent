@@ -11,7 +11,8 @@ from contracts.policy import ResponsePolicyEngine
 from contracts.schemas import CallContext
 from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
-from logging import log_conversation_turn, CallLogger
+from agent_logging import log_conversation_turn, CallLogger
+from .session_manager import SessionManager, SessionState
 
 logger = std_logging.getLogger("Orchestrator")
 
@@ -20,18 +21,20 @@ class VoiceOrchestrator:
     The Mediator: Connects STT, LLM, TTS, and CRM.
     Maintains ultra-low latency via asynchronous streaming and parallel workers.
     """
-    def __init__(self, stt_provider: STTProvider, tts_provider: TTSProvider, call_logger: CallLogger = None):
+    def __init__(self, stt_provider: STTProvider, tts_provider: TTSProvider, 
+                 call_logger: CallLogger = None, session_manager: SessionManager = None):
         self.brain = Brain(call_logger=call_logger)
         self.synthesizer = tts_provider
         self.crm = CRMClient()
         self.transcriber = stt_provider
         self.call_logger = call_logger
-        self.sid = None
-        self.websocket = None
         
-        # Session State
-        self.session_transcript = []
-        self.chat_history = self.brain.start_new_session()
+        from .session_manager import default_session_manager
+        self.session_manager = session_manager or default_session_manager
+        # Note: Collector should be started by the server/app level, not per call.
+        
+        self.session = None
+        self.websocket = None
         self.response_task = None
         
         # Policy Engine
@@ -57,6 +60,14 @@ class VoiceOrchestrator:
             self.state.transition_to(CallState.TRANSCRIBING)
         else:
             self.state.transition_to(CallState.LISTENING) # Text chat is instant
+        # Define the callback: What happens when STT hears text?
+        async def on_transcript(text):
+            if not text.strip() or not self.session: return
+            
+            logger.info(f"USER: {text}")
+            log_conversation_turn(self.session.session_id, "USER", text)
+            self.session.conversation_history.append({"role": "user", "parts": [text]})
+            self.session.touch()
             
         logger.info(f"USER: {text}")
         log_conversation_turn(self.sid, "USER", text)
@@ -97,6 +108,18 @@ class VoiceOrchestrator:
 
         # 3. Start Parallel Response Generation (Normal Flow)
         self.response_task = asyncio.create_task(self.generate_and_speak(text))
+            # 1. Barge-In Cancellation
+            if self.response_task and not self.response_task.done():
+                logger.debug(">>> BARGE-IN: Interrupting current AI response...")
+                self.session_manager.update_state(self.session.session_id, SessionState.INTERRUPTED)
+                if self.call_logger:
+                    self.call_logger.log_event("orchestrator", "user_interruption")
+                self.response_task.cancel()
+                await self.send_clear_buffer()
+
+            # 2. Start Parallel Response Generation
+            self.session_manager.update_state(self.session.session_id, SessionState.THINKING)
+            self.response_task = asyncio.create_task(self.generate_and_speak(text))
 
     async def speak_refusal(self, text):
         """
@@ -141,8 +164,9 @@ class VoiceOrchestrator:
                 data = json.loads(message)
 
                 if data['event'] == 'start':
-                    self.sid = data['start']['streamSid']
-                    logger.info(f"Telephony Stream Started: {self.sid}")
+                    # Extract IDs
+                    sid = data['start']['streamSid']
+                    call_sid = data['start'].get('callSid', sid) # Pillar 1: Identity
                     
                     # STATE: Init
                     self.state.transition_to(CallState.CALL_INIT)
@@ -166,12 +190,53 @@ class VoiceOrchestrator:
                     if self.recorder:
                         self.recorder.write_chunk(payload)
                     await self.transcriber.send_audio(payload)
+                    # 🟢 ENTER SESSION CONTEXT (Pillar 3)
+                    async with self.session_manager.session_scope(sid, call_sid) as session:
+                        self.session = session
+                        logger.info(f"Telephony Stream Started: {self.session.session_id}")
+                        
+                        # Start Recording
+                        self.recorder = CallRecorder(self.session.session_id)
+                        self.recorder.start()
+
+                        # Initial Greeting
+                        self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
+                        greeting = "Hello! I am CILA from GD College."
+                        self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
+                        
+                        # Sub-loop to handle subsequent media packets while session is active
+                        while True:
+                            inner_msg = await websocket.receive_text()
+                            inner_data = json.loads(inner_msg)
+                            
+                            if inner_data['event'] == 'media':
+                                payload = base64.b64decode(inner_data['media']['payload'])
+                                if self.recorder:
+                                    self.recorder.write_chunk(payload)
+                                await self.transcriber.send_audio(payload)
+                                self.session.touch() # Pillar 3: Life signal
+                            
+                            elif inner_data['event'] == 'stop':
+                                logger.debug("Telephony Stream Stopped.")
+                                break
+                        break # Exit the outer loop after the stop event
 
                 elif data['event'] == 'stop':
-                    logger.debug("Telephony Stream Stopped.")
+                    logger.debug("Telephony Stream Stopped before start event?")
                     break
         except Exception as e:
-            logger.error(f"Orchestrator Error: {e}")
+            logger.error(f"CRITICAL ORCHESTRATOR CRASH: {e}", exc_info=True)
+            if self.session:
+                self.session.termination_reason = "system_failure"
+            
+            # Attempt to play goodbye message if socket still open
+            try:
+                if self.websocket:
+                    goodbye_text = "I am having technical trouble. Please wait while I reconnect you or try calling back later. Goodbye."
+                    async for chunk in self.synthesizer.speak(goodbye_text):
+                        await self.send_audio_response(chunk)
+            except:
+                pass
         finally:
             await self.cleanup()
 
@@ -205,6 +270,8 @@ class VoiceOrchestrator:
         """
         Streams AI thoughts into a parallel TTS queue for zero-lag audio.
         """
+        if not self.session: return
+        
         try:
             full_ai_text = ""
             audio_queue = asyncio.Queue()
@@ -251,8 +318,8 @@ class VoiceOrchestrator:
                 self.state.transition_to(CallState.INTENT_EVAL) # Re-confirm state logic
                 await audio_queue.put(text)
                 full_ai_text = text
-                # Sync hardcoded greeting with chat history so LLM knows it has already introduced itself
-                self.chat_history.append({"role": "model", "parts": [text]})
+                # Sync hardcoded greeting with session history
+                self.session.conversation_history.append({"role": "model", "parts": [text]})
             else:
                 # Track LLM Latency
                 llm_start_time = time.time()
@@ -266,10 +333,15 @@ class VoiceOrchestrator:
                     # Policy Check per sentence (Story S1-4)
                     self.state.transition_to(CallState.RESPONSE_VALIDATION)
                     
+                async for sentence in self.brain.generate_stream(text, self.session.conversation_history):
+                    self.session.touch()
+                    self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
+                    
+                    # Policy Check per sentence
                     context = CallContext(
-                        session_id=self.sid or "unknown",
+                        session_id=self.session.session_id,
                         caller_number="unknown",
-                        start_time=0.0
+                        start_time=self.session.start_time.timestamp()
                     )
                     
                     is_safe = self.policy.validate_response(context, sentence)
@@ -309,6 +381,12 @@ class VoiceOrchestrator:
                         
                         # Signal loop termination
                         break
+                        logger.warning(f"Policy Blocked Sentence: {sentence}")
+                    
+                    if not full_ai_text: # First sentence
+                        llm_latency = int((time.time() - llm_start_time) * 1000)
+                        if self.call_logger:
+                            self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency)
 
             await audio_queue.put(None)
             await worker_task
@@ -324,8 +402,7 @@ class VoiceOrchestrator:
                      await self.websocket.close()
             
             logger.info(f"AI: {full_ai_text.strip()}")
-            log_conversation_turn(self.sid, "AI", full_ai_text.strip())
-            self.session_transcript.append(f"AI: {full_ai_text.strip()}")
+            log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
             
             # CRM Background Task (Don't block audio)
             if not is_greeting:
@@ -335,9 +412,14 @@ class VoiceOrchestrator:
                     sentiment="Neutral",
                     call_logger=self.call_logger
                 ))
+            
+            self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
 
         except asyncio.CancelledError:
             logger.info("AI thought-task cancelled by user interruption.")
+            # Pillar 1: Identity snapshot 
+            if self.session:
+                self.session.interruption_snapshot = {"text": text, "timestamp": time.time()}
             if 'worker_task' in locals(): worker_task.cancel()
         except Exception as e:
             logger.error(f"Response Error: {e}")
@@ -362,6 +444,14 @@ class VoiceOrchestrator:
                     # Text Mode (Chat) - chunk is bytes(text)
                     text_chunk = chunk.decode('utf-8')
                     await self.websocket.send_text(text_chunk)
+        if self.websocket and self.session:
+            try:
+                b64_audio = base64.b64encode(chunk).decode('utf-8')
+                await self.websocket.send_text(json.dumps({
+                    "event": "media",
+                    "streamSid": self.session.session_id,
+                    "media": {"payload": b64_audio}
+                }))
             except Exception as e:
                 logger.debug(f"Could not send response chunk: {e}")
 
@@ -371,18 +461,19 @@ class VoiceOrchestrator:
         await self._send_response_chunk(chunk)
 
     async def send_clear_buffer(self):
-        if self.websocket and self.sid:
+        if self.websocket and self.session:
             try:
                 await self.websocket.send_text(json.dumps({
                     "event": "clear",
-                    "streamSid": self.sid
+                    "streamSid": self.session.session_id
                 }))
             except:
                 pass
 
     async def cleanup(self):
-        """Final session archival and resource release."""
-        logger.info(f"Cleanup started for session {self.sid}. CallLogger present: {self.call_logger is not None}")
+        """Final session archival and resource release (Pillar 3)."""
+        sid = self.session.session_id if self.session else "unknown"
+        logger.info(f"Cleanup started for session {sid}.")
         
         # STATE: Call End
         try:
@@ -400,51 +491,61 @@ class VoiceOrchestrator:
                 pass
             except Exception as e:
                 logger.error(f"Error during response task cancellation: {e}")
+        # 🟢 CRITICAL: Wrap in try/except (Pillar 3)
+        try:
+            # 1. Cancel background response task
+            if self.response_task and not self.response_task.done():
+                logger.debug("Cleanup: Cancelling background response task")
+                self.response_task.cancel()
+                try:
+                    await self.response_task
+                except asyncio.CancelledError:
+                    pass
 
-        if self.transcriber: 
-            logger.debug("Cleanup: Closing Transcriber")
-            await self.transcriber.close()
+            if self.transcriber: 
+                logger.debug("Cleanup: Closing Transcriber")
+                await self.transcriber.close()
+                
+            logger.debug("Cleanup: Closing Synthesizer")
+            await self.synthesizer.close()
             
-        logger.debug("Cleanup: Closing Synthesizer")
-        await self.synthesizer.close()
-        
-        if self.session_transcript:
-            logger.debug("Cleanup: Logging session to CRM")
-            await self.crm.create_ticket(
-                transcript="\n".join(self.session_transcript),
-                summary="Full Call Session Log",
-                sentiment="Final",
-                call_logger=self.call_logger
-            )
-            
-        if self.recorder:
-            logger.info(">>> CLEANUP: Saving Recording...")
-            self.recorder.close()
-            
-        logger.info("Orchestrator session finalized.")
-        logger.info(">>> CLEANUP: Done.")
+            if self.session and self.session.conversation_history:
+                logger.debug("Cleanup: Logging full session to CRM")
+                history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
+                
+                # Pillar 3: Safety Net - Check for system failure
+                reason = self.session.termination_reason
+                priority = "normal"
+                if reason == "system_failure":
+                    priority = "high"
+                    logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
 
-        # 2. FINAL LOG ARCHIVAL (Moved here for guaranteed execution)
-        # CRITICAL: Wrap in broad try/except to prevent logging errors from crashing cleanup
-        if self.call_logger:
-            try:
-                # CHANGED: debug -> info
-                logger.info(f"Cleanup: Generating final summary for {self.sid}")
+                await self.crm.create_ticket(
+                    transcript=history_text,
+                    summary=f"Call Session Log ({reason})",
+                    sentiment="Final",
+                    call_logger=self.call_logger,
+                    reason=reason,
+                    priority=priority
+                )
+                
+            if self.recorder:
+                logger.info(">>> CLEANUP: Saving Recording...")
+                self.recorder.close()
+                
+            # 2. End and remove session from manager (Pillar 2)
+            if self.session:
+                self.session_manager.end_session(sid)
+                
+            # 3. Final Log Archival
+            if self.call_logger:
+                logger.info(f"Cleanup: Generating final summary for {sid}")
                 self.call_logger.generate_summary_line(status="completed", reason="user_hangup")
                 self.call_logger.save_log(status="completed")
-                
-                # CHANGED: already info
-                logger.info(f"Cleanup: Successfully saved call log for {self.sid}")
-                
-            except Exception as e:
-                # KEEP THIS: Writing to stderr is valid when the logger itself might be broken.
-                import sys
-                error_msg = f"CRITICAL: Failed to save call log for {self.sid}: {type(e).__name__}: {str(e)}"
-                print(error_msg, file=sys.stderr) 
-                
-                # But also try to log it if the handler is still alive
-                logger.error(f"Failed to finalize call logs in cleanup: {e}", exc_info=True)
-        else:
-            logger.warning(f"call_logger is None during cleanup for session {self.sid}")
-
-        logger.debug("Orchestrator session finalized.")
+            
+        except Exception as e:
+            # Fallback to sys.stderr (Pillar 3)
+            import sys
+            print(f"CRITICAL CLEANUP ERROR for {sid}: {e}", file=sys.stderr)
+        finally:
+            logger.info(f"Orchestrator session {sid} finalized.")
