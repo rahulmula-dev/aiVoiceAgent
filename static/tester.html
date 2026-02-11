@@ -111,6 +111,29 @@
             background: #00e676;
             box-shadow: 0 0 10px #00e676;
         }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .meter-container {
+            flex-grow: 1;
+            height: 10px;
+            background: #333;
+            border-radius: 5px;
+            overflow: hidden;
+            display: none;
+        }
+
+        #volumeMeter {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #FFC107, #F44336);
+            transition: width 0.1s ease;
+        }
     </style>
 </head>
 
@@ -122,6 +145,9 @@
         <div class="controls">
             <button id="startBtn" onclick="startCall()">Start Call</button>
             <button id="stopBtn" onclick="stopCall()" disabled>End Call</button>
+            <div class="meter-container" id="meterContainer">
+                <div id="volumeMeter"></div>
+            </div>
         </div>
 
         <div class="log" id="log"></div>
@@ -154,6 +180,8 @@
             STATUS_DIV.innerHTML = `<span class="indicator ${connected ? 'active' : ''}" id="wsIndicator"></span>${connected ? 'Connected (Linear16 16kHz)' : 'Disconnected'}`;
             START_BTN.disabled = connected;
             STOP_BTN.disabled = !connected;
+            const meter = document.getElementById('meterContainer');
+            if (meter) meter.style.display = connected ? 'flex' : 'none';
         }
 
         async function startCall() {
@@ -238,21 +266,31 @@
 
         function processMicrophone() {
             const source = audioContext.createMediaStreamSource(mediaStream);
-            // BufferSize 2048 or 4096 gives a reasonable chunks size
             scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
 
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioContext.destination);
-
             scriptProcessor.onaudioprocess = (e) => {
                 if (!isConnected) return;
 
                 const inputData = e.inputBuffer.getChannelData(0);
-                // Downsample/Convert to Int16 PCM
+
+                // Visualizer
+                let sum = 0;
+                for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+                const volume = Math.sqrt(sum / inputData.length);
+                const meter = document.getElementById('volumeMeter');
+                if (meter) meter.style.width = Math.min(100, volume * 400) + "%";
+
                 const pcmData = f32toPCM16(inputData);
 
-                // Send as base64 (mimic Twilio)
-                const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+                // Robust Base64 conversion
+                const bytes = new Uint8Array(pcmData.buffer);
+                let binary = '';
+                for (let i = 0; i < bytes.byteLength; i++) {
+                    binary += String.fromCharCode(bytes[i]);
+                }
+                const base64Audio = btoa(binary);
 
                 ws.send(JSON.stringify({
                     event: "media",
@@ -273,7 +311,6 @@
             source.buffer = buffer;
             source.connect(audioContext.destination);
 
-            // Schedule seamless playback
             if (nextPlayTime < audioContext.currentTime) {
                 nextPlayTime = audioContext.currentTime;
             }
@@ -281,7 +318,6 @@
             nextPlayTime += buffer.duration;
         }
 
-        // Convert Float32 [-1, 1] to Int16 PCM
         function f32toPCM16(input) {
             const output = new Int16Array(input.length);
             for (let i = 0; i < input.length; i++) {
@@ -291,7 +327,6 @@
             return output;
         }
 
-        // Convert Raw Binary String (PCM16) to Float32
         function pcm16toF32(binaryString) {
             const len = binaryString.length / 2;
             const floats = new Float32Array(len);

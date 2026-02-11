@@ -48,30 +48,95 @@ class VoiceOrchestrator:
         
         # Mode: 'audio' (default) or 'text'
         self.mode = "audio"
+        self.sid = "unknown" # Default session ID before call starts
+        self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
+        self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
+        self.user_has_spoken = False  # Track if user has spoken at least once
 
-    async def _on_transcript(self, text):
+    async def _on_transcript(self, text, confidence=1.0):
         """
         Callback for when user input is received (either via STT or text chat).
+        Args:
+            text: Transcribed text from user
+            confidence: Deepgram confidence score (0.0-1.0), defaults to 1.0 for text chat
         """
-        if not text.strip(): return
+        # DEBUG: Log every callback invocation
+        logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}")
+        
+        # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
+        if not text.strip():
+            if confidence == 0.0:
+                # We trigger a refusal for SUSTAINED empty frames (likely non-English speech filtered by Deepgram)
+                # Threshold increased to 6 to avoid false positives during natural English thinking pauses.
+                if self.state.current_state == CallState.LISTENING and self.user_has_spoken:
+                    self.consecutive_empty_frames += 1
+                    logger.debug(f"[EMPTY FRAME] Count: {self.consecutive_empty_frames} (Pausing or filtered noise)")
+                    
+                    # Threshold of 6 = approx 4.5 seconds of sustained non-English filtering
+                    if self.consecutive_empty_frames >= 6:
+                        # RATE LIMITING: Only refuse once every 10 seconds
+                        import time
+                        current_time = time.time()
+                        if current_time - self.last_refusal_time < 10:
+                            return
+                        
+                        logger.warning(f"[NON-ENGLISH DETECTED] {self.consecutive_empty_frames} consecutive empty frames - refusing")
+                        
+                        # LOGGING: Record the detection and refusal in the call logs
+                        if self.call_logger and self.session:
+                            self.call_logger.log_event("stt", "user_transcript_final", 
+                                                     meta={"text": "[NON-ENGLISH SPEECH DETECTED] (Filtered by Deepgram)"})
+                            self.session.conversation_history.append({"role": "user", "parts": ["[NON-ENGLISH SPEECH DETECTED]"]})
+
+                        self.last_refusal_time = current_time
+                        self.consecutive_empty_frames = 0
+                        
+                        refusal_text = "I am currently designed to support English only. Please contact our admission office for assistance."
+                        
+                        if self.call_logger:
+                             self.call_logger.log_event("brain", "chunk_generated", 
+                                                      meta={"text": refusal_text, "rag_score": 0.0, "grounding": False, "validation_pass": True})
+                        
+                        self.response_task = asyncio.create_task(self.speak_refusal(refusal_text))
+                return
+            else:
+                # Empty with higher confidence = Background silence, reset counter
+                if self.consecutive_empty_frames > 0:
+                    logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames})")
+                    self.consecutive_empty_frames = 0
+                logger.debug(f"[FILTER] Empty transcript (confidence: {confidence:.2f}) - background silence")
+                return
+        else:
+            # Mark that user has spoken (enable non-English detection)
+            if not self.user_has_spoken:
+                logger.debug("[FIRST SPEECH] User has spoken - enabling non-English detection")
+                self.user_has_spoken = True
+            
+            # Non-empty transcript received, reset counter
+            if self.consecutive_empty_frames > 0:
+                logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames}) - received text")
+                self.consecutive_empty_frames = 0
+        
+        # LOW-QUALITY DETECTION: Catch mumbled/garbled non-English input
+        # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
+        if confidence < 0.4:
+            logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
+            self.response_task = asyncio.create_task(
+                self.speak_refusal("I didn't quite catch that. Could you please repeat?")
+            )
+            return
         
         # STATE: Transcribing / Input Received
         if self.mode == "audio":
             self.state.transition_to(CallState.TRANSCRIBING)
         else:
             self.state.transition_to(CallState.LISTENING) # Text chat is instant
-        # Define the callback: What happens when STT hears text?
-        async def on_transcript(text):
-            if not text.strip() or not self.session: return
             
-            logger.info(f"USER: {text}")
+        logger.info(f"USER: {text}")
+        if self.session:
             log_conversation_turn(self.session.session_id, "USER", text)
             self.session.conversation_history.append({"role": "user", "parts": [text]})
             self.session.touch()
-            
-        logger.info(f"USER: {text}")
-        log_conversation_turn(self.sid, "USER", text)
-        self.session_transcript.append(f"User: {text}")
         
         if self.call_logger:
             self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text})
@@ -79,7 +144,6 @@ class VoiceOrchestrator:
         if self.response_task and not self.response_task.done():
             logger.debug(">>> BARGE-IN: Interrupting current AI response...")
             if self.call_logger:
-                self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text})
                 # Checkpoint: Save logs immediately to prevent data loss
                 self.call_logger.save_log(status="in-progress")
                 self.call_logger.log_event("orchestrator", "user_interruption")
@@ -105,51 +169,50 @@ class VoiceOrchestrator:
             ))
             
             # C. Speak Refusal directly (Bypass Brain)
-            # We wrap this in a task just like generate_and_speak to maintain consistency
             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text))
             return 
 
         # 3. Start Parallel Response Generation (Normal Flow)
         self.response_task = asyncio.create_task(self.generate_and_speak(text))
-            # 1. Barge-In Cancellation
-            if self.response_task and not self.response_task.done():
-                logger.debug(">>> BARGE-IN: Interrupting current AI response...")
-                self.session_manager.update_state(self.session.session_id, SessionState.INTERRUPTED)
-                if self.call_logger:
-                    self.call_logger.log_event("orchestrator", "user_interruption")
-                self.response_task.cancel()
-                await self.send_clear_buffer()
 
-            # 2. Start Parallel Response Generation
-            self.session_manager.update_state(self.session.session_id, SessionState.THINKING)
-            self.response_task = asyncio.create_task(self.generate_and_speak(text))
-
-        # Set the callback and connect in BACKGROUND to reduce latency
-        self.transcriber.set_callback(on_transcript)
-        # Optimization: Don't wait for STT to connect before saying "Hello"
-        # This saves ~3.5s of startup latency.
-        self.transcriber_task = asyncio.create_task(self.transcriber.connect())
-        logger.info("Deepgram connection initiated in background.")
     async def speak_refusal(self, text):
         """
         Helper to speak a static refusal message without using the Brain.
         """
+        logger.debug(f"Starting Speak Refusal: '{text}'")
+        # CRITICAL: Reset empty frame counter when agent speaks
+        if self.consecutive_empty_frames > 0:
+            logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
+            self.consecutive_empty_frames = 0
+        # Allow transition to SPEAKING even from ESCALATION
         self.state.transition_to(CallState.SPEAKING)
-        full_ai_text = text
         
-        # Add to history so LLM knows it refused
-        self.chat_history.append({"role": "model", "parts": [text]})
-        self.session_transcript.append(f"AI: {text}")
+        try:
+            # Add to history so LLM knows it refused
+            if self.session:
+                self.session.conversation_history.append({"role": "model", "parts": [text]})
 
-        # Speak it
-        async for chunk in self.synthesizer.speak(text):
-            await self._send_response_chunk(chunk)
+            # Speak it with a safety timeout to prevent "dead silence"
+            chunks_sent = 0
+            async with asyncio.timeout(10.0): # 10s max for refusal tts
+                async for chunk in self.synthesizer.speak(text):
+                    await self._send_response_chunk(chunk)
+                    chunks_sent += 1
             
-        logger.info(f"AI (Refusal): {text}")
-        log_conversation_turn(self.sid, "AI", text)
-        
-        # Back to Listening
-        self.state.transition_to(CallState.LISTENING)
+            logger.info(f"AI (Refusal): {text} (Sent {chunks_sent} audio chunks)")
+            if self.session:
+                log_conversation_turn(self.session.session_id, "AI", text)
+            
+            # LOGGING: Record the refusal in JSON logs
+            if self.call_logger:
+                self.call_logger.log_event("brain", "refusal_spoken", meta={"text": text, "chunks": chunks_sent})
+        except asyncio.TimeoutError:
+            logger.error(f"Refusal TTS Timed Out for text: {text}")
+        except Exception as e:
+            logger.error(f"Error in speak_refusal: {e}")
+        finally:
+            # CRITICAL: Always back to Listening so the agent doesn't stay deaf
+            self.state.transition_to(CallState.LISTENING)
 
     async def handle_audio_stream(self, websocket):
         """
@@ -165,89 +228,97 @@ class VoiceOrchestrator:
         # if not connected: logic removed as we don't await result here
         # We assume connection will succeed or log error in background task
 
+        sid = None
+        call_sid = None
+
         try:
             while True:
-                # Use raw receive to prevent crashes on non-text frames (e.g. browser keep-alives)
-                message = await websocket.receive()
+                # 1. Wait for 'start' or first 'media' to get Identity
+                try:
+                    message = await asyncio.wait_for(websocket.receive(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if not sid:
+                        logger.warning("Identity detection timed out. Using fallback IDs.")
+                        import uuid
+                        sid = "fallback_" + str(uuid.uuid4())[:12]
+                        call_sid = sid
+                        self.sid = sid
+                    break
                 
                 if message["type"] == "websocket.disconnect":
-                    logger.info("WebSocket disconnected event received.")
+                    logger.info("WebSocket disconnected before start.")
                     break
                 
                 if "text" not in message:
-                    # Helper for debugging: Log what we got if it's not text
-                    # logger.debug(f"Ignored non-text message type: {message['type']}")
                     continue
                     
                 data = json.loads(message["text"])
 
                 if data['event'] == 'start':
-                    # Extract IDs
                     sid = data['start']['streamSid']
-                    call_sid = data['start'].get('callSid', sid) # Pillar 1: Identity
-                    
-                    # STATE: Init
-                    self.state.transition_to(CallState.CALL_INIT)
-
-                    # Start Recording
-                    self.recorder = CallRecorder(self.sid)
-                    self.recorder.start()
-
-                    logger.debug(f"Telephony Stream Started: {self.sid}")
-                    # Initial Greeting
-                    greeting = "Hello! I am CILA from GD College."
-                    self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
-
-                elif data['event'] == 'media':
-                    # STATE: Listening (Implicitly, every time we get audio, we are listening)
-                    if self.state.get_state() != CallState.SPEAKING:
-                         # Don't flap state if speaking
-                         self.state.transition_to(CallState.LISTENING)
-
-                    payload = base64.b64decode(data['media']['payload'])
-                    if self.recorder:
-                        self.recorder.write_chunk(payload)
-                    await self.transcriber.send_audio(payload)
-                    # 🟢 ENTER SESSION CONTEXT (Pillar 3)
-                    async with self.session_manager.session_scope(sid, call_sid) as session:
-                        self.session = session
-                        logger.info(f"Telephony Stream Started: {self.session.session_id}")
-                        
-                        # Start Recording
-                        self.recorder = CallRecorder(self.session.session_id)
-                        self.recorder.start()
-
-                        # Initial Greeting
-                        self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
-                        greeting = "Hello! I am CILA from GD College."
-                        self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
-                        
-                        # Sub-loop to handle subsequent media packets while session is active
-                        while True:
-                            inner_msg_raw = await websocket.receive()
-                            if inner_msg_raw["type"] == "websocket.disconnect":
-                                break
-                            
-                            if "text" not in inner_msg_raw:
-                                continue
-                                
-                            inner_data = json.loads(inner_msg_raw["text"])
-                            
-                            if inner_data['event'] == 'media':
-                                payload = base64.b64decode(inner_data['media']['payload'])
-                                if self.recorder:
-                                    self.recorder.write_chunk(payload)
-                                await self.transcriber.send_audio(payload)
-                                self.session.touch() # Pillar 3: Life signal
-                            
-                            elif inner_data['event'] == 'stop':
-                                logger.debug("Telephony Stream Stopped.")
-                                break
-                        break # Exit the outer loop after the stop event
-
-                elif data['event'] == 'stop':
-                    logger.debug("Telephony Stream Stopped before start event?")
+                    call_sid = data['start'].get('callSid', sid)
+                    self.sid = sid # Set for _on_transcript
                     break
+                
+                elif data['event'] == 'media' and not sid:
+                    # Rare: media before start. Generate temporary IDs.
+                    import uuid
+                    sid = "temp_" + str(uuid.uuid4())[:12]
+                    call_sid = sid
+                    self.sid = sid
+                    break
+
+            if not sid:
+                return
+
+            # 🟢 ENTER SESSION CONTEXT (Pillar 3)
+            async with self.session_manager.session_scope(sid, call_sid) as session:
+                self.session = session
+                self.state.transition_to(CallState.CALL_INIT)
+                logger.info(f"Telephony Stream Started: {self.session.session_id}")
+                
+                # Start Recording with provider-specifc settings
+                encoding = getattr(self.transcriber, 'encoding', 'mulaw')
+                sample_rate = getattr(self.transcriber, 'sample_rate', 8000)
+                self.recorder = CallRecorder(
+                    self.session.session_id, 
+                    encoding=encoding, 
+                    sample_rate=sample_rate
+                )
+                self.recorder.start()
+
+                # Initial Greeting
+                self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
+                greeting = "Hello! I am CILA from GD College."
+                self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
+
+                # 2. Main Media Loop
+                while True:
+                    message = await websocket.receive()
+                    
+                    if message["type"] == "websocket.disconnect":
+                        logger.info(f"WebSocket disconnected: {sid}")
+                        break
+                    
+                    if "text" not in message:
+                        continue
+                        
+                    data = json.loads(message["text"])
+
+                    if data['event'] == 'media':
+                        # STATE: Listening (Implicitly)
+                        if self.state.get_state() != CallState.SPEAKING:
+                             self.state.transition_to(CallState.LISTENING)
+
+                        payload = base64.b64decode(data['media']['payload'])
+                        if self.recorder:
+                            self.recorder.write_chunk(payload)
+                        await self.transcriber.send_audio(payload)
+                        self.session.touch() # Life signal
+                    
+                    elif data['event'] == 'stop':
+                        logger.debug(f"Telephony Stream Stopped: {sid}")
+                        break
         except Exception as e:
             logger.error(f"CRITICAL ORCHESTRATOR CRASH: {e}", exc_info=True)
             if self.session:
@@ -274,20 +345,37 @@ class VoiceOrchestrator:
         self.sid = str(uuid.uuid4())[:8] # Generate a temporary session ID
 
         logger.info(f"Text Chat Started: {self.sid}")
-        self.state.transition_to(CallState.CALL_INIT)
         
-        # Initial Greeting
-        greeting = "Hello! I am CILA from GD College. (Text Mode)"
-        self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
+        # 🟢 ENTER SESSION CONTEXT (Pillar 3) - Fix for Text Mode
+        # We need a dummy call_sid for text mode
+        call_sid = f"text-{self.sid}"
+        
+        async with self.session_manager.session_scope(self.sid, call_sid) as session:
+            self.session = session
+            self.state.transition_to(CallState.CALL_INIT)
+            
+            # Initial Greeting
+            greeting = "Hello! I am CILA from GD College. (Text Mode)"
+            self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
 
-        try:
-            while True:
-                text = await websocket.receive_text()
-                await self._on_transcript(text)
-        except Exception as e:
-            logger.error(f"Text Orchestrator Error: {e}")
-        finally:
-            await self.cleanup()
+            from starlette.websockets import WebSocketDisconnect
+            try:
+                while True:
+                    text = await websocket.receive_text()
+                    await self._on_transcript(text)
+            except WebSocketDisconnect:
+                logger.info(f"Text Chat Disconnected: {self.sid}")
+            except Exception as e:
+                logger.error(f"Text Orchestrator Error: {e}", exc_info=True)
+            # Cleanup is handled by session_scope primarily, but we can keep explicit cleanup if needed for websocket/tasks
+            # but session_scope handles the session end.
+            # We'll keep manual cleanup for websocket closure if needed, but remove await self.cleanup() if it conflicts.
+            # actually manager.py cleanup() does a lot. let's keep it but ensure it doesn't double-close session if scope does it.
+            # The session_scope ends the session in session_manager. 
+            # cleanup() also calls session_manager.end_session.
+            # To be safe and simple: just wrap the loop. 
+            finally:
+                await self.cleanup()
 
 
     async def generate_and_speak(self, text, is_greeting=False):
@@ -313,6 +401,13 @@ class VoiceOrchestrator:
                     first_chunk_received = False
                     
                     async for chunk in self.synthesizer.speak(sentence):
+                        # DEFENSIVE: If task was cancelled during synthesis, stop immediately
+                        try:
+                            await asyncio.sleep(0) # Yield to let cancellation happen
+                        except asyncio.CancelledError:
+                            logger.debug("TTS stream interrupted by task cancellation.")
+                            raise
+
                         if not first_chunk_received:
                             first_chunk_received = True
                             tts_latency = int((time.time() - tts_start_time) * 1000)
@@ -323,8 +418,9 @@ class VoiceOrchestrator:
                         await self._send_response_chunk(chunk)
                     audio_queue.task_done()
                 
-                # Back to Listening when done speaking
-                self.state.transition_to(CallState.LISTENING)
+                # Back to Listening when done speaking (if not escalated)
+                if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END]:
+                    self.state.transition_to(CallState.LISTENING)
 
             worker_task = asyncio.create_task(tts_worker())
 
@@ -353,11 +449,7 @@ class VoiceOrchestrator:
                 # We are technically in RAG/Eval state before generating
                 # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
                 
-                async for sentence, metadata in self.brain.generate_stream(text, self.chat_history):
-                    # Policy Check per sentence (Story S1-4)
-                    self.state.transition_to(CallState.RESPONSE_VALIDATION)
-                    
-                async for sentence in self.brain.generate_stream(text, self.session.conversation_history):
+                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history):
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     
@@ -388,42 +480,26 @@ class VoiceOrchestrator:
                         full_ai_text += sentence + " "
                         await audio_queue.put(sentence)
                     else:
-                        logger.warning(f"Response Validation Failed: '{sentence}'")
+                        logger.warning(f"Response Validation Failed (English/Speculation): '{sentence}'")
                         
-                        # FAILURE ACTION: End Call (Story S1-4)
-                        # We stop the stream, speak specific failure message, and hang up.
-                        failure_msg = "I can only respond in English and provide factual information."
+                        # FAILURE ACTION: English Refusal & Escalation (Policy Rule)
+                        self.state.transition_to(CallState.ESCALATION)
+                        failure_msg = "I am currently trained to speak only in English. Please contact our admission office for assistance."
                         await audio_queue.put(failure_msg)
-                        full_ai_text += failure_msg
+                        full_ai_text = failure_msg
                         
                         asyncio.create_task(self.crm.create_ticket(
-                            transcript=f"Blocked Response: {sentence}\nUser Query: {text}",
-                            summary="Quality Validation Failure (Speculation/Hallucination)",
+                            transcript=f"Blocked Response (Non-English/Speculative): {sentence}\nUser Query: {text}",
+                            summary="English-Only Policy/Speculation Violation",
                             sentiment="QUALITY_FAILURE",
                             call_logger=self.call_logger
                         ))
                         
-                        # Signal loop termination
+                        # Stop the stream immediately
                         break
-                        logger.warning(f"Policy Blocked Sentence: {sentence}")
-                    
-                    if not full_ai_text: # First sentence
-                        llm_latency = int((time.time() - llm_start_time) * 1000)
-                        if self.call_logger:
-                            self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency)
-
+            
             await audio_queue.put(None)
             await worker_task
-            
-            # If we broke out due to validation failure, trigger Call End
-            if "I can only respond in English" in full_ai_text:
-                 self.state.transition_to(CallState.CALL_END)
-                 # Close connection after speaking is done
-                 # In a real scenario, we might wait for the 'speaking' event to finish, 
-                 # but for now we let the worker finish the failure message and then close.
-                 if self.websocket:
-                     await asyncio.sleep(3) # Give time to speak
-                     await self.websocket.close()
             
             logger.info(f"AI: {full_ai_text.strip()}")
             log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
@@ -455,32 +531,30 @@ class VoiceOrchestrator:
         """
         Sends a chunk of response (audio or text) to the websocket.
         """
-        # Only attempt to send if the websocket is still open (avoid ASGI errors)
-        if self.websocket:
-            try:
-                if self.mode == "audio":
-                    # Audio Mode (Twilio)
-                    if self.sid:
-                        b64_audio = base64.b64encode(chunk).decode('utf-8')
-                        await self.websocket.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": self.sid,
-                            "media": {"payload": b64_audio}
-                        }))
-                else:
-                    # Text Mode (Chat) - chunk is bytes(text)
-                    text_chunk = chunk.decode('utf-8')
-                    await self.websocket.send_text(text_chunk)
-        if self.websocket and self.session:
-            try:
-                b64_audio = base64.b64encode(chunk).decode('utf-8')
-                await self.websocket.send_text(json.dumps({
-                    "event": "media",
-                    "streamSid": self.session.session_id,
-                    "media": {"payload": b64_audio}
-                }))
-            except Exception as e:
-                logger.debug(f"Could not send response chunk: {e}")
+        if not self.websocket:
+            return
+
+        try:
+            if self.mode == "audio":
+                # Pillar 2: Record AI response into the master WAV
+                if self.recorder:
+                    self.recorder.write_chunk(chunk)
+
+                # Send Media Event
+                sid = self.sid or (self.session.session_id if self.session else None)
+                if sid:
+                    b64_audio = base64.b64encode(chunk).decode('utf-8')
+                    await self.websocket.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": sid,
+                        "media": {"payload": b64_audio}
+                    }))
+            else:
+                # Text Mode (Chat) - chunk is bytes(text)
+                text_chunk = chunk.decode('utf-8')
+                await self.websocket.send_text(text_chunk)
+        except Exception as e:
+            logger.debug(f"Could not send response chunk: {e}")
 
     async def send_audio_response(self, chunk):
         # Legacy/Public method wrapper
@@ -551,9 +625,7 @@ class VoiceOrchestrator:
                     transcript=history_text,
                     summary=f"Call Session Log ({reason})",
                     sentiment="Final",
-                    call_logger=self.call_logger,
-                    reason=reason,
-                    priority=priority
+                    call_logger=self.call_logger
                 )
                 
             if self.recorder:

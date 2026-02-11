@@ -61,7 +61,6 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 text = match.get('metadata', {}).get('text', '')
                 score = match.get('score', 0)
                 if text:
-                    logger.debug(f"RAG Match Found (Score: {score:.4f}): {text[:50]}...")
                     context_chunks.append(text)
                     scores.append(score)
             
