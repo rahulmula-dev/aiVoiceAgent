@@ -92,6 +92,14 @@ class Brain(LLMEngine):
 
         try:
             # 1. RETRIEVE KNOWLEDGE
+            # Currently kb.search returns just text. 
+            # Ideally it should return metadata too, but for S1-4 we will trust the presence of text.
+            context_text = await asyncio.to_thread(self.kb.search, text, self.call_logger)
+            
+            has_grounding = True
+            rag_score = 0.8 # Dummy score if KB doesn't return one yet. In real app, KB should return score.
+            
+            if not context_text or context_text == "No specific documents found.": 
             try:
                 context_text = await asyncio.wait_for(
                     asyncio.to_thread(self.kb.search, text, self.call_logger),
@@ -104,8 +112,16 @@ class Brain(LLMEngine):
             if not context_text: 
                 logger.warning("RAG Decision: No relevant documents found. Falling back to LLM knowledge.")
                 context_text = "No specific documents found."
+                has_grounding = False
+                rag_score = 0.0
             
             logger.info(f"RAG Context for '{text}': {context_text[:200]}...")
+
+            # Metadata for Policy Engine
+            sent_metadata = {
+                "rag_score": rag_score,
+                "has_grounding": has_grounding
+            }
 
             # 2. AUGMENT PROMPT
             rag_prompt = f"""[CONTEXT FROM DATABASE]\n{context_text}\n\n[USER QUESTION]\n{text}\n\nAnswer the user based on the context above."""
@@ -135,7 +151,8 @@ class Brain(LLMEngine):
                     self.call_logger.log_event("brain", "error_fallback", 
                                                meta={"reason": "quota_exceeded_429"})
                 
-                yield "I am currently at capacity, please try again later."
+                # Structural change: yield tuple (text, metadata)
+                yield ("I am currently at capacity, please try again later.", {"error": True})
                 return
             
             full_ai_text = ""
@@ -169,7 +186,7 @@ class Brain(LLMEngine):
                                     sentence = parts[i].strip()
                                     if sentence:
                                         full_ai_text += sentence + ". "
-                                        yield sentence + "."
+                                        yield (sentence + ".", sent_metadata)
                                 sentence_buffer = parts[-1]
                 except Exception as e:
                     logger.debug(f"Skipping malformed chunk: {e}")
@@ -179,12 +196,17 @@ class Brain(LLMEngine):
             final_sentence = sentence_buffer.strip()
             if final_sentence:
                 full_ai_text += final_sentence
-                yield final_sentence
+                yield (final_sentence, sent_metadata)
             
             # 5. APPEND AI RESPONSE TO HISTORY (After success)
             if full_ai_text.strip():
                 history.append({"role": "model", "parts": [full_ai_text.strip()]})
 
+        except ResourceExhausted as quota_error:
+            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
+            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
+            logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
+            yield ("I am currently at capacity, please try again later.", {"error": True})
         except ResourceExhausted:
             logger.warning("Gemini Quota Exceeded during streaming.")
             yield "My AI brain has reached its free-tier limit. I will be back in a minute!"
@@ -197,6 +219,9 @@ class Brain(LLMEngine):
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
+                yield ("I am currently overloaded with requests. Please try again in a few seconds.", {"error": True})
+            else:
+                yield ("I'm having trouble connecting to my knowledge base right now.", {"error": True})
                 yield "My brain is currently resting due to high traffic (Quota reached). Please try again soon."
             elif "404" in str(e):
                 yield "I am currently undergoing a structural update. Check back in a few minutes!"
@@ -210,8 +235,9 @@ class Brain(LLMEngine):
         if history is None:
             history = self.start_new_session()
             
+            
         full_text = ""
-        async for chunk in self.generate_stream(text, history):
+        async for chunk, meta in self.generate_stream(text, history):
             full_text += chunk + " "
         return full_text.strip()
 

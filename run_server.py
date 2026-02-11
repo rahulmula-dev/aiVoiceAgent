@@ -17,5 +17,6 @@ from telephony.server import app
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", 8000))
     print(f"\n>>> Starting AI Voice Agent Server at http://localhost:{PORT}")
+    print(f">>> TEST CHAT UI AVAILABLE AT: http://localhost:{PORT}/chat-ui")
     print(f">>> Root Directory: {ROOT_DIR}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
