@@ -25,6 +25,9 @@ class CallLogger:
         # Log initialization
         self.log_event("orchestrator", "call_logger_initialized", 
                        meta={"agent_version": self.agent_version})
+        
+        # PILLAR 3: Ghost File Rule - Ensure disk allocation immediately
+        self.save_log(status="initialized")
 
     def _anonymize_number(self, number: str) -> str:
         """Helper to mask the middle of a phone number for privacy."""
