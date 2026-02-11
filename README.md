@@ -24,20 +24,12 @@ Certified "Antigravity Compliant" for modularity, observability, and resilience.
 └── crm/             # CRM Integration (LeadSquared)
 ```
 
-## 🛠️ Setup & Installation
-
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/Chakraview100/Ai-voice-agent.git
-    cd Ai-voice-agent
-    ```
-
-2.  **Install dependencies**:
+  **Install dependencies**:
     ```bash
     pip install -r requirements.txt
     ```
 
-3.  **Configure Environment**:
+  **Configure Environment**:
     Create a `.env` file with:
     ```ini
     DEEPGRAM_API_KEY=your_key
@@ -49,12 +41,12 @@ Certified "Antigravity Compliant" for modularity, observability, and resilience.
     NGROK_URL=your_ngrok_url
     ```
 
-4.  **Run the Server**:
+ **Run the Server**:
     ```bash
     python run_server.py
     ```
 
-5.  **Expose Localhost**:
+  **Expose Localhost**:
     ```bash
     ngrok http 8085
     ```
