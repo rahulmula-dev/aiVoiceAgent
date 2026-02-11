@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GD College AI Voice Agent - Sandbox</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            background: #2d2d2d;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+            text-align: center;
+            width: 400px;
+        }
+
+        h1 {
+            margin-bottom: 2rem;
+            color: #4CAF50;
+        }
+
+        .status {
+            margin-bottom: 1.5rem;
+            padding: 10px;
+            border-radius: 6px;
+            background: #333;
+            font-weight: bold;
+        }
+
+        .status.connected {
+            background: #1b5e20;
+            color: #a5d6a7;
+        }
+
+        .status.disconnected {
+            background: #b71c1c;
+            color: #ffcdd2;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+        }
+
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: transform 0.1s, opacity 0.2s;
+            font-weight: bold;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        #startBtn {
+            background: #4CAF50;
+            color: white;
+        }
+
+        #stopBtn {
+            background: #f44336;
+            color: white;
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        .log {
+            margin-top: 1rem;
+            font-size: 12px;
+            color: #bbb;
+            text-align: left;
+            height: 150px;
+            overflow-y: auto;
+            background: #000;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+
+        .indicator {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            background: #555;
+            display: inline-block;
+            margin-right: 8px;
+        }
+
+        .indicator.active {
+            background: #00e676;
+            box-shadow: 0 0 10px #00e676;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🎙️ Agent Sandbox</h1>
+        <div id="status" class="status disconnected"><span class="indicator" id="wsIndicator"></span>Disconnected</div>
+
+        <div class="controls">
+            <button id="startBtn" onclick="startCall()">Start Call</button>
+            <button id="stopBtn" onclick="stopCall()" disabled>End Call</button>
+        </div>
+
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        let ws;
+        let audioContext;
+        let mediaStream;
+        let scriptProcessor;
+        let isConnected = false;
+        let nextPlayTime = 0;
+
+        const STATUS_DIV = document.getElementById('status');
+        const WS_INDICATOR = document.getElementById('wsIndicator');
+        const LOG_DIV = document.getElementById('log');
+        const START_BTN = document.getElementById('startBtn');
+        const STOP_BTN = document.getElementById('stopBtn');
+
+        function log(msg) {
+            const line = document.createElement('div');
+            line.textContent = `> ${msg}`;
+            LOG_DIV.appendChild(line);
+            LOG_DIV.scrollTop = LOG_DIV.scrollHeight;
+        }
+
+        function setStatus(connected) {
+            isConnected = connected;
+            STATUS_DIV.className = `status ${connected ? 'connected' : 'disconnected'}`;
+            STATUS_DIV.innerHTML = `<span class="indicator ${connected ? 'active' : ''}" id="wsIndicator"></span>${connected ? 'Connected (Linear16 16kHz)' : 'Disconnected'}`;
+            START_BTN.disabled = connected;
+            STOP_BTN.disabled = !connected;
+        }
+
+        async function startCall() {
+            try {
+                // 1. Initialize Audio Context (16kHz for STT compatibility)
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                log(`AudioContext initialized: ${audioContext.sampleRate}Hz`);
+
+                // 2. Override browser 44.1/48k capture to 16k if possible, strictly mono
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                // 3. Connect WebSocket
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws/browser`);
+                // For local static file testing, hardcode localhost port if needed:
+                // ws = new WebSocket(`ws://localhost:8085/ws/browser`);
+
+                ws.onopen = () => {
+                    log("WebSocket Connected");
+                    setStatus(true);
+
+                    // 4. Send Twilio-mimic Start Event
+                    const startMsg = {
+                        event: "start",
+                        start: {
+                            streamSid: "browser_" + Date.now(),
+                            callSid: "browser_call_" + Date.now()
+                        }
+                    };
+                    ws.send(JSON.stringify(startMsg));
+
+                    // 5. Start Audio Capture
+                    processMicrophone();
+                };
+
+                ws.onmessage = async (event) => {
+                    const msg = JSON.parse(event.data);
+
+                    if (msg.event === 'media') {
+                        // Play received audio
+                        const payload = atob(msg.media.payload);
+                        const floats = pcm16toF32(payload);
+                        playAudio(floats);
+                    } else if (msg.event === 'clear') {
+                        // Clear buffer (Interruption)
+                        log("⚠️ Interruption - Clearing Buffer");
+                        // We can't strictly "clear" the AudioContext buffer queue easily without creating new nodes,
+                        // but resetting nextPlayTime helps sync.
+                        nextPlayTime = audioContext.currentTime;
+                    }
+                };
+
+                ws.onclose = () => {
+                    log("WebSocket Closed");
+                    stopCall();
+                };
+
+                ws.onerror = (e) => {
+                    log(`WebSocket Error: ${e}`);
+                };
+
+            } catch (e) {
+                log(`Error: ${e.message}`);
+                stopCall();
+            }
+        }
+
+        function stopCall() {
+            if (ws) ws.close();
+            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+            if (scriptProcessor) scriptProcessor.disconnect();
+            if (audioContext) audioContext.close();
+            setStatus(false);
+        }
+
+        function processMicrophone() {
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            // BufferSize 2048 or 4096 gives a reasonable chunks size
+            scriptProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(audioContext.destination);
+
+            scriptProcessor.onaudioprocess = (e) => {
+                if (!isConnected) return;
+
+                const inputData = e.inputBuffer.getChannelData(0);
+                // Downsample/Convert to Int16 PCM
+                const pcmData = f32toPCM16(inputData);
+
+                // Send as base64 (mimic Twilio)
+                const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+
+                ws.send(JSON.stringify({
+                    event: "media",
+                    media: {
+                        payload: base64Audio
+                    }
+                }));
+            };
+        }
+
+        // --- Helpers ---
+
+        function playAudio(float32Array) {
+            const buffer = audioContext.createBuffer(1, float32Array.length, 16000);
+            buffer.getChannelData(0).set(float32Array);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+
+            // Schedule seamless playback
+            if (nextPlayTime < audioContext.currentTime) {
+                nextPlayTime = audioContext.currentTime;
+            }
+            source.start(nextPlayTime);
+            nextPlayTime += buffer.duration;
+        }
+
+        // Convert Float32 [-1, 1] to Int16 PCM
+        function f32toPCM16(input) {
+            const output = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return output;
+        }
+
+        // Convert Raw Binary String (PCM16) to Float32
+        function pcm16toF32(binaryString) {
+            const len = binaryString.length / 2;
+            const floats = new Float32Array(len);
+            const view = new DataView(new ArrayBuffer(len * 2));
+
+            for (let i = 0; i < binaryString.length; i++) {
+                view.setUint8(i, binaryString.charCodeAt(i));
+            }
+
+            for (let i = 0; i < len; i++) {
+                const pcm = view.getInt16(i * 2, true); // Little Endian
+                floats[i] = pcm / 32768.0;
+            }
+            return floats;
+        }
+    </script>
+</body>
+
+</html>
