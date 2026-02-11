@@ -14,13 +14,15 @@ logger = std_logging.getLogger("Transcriber")
 load_dotenv()
 
 class Transcriber(STTProvider):
-    def __init__(self, on_transcript_callback=None):
+    def __init__(self, on_transcript_callback=None, encoding="mulaw", sample_rate=8000):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY missing in .env")
         
         self.on_transcript_callback = on_transcript_callback
         self.model = os.getenv("DEEPGRAM_MODEL", "nova-2-phone")
+        self.encoding = encoding
+        self.sample_rate = sample_rate
         self.ws = None
         self._keep_alive_task = None
 
@@ -34,8 +36,8 @@ class Transcriber(STTProvider):
         """
         params = [
             "model=nova-2",
-            "encoding=mulaw",
-            "sample_rate=8000",
+            f"encoding={self.encoding}",
+            f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
             "endpointing=300" 

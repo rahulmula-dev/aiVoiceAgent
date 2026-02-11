@@ -4,12 +4,15 @@ import logging
 import uvicorn
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, Request, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
 from orchestrator.factory import create_default_orchestrator, create_custom_orchestrator
 from orchestrator.mocks import MockSTT, MockTTS
 from orchestrator.factory import create_default_orchestrator
 from orchestrator.session_manager import default_session_manager
+from stt.transcriber import Transcriber
+from tts.synthesizer import Synthesizer
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +23,9 @@ logger = logging.getLogger("Server")
 from agent_logging import bind_call_context, CallLogger
 
 app = FastAPI()
+
+# Mount static files for Sandbox Mode
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():
@@ -101,6 +107,37 @@ async def handle_media_stream(websocket: WebSocket):
         call_logger.save_log()
         logger.info(f"Forensic Audit trace finalized for {session_id}")
 
+@app.websocket("/ws/browser")
+async def handle_browser_stream(websocket: WebSocket):
+    """
+    Browser-based Sandbox Mode (Sprint 2.7).
+    Bypasses Twilio and uses raw PCM (linear16) at 16kHz for low latency.
+    """
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+    
+    # Initialize Logger
+    call_logger = CallLogger(call_id=session_id, caller_number="browser_dev")
+    bind_call_context(session_id, "browser_dev")
+    
+    await websocket.accept()
+    
+    # 1. Custom Providers for Browser (PCM 16kHz)
+    # Using explicit instantiation to override defaults
+    stt = Transcriber(encoding="linear16", sample_rate=16000)
+    tts = Synthesizer(encoding="linear16", sample_rate=16000)
+    
+    # 2. Custom Orchestrator
+    manager = VoiceOrchestrator(
+        stt_provider=stt,
+        tts_provider=tts,
+        call_logger=call_logger,
+        session_manager=default_session_manager
+    )
+    
+    # 3. Handle Stream (Protocol mimicking)
+    # The browser client MUST send Twilio-formatted JSON messages for this to work.
+    await manager.handle_audio_stream(websocket)
 @app.get("/chat-ui", response_class=HTMLResponse)
 async def chat_ui():
     """

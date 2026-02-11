@@ -13,14 +13,14 @@ logger = std_logging.getLogger("Synthesizer")
 from contracts.interfaces import TTSEngine
 
 class Synthesizer(TTSEngine):
-    def __init__(self):
+    def __init__(self, encoding="mulaw", sample_rate=8000):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             logger.error("DEEPGRAM_API_KEY is missing")
             raise ValueError("DEEPGRAM_API_KEY not found")
         
         # Deepgram Aura Options
-        self.url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none"
+        self.url = f"https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding={encoding}&sample_rate={sample_rate}&container=none"
         self._client = None
 
     async def _get_client(self):

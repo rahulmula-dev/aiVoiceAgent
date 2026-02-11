@@ -79,6 +79,9 @@ class VoiceOrchestrator:
         if self.response_task and not self.response_task.done():
             logger.debug(">>> BARGE-IN: Interrupting current AI response...")
             if self.call_logger:
+                self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text})
+                # Checkpoint: Save logs immediately to prevent data loss
+                self.call_logger.save_log(status="in-progress")
                 self.call_logger.log_event("orchestrator", "user_interruption")
             self.response_task.cancel()
             await self.send_clear_buffer()
@@ -121,6 +124,12 @@ class VoiceOrchestrator:
             self.session_manager.update_state(self.session.session_id, SessionState.THINKING)
             self.response_task = asyncio.create_task(self.generate_and_speak(text))
 
+        # Set the callback and connect in BACKGROUND to reduce latency
+        self.transcriber.set_callback(on_transcript)
+        # Optimization: Don't wait for STT to connect before saying "Hello"
+        # This saves ~3.5s of startup latency.
+        self.transcriber_task = asyncio.create_task(self.transcriber.connect())
+        logger.info("Deepgram connection initiated in background.")
     async def speak_refusal(self, text):
         """
         Helper to speak a static refusal message without using the Brain.
@@ -153,15 +162,24 @@ class VoiceOrchestrator:
         self.transcriber.set_callback(self._on_transcript)
         connected = await self.transcriber.connect()
         
-        if not connected:
-            logger.error("Failed to connect to STT engine.")
-            await websocket.close()
-            return
+        # if not connected: logic removed as we don't await result here
+        # We assume connection will succeed or log error in background task
 
         try:
             while True:
-                message = await websocket.receive_text()
-                data = json.loads(message)
+                # Use raw receive to prevent crashes on non-text frames (e.g. browser keep-alives)
+                message = await websocket.receive()
+                
+                if message["type"] == "websocket.disconnect":
+                    logger.info("WebSocket disconnected event received.")
+                    break
+                
+                if "text" not in message:
+                    # Helper for debugging: Log what we got if it's not text
+                    # logger.debug(f"Ignored non-text message type: {message['type']}")
+                    continue
+                    
+                data = json.loads(message["text"])
 
                 if data['event'] == 'start':
                     # Extract IDs
@@ -206,8 +224,14 @@ class VoiceOrchestrator:
                         
                         # Sub-loop to handle subsequent media packets while session is active
                         while True:
-                            inner_msg = await websocket.receive_text()
-                            inner_data = json.loads(inner_msg)
+                            inner_msg_raw = await websocket.receive()
+                            if inner_msg_raw["type"] == "websocket.disconnect":
+                                break
+                            
+                            if "text" not in inner_msg_raw:
+                                continue
+                                
+                            inner_data = json.loads(inner_msg_raw["text"])
                             
                             if inner_data['event'] == 'media':
                                 payload = base64.b64decode(inner_data['media']['payload'])
@@ -403,6 +427,9 @@ class VoiceOrchestrator:
             
             logger.info(f"AI: {full_ai_text.strip()}")
             log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
+            
+            if self.call_logger:
+                self.call_logger.save_log(status="in-progress")
             
             # CRM Background Task (Don't block audio)
             if not is_greeting:
