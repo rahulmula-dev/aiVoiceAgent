@@ -1,69 +1,41 @@
-# 🎙️ AI Voice Agent (v2 Flash Lite Release)
+# 🎙️ CILA: AI Voice Agent
 
-A production-ready AI Voice Agent for GD College, built with Python, FastAPI, and Twilio.
-Certified "Antigravity Compliant" for modularity, observability, and resilience.
+A production-ready AI Voice Agent for GD College, designed for high-performance telephony and automated admission support.
 
-## 🚀 Key Features
+## � Simple Flow
 
-- **Architecture**: Fully modular (`/telephony`, `/orchestrator`, `/stt`, `/tts`, `/retrieval`).
-- **Intelligence**: Powered by Google Gemini (`gemini-flash-lite-latest`) with RAG.
-- **Observability**: Structured JSON logging with `trace_id` and `latency_ms`.
-- **Hygiene**: "Silent Mode" (Zero console noise) & Safe Cleanup patterns.
-- **Reliability**: Robust error handling and quota management.
-
-## 📂 Project Structure
-
-```
-/src
-├── telephony/       # Twilio WebSocket Server (FastAPI)
-├── orchestrator/    # Core Logic (Brain, Manager, Factory)
-├── stt/             # Speech-to-Text (Deepgram Nova-2)
-├── tts/             # Text-to-Speech (Deepgram Aura)
-├── retrieval/       # RAG Knowledge Base (Pinecone)
-├── logging/         # Centralized Logging Module
-└── crm/             # CRM Integration (LeadSquared)
+```mermaid
+sequenceDiagram
+    participant User
+    participant Twilio
+    participant Orchestrator
+    participant Brain
+    participant TTS
+    
+    User->>Twilio: Makes Phone Call
+    Twilio->>Orchestrator: Streams Audio (WebSocket)
+    Orchestrator->>Brain: Transcribes & Processes Query
+    Brain-->>Orchestrator: Generates Response (RAG)
+    Orchestrator->>TTS: Streams Audio Chunks
+    TTS-->>Twilio: Plays Audio back to User
 ```
 
-  **Install dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+## 🚀 Quick Start
 
-  **Configure Environment**:
-    Create a `.env` file with:
-    ```ini
-    DEEPGRAM_API_KEY=your_key
-    GEMINI_API_KEY=your_key
-    PINECONE_API_KEY=your_key
-    TWILIO_ACCOUNT_SID=your_sid
-    TWILIO_AUTH_TOKEN=your_token
-    LEADSQUARED_ACCESS_KEY=your_key
-    NGROK_URL=your_ngrok_url
-    ```
+1. **Install Dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
- **Run the Server**:
-    ```bash
-    python run_server.py
-    ```
+2. **Run the Server**:
+   ```bash
+   python run_server.py
+   ```
 
-  **Expose Localhost**:
-    ```bash
-    ngrok http 8085
-    ```
-
-## 📊 Logging
-
-Logs are written to `logs/`:
-- `voice_agent.log`: Full structured JSON logs.
-- `call_summary.log`: One-line summary per call.
-- `logs/call_{id}.json`: Individual call session logs.
-
-## 🏆 Certification
-
-This project has passed the **Master Architecture Audit** (v2 Release Candidate).
-- **Architecture**: Modular & Decoupled.
-- **Zero-Print**: Core logic is free of `print()` statements.
-- **Session-Aware**: All logs are traceable.
+3. **Expose to Twilio**:
+   ```bash
+   ngrok http 8085
+   ```
 
 ---
 **Status**: 🟢 PRODUCTION READY

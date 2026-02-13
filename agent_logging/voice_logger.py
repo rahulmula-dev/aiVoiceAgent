@@ -46,7 +46,7 @@ def setup_global_logging():
         os.makedirs('logs')
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
     
     # Avoid duplicate handlers
     if root_logger.hasHandlers():

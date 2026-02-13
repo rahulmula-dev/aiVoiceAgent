@@ -14,13 +14,15 @@ logger = std_logging.getLogger("Transcriber")
 load_dotenv()
 
 class Transcriber(STTProvider):
-    def __init__(self, on_transcript_callback=None):
+    def __init__(self, on_transcript_callback=None, encoding="mulaw", sample_rate=8000):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY missing in .env")
         
         self.on_transcript_callback = on_transcript_callback
         self.model = os.getenv("DEEPGRAM_MODEL", "nova-2-phone")
+        self.encoding = encoding
+        self.sample_rate = sample_rate
         self.ws = None
         self._keep_alive_task = None
 
@@ -34,11 +36,12 @@ class Transcriber(STTProvider):
         """
         params = [
             "model=nova-2",
-            "encoding=mulaw",
-            "sample_rate=8000",
+            f"encoding={self.encoding}",
+            f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
-            "endpointing=300" 
+            "endpointing=300",
+            "language=multi"  # Allow Deepgram to use multi-language detection for better 0.0-confidence filtering
         ]
         
         url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
@@ -100,11 +103,17 @@ class Transcriber(STTProvider):
                         except: pass
                     
                     # Process final transcripts
-                    if len(sentence) > 0:
-                        if is_final:
+                    if is_final:
+                        speech_final = data.get("speech_final", False)
+                        
+                        if len(sentence) > 0:
+                            # Non-empty transcript - pass to manager
                             logger.debug(f"USER FINAL: {sentence}")
-                            # Execute callback in a background task so we don't block the listen loop
-                            asyncio.create_task(self.on_transcript_callback(sentence))
+                            asyncio.create_task(self.on_transcript_callback(sentence, conf))
+                        elif conf == 0.0 and speech_final:
+                            # Empty + 0.0 + speech_final = Pass for state-aware detection
+                            logger.debug(f"[EMPTY 0.0 + SPEECH_FINAL] Passing to manager")
+                            asyncio.create_task(self.on_transcript_callback("", 0.0))
                 else:
                     # DEBUG: Print EVERYTHING else
                     # print(f"DEBUG - DG Event: {data}")
@@ -128,15 +137,19 @@ class Transcriber(STTProvider):
                 self._packet_counter += 1
                 self._total_packets += 1
                 
-                # Mu-law Digital Silence markers: 0xff (255) and 0x7f (127)
-                non_silence_bytes = [b for b in audio_chunk if b not in [0xff, 0x7f]]
+                # Mu-law vs Linear16 Digital Silence markers
+                if self.encoding == "mulaw":
+                    non_silence_bytes = [b for b in audio_chunk if b not in [0xff, 0x7f]]
+                else:
+                    # For Linear16 (Little Endian), check for non-zero values
+                    non_silence_bytes = [b for b in audio_chunk if b != 0x00]
                 
                 # Classify packet
-                if len(non_silence_bytes) > 10:  # At least 10 non-silence bytes = voice detected
+                if len(non_silence_bytes) > len(audio_chunk) * 0.1:  # 10% activity threshold
                     self._voice_packets += 1
                     if not hasattr(self, '_first_voice_detected'):
                         self._first_voice_detected = True
-                        logger.debug(f"🎤 VOICE DETECTED! Audio input is working! (Packet #{self._packet_counter})")
+                        logger.debug(f"🎤 VOICE DETECTED! ({self.encoding} @ {self.sample_rate}Hz, Packet #{self._packet_counter})")
                 else:
                     self._silent_packets += 1
                 

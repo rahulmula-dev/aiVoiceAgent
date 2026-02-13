@@ -13,6 +13,10 @@ load_dotenv()
 
 from contracts.interfaces import LLMEngine
 
+# Pillar 2: Anti-Freeze Timeouts
+LLM_TIMEOUT = 12.0
+RAG_TIMEOUT = 5.0
+
 class Brain(LLMEngine):
     def __init__(self, call_logger=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -28,21 +32,26 @@ class Brain(LLMEngine):
             You are CILA (often mis-transcribed as "Tina", "Sheila", or "Peter"), the friendly and professional AI Voice Agent for GD College in Calgary, Alberta.
             
             CORE INSTRUCTIONS:
-            1. GREETING RULES:
-               - I have ALREADY introduced myself at the start of this call. NEVER repeat "I am CILA" or "I am from GD College" again.
-               - If the caller says "Hello?", "Hi", "Hey", or just greets you, respond conversationally: "Yes, how can I help you?" or "What can I do for you today?"
-               - If asked "How are you?", respond briefly: "I'm doing well, thank you. How can I assist you?"
-               - DO NOT re-introduce yourself unless the caller explicitly asks "Who am I speaking with?" or "What is your name?"
+            1. CONVERSATIONAL PRIORITY: 
+               - If the user greets you (Hello, Hi, Hey) or asks "How are you?", respond conversationally and briefly: "I'm doing well, thank you! How can I help you with GD College today?"
+               - This is a warm conversation. Do NOT use strict refusals for simple greetings or casual questions.
+
+            2. LANGUAGE GUARDRAIL:
+               - You are an English-only agent.
+               - You MUST refuse if the input is CLEARLY another language (like sustained Hindi, Spanish, etc.) or if it is "phonetic gibberish" (nonsensical English words that result from forcing a non-English language through your English model).
+               - DO NOT refuse broken English, slight repetitions, or conversational fillers.
+               - Refusal Output: "I am currently designed to support English only. Please contact our admission office for assistance."
+
+            3. COLLEGE KNOWLEDGE (RAG):
+               - Answer questions about GD College using the provided [CONTEXT].
+               - If the [CONTEXT] does not contain the answer to a college-specific query, say: "I don't have that information right now, but I can arrange for a team member to follow up."
+               - IMPORTANT: Do NOT use this refusal for greetings or polite talk.
+
+            4. CONCISE & ACCURATE:
+               - Keep answers to 1 or 2 short sentences.
+               - Never invent facts. If unsure about college details, refer to the follow-up phrase above.
             
-            2. COLLEGE KNOWLEDGE: You MUST ONLY answer questions about GD College using the provided [CONTEXT]. 
-            
-            3. STRICT REFUSAL: If the [CONTEXT] says "No specific documents found" or does NOT contain the specific answer to a college query, you MUST say exactly: "I don't have that information right now, but I can arrange for a team member to follow up."
-            
-            4. ACCURACY: Never invent facts. If you aren't 100% sure based on the [CONTEXT], use the refusal phrase.
-            
-            5. CONCISE: Keep all answers to 1 or 2 short sentences. Be direct and efficient.
-            
-            6. TOPICS: Do not discuss immigration, medical advice, or personal opinions.
+            5. LIMITS: No immigration, medical, or legal advice.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -88,12 +97,30 @@ class Brain(LLMEngine):
 
         try:
             # 1. RETRIEVE KNOWLEDGE
-            context_text = await asyncio.to_thread(self.kb.search, text, self.call_logger)
-            if not context_text: 
-                logger.warning("RAG Decision: No relevant documents found. Falling back to LLM knowledge.")
-                context_text = "No specific documents found."
+            try:
+                context_text = await asyncio.wait_for(
+                    asyncio.to_thread(self.kb.search, text, self.call_logger),
+                    timeout=RAG_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
+                context_text = "No specific documents found due to timeout."
             
-            logger.debug(f"RAG Context for '{text}': {context_text[:200]}...")
+            has_grounding = bool(context_text and context_text != "No specific documents found.")
+            rag_score = 0.8 if has_grounding else 0.0
+            
+            if not context_text:
+                context_text = "No specific documents found."
+                has_grounding = False
+                rag_score = 0.0
+            
+            logger.info(f"RAG Context for '{text}': {context_text[:200]}...")
+
+            # Metadata for Policy Engine
+            sent_metadata = {
+                "rag_score": rag_score,
+                "has_grounding": has_grounding
+            }
 
             # 2. AUGMENT PROMPT
             rag_prompt = f"""[CONTEXT FROM DATABASE]\n{context_text}\n\n[USER QUESTION]\n{text}\n\nAnswer the user based on the context above."""
@@ -103,10 +130,17 @@ class Brain(LLMEngine):
 
             # 4. STREAM GENERATE (with graceful quota handling)
             try:
-                response_stream = await self.model.generate_content_async(
-                    contents=history,
-                    stream=True
+                response_stream = await asyncio.wait_for(
+                    self.model.generate_content_async(
+                        contents=history,
+                        stream=True
+                    ),
+                    timeout=LLM_TIMEOUT
                 )
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
+                yield "I am taking too long to think. Please ask again."
+                return
             except ResourceExhausted as quota_error:
                 # GRACEFUL HANDLING: Log single line instead of full traceback
                 logger.warning("Gemini Quota Exceeded (429). Triggering fallback.")
@@ -116,7 +150,8 @@ class Brain(LLMEngine):
                     self.call_logger.log_event("brain", "error_fallback", 
                                                meta={"reason": "quota_exceeded_429"})
                 
-                yield "I am currently at capacity, please try again later."
+                # Structural change: yield tuple (text, metadata)
+                yield ("I am currently at capacity, please try again later.", {"error": True})
                 return
             
             full_ai_text = ""
@@ -150,7 +185,7 @@ class Brain(LLMEngine):
                                     sentence = parts[i].strip()
                                     if sentence:
                                         full_ai_text += sentence + ". "
-                                        yield sentence + "."
+                                        yield (sentence + ".", sent_metadata)
                                 sentence_buffer = parts[-1]
                 except Exception as e:
                     logger.debug(f"Skipping malformed chunk: {e}")
@@ -160,7 +195,7 @@ class Brain(LLMEngine):
             final_sentence = sentence_buffer.strip()
             if final_sentence:
                 full_ai_text += final_sentence
-                yield final_sentence
+                yield (final_sentence, sent_metadata)
             
             # 5. APPEND AI RESPONSE TO HISTORY (After success)
             if full_ai_text.strip():
@@ -168,21 +203,26 @@ class Brain(LLMEngine):
 
         except ResourceExhausted as quota_error:
             # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
+            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
             logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
-            yield "I am currently at capacity, please try again later."
+            yield ("I am currently at capacity, please try again later.", {"error": True})
+        except ResourceExhausted:
+            logger.warning("Gemini Quota Exceeded during streaming.")
+            yield "My AI brain has reached its free-tier limit. I will be back in a minute!"
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
-            logger.error(f"!!! Error in Brain: {e}")
 
             # Error Recovery: Rollback the 'user' message so we don't break the [User, Model] alternation
             if history and history[-1].get("role") == "user":
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
-                yield "I am currently overloaded with requests. Please try again in a few seconds."
+                yield ("I am currently overloaded with requests. Please try again in a few seconds.", {"error": True})
+            elif "404" in str(e):
+                yield "I am currently undergoing a structural update. Check back in a few minutes!"
             else:
-                yield "I'm having trouble connecting to my knowledge base right now."
+                yield "I am having a moment of silence (Internal Error). Please try again later."
 
     async def generate_response(self, text, history=None):
         """
@@ -191,10 +231,25 @@ class Brain(LLMEngine):
         if history is None:
             history = self.start_new_session()
             
+            
         full_text = ""
-        async for chunk in self.generate_stream(text, history):
+        async for chunk, meta in self.generate_stream(text, history):
             full_text += chunk + " "
         return full_text.strip()
+
+    def validate_response(self, text: str) -> bool:
+        """
+        Structural guardrail: Ensures output is English-oriented.
+        Matches the logic in PolicyEngine for consistency.
+        """
+        if not text: return True
+        try:
+            # Ratio of ASCII characters to total length
+            ascii_chars = sum(1 for c in text if ord(c) < 128)
+            ratio = ascii_chars / len(text)
+            return ratio >= 0.8 # Allow 20% for accents/emojis
+        except:
+            return True
 
 if __name__ == "__main__":
     # Simple standalone test
