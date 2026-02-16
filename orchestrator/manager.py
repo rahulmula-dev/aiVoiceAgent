@@ -23,9 +23,9 @@ class VoiceOrchestrator:
     """
     def __init__(self, stt_provider: STTProvider, tts_provider: TTSProvider, 
                  call_logger: CallLogger = None, session_manager: SessionManager = None):
-        self.brain = Brain(call_logger=call_logger)
-        self.synthesizer = tts_provider
         self.crm = CRMClient()
+        self.synthesizer = tts_provider
+        self.brain = Brain(call_logger=call_logger, crm_client=self.crm)
         self.transcriber = stt_provider
         self.call_logger = call_logger
         
@@ -272,7 +272,12 @@ class VoiceOrchestrator:
                 return
 
             # 🟢 ENTER SESSION CONTEXT (Pillar 3)
-            async with self.session_manager.session_scope(sid, call_sid) as session:
+            # Use 'from' number extracted from Twilio if available
+            caller_num = "unknown"
+            if self.websocket:
+                caller_num = self.websocket.query_params.get("from", "unknown")
+            
+            async with self.session_manager.session_scope(sid, call_sid, caller_number=caller_num) as session:
                 self.session = session
                 self.state.transition_to(CallState.CALL_INIT)
                 logger.info(f"Telephony Stream Started: {self.session.session_id}")
@@ -350,7 +355,7 @@ class VoiceOrchestrator:
         # We need a dummy call_sid for text mode
         call_sid = f"text-{self.sid}"
         
-        async with self.session_manager.session_scope(self.sid, call_sid) as session:
+        async with self.session_manager.session_scope(self.sid, call_sid, caller_number="web_chat") as session:
             self.session = session
             self.state.transition_to(CallState.CALL_INIT)
             
@@ -449,7 +454,10 @@ class VoiceOrchestrator:
                 # We are technically in RAG/Eval state before generating
                 # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
                 
-                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history):
+                # Extract Caller Number for Auto-ID
+                caller_num = self.session.caller_number if self.session else "unknown"
+                
+                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num):
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     

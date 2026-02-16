@@ -37,12 +37,12 @@ class SessionManager:
                 logger.error(f"Error in Zombie Collector: {e}")
 
     @asynccontextmanager
-    async def session_scope(self, session_id: str, call_id: str):
+    async def session_scope(self, session_id: str, call_id: str, caller_number: str = "unknown"):
         """
         Async Context Manager for guaranteed session lifecycle (Pillar 3).
         Example: async with manager.session_scope(sid, cid) as session:
         """
-        session = self.get_or_create_session(session_id, call_id)
+        session = self.get_or_create_session(session_id, call_id, caller_number)
         try:
             yield session
         finally:
@@ -51,11 +51,11 @@ class SessionManager:
             # But we ensure it's touched.
             session.touch()
 
-    def get_or_create_session(self, session_id: str, call_id: str) -> Session:
+    def get_or_create_session(self, session_id: str, call_id: str, caller_number: str = "unknown") -> Session:
         if session_id not in self.sessions:
-            session = Session(session_id=session_id, call_id=call_id)
+            session = Session(session_id=session_id, call_id=call_id, caller_number=caller_number)
             self.sessions[session_id] = session
-            logger.info(f"Session created: {session_id} (Call: {call_id})")
+            logger.info(f"Session created: {session_id} (Call: {call_id}, From: {caller_number})")
         return self.sessions[session_id]
 
     def get_session(self, session_id: str) -> Optional[Session]:
