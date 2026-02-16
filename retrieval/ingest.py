@@ -49,11 +49,8 @@ knowledge_chunks_raw = [
     "GD College is located in Calgary, Alberta, Canada. The specific address is #108, 1935-27 Ave NE, Calgary, AB T2E 7E4.",
     "It is a recognized cosmetology school offering diploma programs in Esthetics, Makeup Artistry, Hairstyling, and Massage Therapy.",
     "The GD College AI Voice Agent handles inbound calls from prospective students, existing students, and alumni. It operates 24/7 replacing the need for a human receptionist.",
-    "GD College Policy: We prioritize student privacy and strictly follow Alberta's post-secondary guidelines.", # Replaced meta-talk with safe policy
-    "For vendors, partners, or internal staff inquiries, please contact the college office via email. The AI only assists with student-related queries.",
-    "The system targets a 1-2 second response latency. It operates strictly within defined knowledge boundaries and never hallucinates.",
-    "If the user interrupts (barge-in), the AI stops speaking immediately. It then asks 'Should I continue from where I left off?' before proceeding.",
-    "Admissions for the 2026 Batch are currently open. Please visit the GD College website for specific fee structures and application deadlines.",
+    "Admissions for the 2026 Batch are currently open. The tuition fees for the Computer Science diploma program are $15,000 per year.",
+    "GD College Policy: We prioritize student privacy and strictly follow Alberta's post-secondary guidelines.",
     "CALL DURATION LIMIT: To ensure all students can be served, each automated session is restricted to a maximum of 5 minutes.",
     
     # HARD REFUSAL TARGETS (Actually Sensitive)
