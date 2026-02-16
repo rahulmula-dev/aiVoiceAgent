@@ -25,7 +25,7 @@ class KnowledgeBaseEngine(Protocol):
     Contract for RAG/Knowledge Retrieval.
     (Supported: Pinecone, Weaviate, FAISS)
     """
-    def search(self, query: str, top_k: int = 2) -> str: ...
+    def search(self, query: str, top_k: int = 2) -> tuple[str, float]: ...
 
 class LLMEngine(Protocol):
     """

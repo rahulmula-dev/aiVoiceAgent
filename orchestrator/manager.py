@@ -419,7 +419,7 @@ class VoiceOrchestrator:
                             if self.call_logger:
                                 self.call_logger.log_event("tts", "audio_stream_start", 
                                                            latency_ms=tts_latency, 
-                                                           meta={"text": sentence[:50]})
+                                                           meta={"text": sentence})
                         await self._send_response_chunk(chunk)
                     audio_queue.task_done()
                 
@@ -473,7 +473,7 @@ class VoiceOrchestrator:
                     # Log Brain Performance
                     if self.call_logger:
                          self.call_logger.log_event("brain", "chunk_generated", meta={
-                             "text": sentence[:20], 
+                             "text": sentence, 
                              "rag_score": metadata.get("rag_score", 0),
                              "grounding": metadata.get("has_grounding", False),
                              "validation_pass": is_safe
@@ -517,10 +517,21 @@ class VoiceOrchestrator:
             
             # CRM Background Task (Don't block audio)
             if not is_greeting:
+                ticket_sentiment = "Neutral"
+                ticket_summary = f"Query: {text}"
+                
+                # Check for KB Miss / Escalation Logic
+                # If the AI spoke the mandatory fallback script, we must escalate.
+                # Use the Brain's official check (Single Source of Truth)
+                if Brain.is_kb_refusal(full_ai_text):
+                    ticket_sentiment = "ESCALATION" # Or "High" priority mapping in CRM
+                    ticket_summary = f"KB Miss - Escalation Required: {text}"
+                    logger.warning(f"KB Miss Detected. Triggering Escalation Ticket for: {text}")
+
                 asyncio.create_task(self.crm.create_ticket(
                     transcript=text,
-                    summary=f"Query: {text}",
-                    sentiment="Neutral",
+                    summary=ticket_summary,
+                    sentiment=ticket_sentiment,
                     call_logger=self.call_logger
                 ))
             

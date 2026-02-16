@@ -19,6 +19,9 @@ LLM_TIMEOUT = 12.0
 RAG_TIMEOUT = 5.0
 
 class Brain(LLMEngine):
+    # 1. DEFINE SOURCE OF TRUTH FOR REFUSAL SCRIPT
+    KB_MISS_SCRIPT = "I do not have that information. A staff member will follow up."
+
     def __init__(self, call_logger=None, crm_client=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.call_logger = call_logger
@@ -29,8 +32,8 @@ class Brain(LLMEngine):
 
         # --- ATTEMPT CONNECTION ---
         try:
-            # 2. Define Instructions
-            self.system_instruction = """
+            # 2. Define Instructions (Injecting the Constant)
+            self.system_instruction = f"""
             You are CILA (often mis-transcribed as "Tina", "Sheila", or "Peter"), the friendly and professional AI Voice Agent for GD College in Calgary, Alberta.
             
             CORE INSTRUCTIONS:
@@ -46,7 +49,7 @@ class Brain(LLMEngine):
 
             3. COLLEGE KNOWLEDGE (RAG):
                - Answer questions about GD College using the provided [CONTEXT].
-               - If the [CONTEXT] does not contain the answer to a college-specific query, say: "I don't have that information right now, but I can arrange for a team member to follow up."
+               - If the [CONTEXT] does not contain the answer to a college-specific query, say: "{self.KB_MISS_SCRIPT}"
                - IMPORTANT: Do NOT use this refusal for greetings or polite talk.
 
             4. CONCISE & ACCURATE:
@@ -106,23 +109,28 @@ class Brain(LLMEngine):
         try:
             # 1. RETRIEVE KNOWLEDGE
             try:
-                context_text = await asyncio.wait_for(
+                # KB returns (content, top_score)
+                context_text, rag_score = await asyncio.wait_for(
                     asyncio.to_thread(self.kb.search, text, self.call_logger),
                     timeout=RAG_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
                 context_text = "No specific documents found due to timeout."
+                rag_score = 0.0
             
-            has_grounding = bool(context_text and context_text != "No specific documents found.")
-            rag_score = 0.8 if has_grounding else 0.0
+            # Grounding: Only true if text exists AND score is decent (> 0.65)
+            # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise
+            has_grounding = bool(context_text and context_text != "No specific documents found." and rag_score > 0.65)
+            
+            # Logging accuracy fix: 'kb_hit' means GOOD hit, not just ANY hit
             
             if not context_text:
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
             
-            logger.info(f"RAG Context for '{text}': {context_text[:200]}...")
+            logger.info(f"RAG Context for '{text}' (Score: {rag_score:.2f}): {context_text[:200]}...")
 
             # 1.5 DYNAMIC DATA CHECK (CRM)
             crm_context = ""
@@ -317,6 +325,20 @@ class Brain(LLMEngine):
             return ratio >= 0.8 # Allow 20% for accents/emojis
         except:
             return True
+
+    @classmethod
+    def is_kb_refusal(cls, text: str) -> bool:
+        """
+        Utilities for the Orchestrator to detect if the Brain generated the mandatory refusal.
+        Using a soft match is safer (in case of minor punctuation deviations).
+        """
+        if not text: return False
+        
+        # Use the single source of truth, removing punctuation/case for safer matching
+        # "I do not have that information. A staff member will follow up." -> "i do not have that information"
+        
+        target = cls.KB_MISS_SCRIPT.lower().split(".")[0] # Check first sentence roughly
+        return target in text.lower()
 
 if __name__ == "__main__":
     # Simple standalone test

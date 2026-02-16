@@ -37,7 +37,11 @@ class CRMClient(CRMEngine):
         # Structured log event for ticket creation
         if call_logger:
             call_logger.log_event("crm", "ticket_created", 
-                                 meta={"ticket_id": ticket_id, "sentiment": sentiment})
+                                 meta={
+                                     "ticket_id": ticket_id, 
+                                     "sentiment": sentiment,
+                                     "summary": summary  # Added for visibility
+                                 })
         
         return {"status": "success", "ticket_id": ticket_id}
 

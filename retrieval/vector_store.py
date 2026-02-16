@@ -65,8 +65,9 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     scores.append(score)
             
             # Log retrieval boundary with statistics (not content)
+            top_score = 0.0
             if scores:
-                top_score = max(scores)
+                top_score = max(scores) # Assume index is cosine sim, 0-1
                 logger.info(f"RAG Search: Found {len(context_chunks)} matches (Top Score: {top_score:.2f})")
                 
                 # Structured log event for RAG search completion
@@ -80,7 +81,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     call_logger.log_event("retrieval", "rag_search_complete",
                                          meta={"matches": 0, "top_score": 0})
 
-            return "\n".join(context_chunks)
+            return "\n".join(context_chunks), top_score
         except Exception as e:
             logger.error(f"ERROR: Knowledge Search Error: {e}")
-            return ""
+            return "", 0.0
