@@ -119,9 +119,10 @@ class Brain(LLMEngine):
                 context_text = "No specific documents found due to timeout."
                 rag_score = 0.0
             
-            # Grounding: Only true if text exists AND score is decent (> 0.65)
+            # Grounding: Only true if text exists AND score is decent (> 0.58)
             # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise
-            has_grounding = bool(context_text and context_text != "No specific documents found." and rag_score > 0.65)
+            # Syncing with KnowledgeBase DEFAULT_THRESHOLD (0.58)
+            has_grounding = bool(context_text and context_text != "No specific documents found." and rag_score > 0.58)
             
             # Logging accuracy fix: 'kb_hit' means GOOD hit, not just ANY hit
             

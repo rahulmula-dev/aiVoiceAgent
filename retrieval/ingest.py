@@ -25,7 +25,8 @@ KB_VERSION = f"v1.0_{datetime.now().strftime('%Y%m%d')}"
 RESTRICTED_KEYWORDS = {
     "immigration": "HARD_REFUSAL_IMMIGRATION",
     "visa": "HARD_REFUSAL_IMMIGRATION",
-    "status": "HARD_REFUSAL_IMMIGRATION",
+    "visa status": "HARD_REFUSAL_IMMIGRATION",
+    "immigration status": "HARD_REFUSAL_IMMIGRATION",
     "legal action": "HARD_REFUSAL_LEGAL",
     "sue": "HARD_REFUSAL_LEGAL",
     "lawsuit": "HARD_REFUSAL_LEGAL",

@@ -80,14 +80,18 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 is_sensitive = metadata.get('is_sensitive_topic', False)
                 category = metadata.get('hard_refusal_category', "")
 
-                # GATE 1: Safety
+                # GATE 1: Safety (Refined to avoid collateral over-blocking)
                 if is_sensitive:
-                    refusal_cat = category or "GENERAL_POLICY_VIOLATION"
-                    logger.warning(f"RAG-BLOCK: sensitive content detected (Score: {score:.2f})")
-                    if call_logger:
-                        call_logger.log_event("retrieval", "rag_search_blocked", 
-                                             meta={"reason": refusal_cat, "score": round(score, 2)})
-                    return "BLOCKED_BY_SAFETY_GUARDRAIL", score
+                    if score >= 0.70:
+                        refusal_cat = category or "GENERAL_POLICY_VIOLATION"
+                        logger.warning(f"RAG-BLOCK: High-confidence sensitive content detected (Score: {score:.2f})")
+                        if call_logger:
+                            call_logger.log_event("retrieval", "rag_search_blocked", 
+                                                 meta={"reason": refusal_cat, "score": round(score, 2)})
+                        return "BLOCKED_BY_SAFETY_GUARDRAIL", score
+                    else:
+                        logger.debug(f"RAG-SKIP: Sensitive neighbor detected but score {score:.2f} < 0.70 (Likely collateral)")
+                        continue
 
                 # GATE 2: Confidence
                 threshold = get_threshold(category)
