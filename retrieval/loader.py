@@ -10,14 +10,27 @@ load_dotenv()
 # Configure logging
 logger = logging.getLogger("RAG-Loader")
 
+# --- CONFIGURATION ---
+DEFAULT_THRESHOLD = 0.58
+CATEGORY_THRESHOLDS = {
+    "HARD_REFUSAL_LEGAL": 0.75,       # Higher bar for legal
+    "HARD_REFUSAL_IMMIGRATION": 0.75, # Higher bar for immigration
+    "HARD_REFUSAL_HARASSMENT": 0.80   # Highest bar for harassment
+}
+
+def get_threshold(category):
+    """Returns the specific threshold for a category, or the default."""
+    if not category:
+        return DEFAULT_THRESHOLD
+    return CATEGORY_THRESHOLDS.get(category, DEFAULT_THRESHOLD)
+
 def retrieve_context(query, top_k=3):
     """
-    Search Pinecone for relevant knowledge chunks and enforce a strict 
-    post-retrieval guardrail to prevent sensitive info from reaching the LLM.
-    
+    Retrieves context with strict Safety (Task 2.2) and Confidence (Task 2.3) gates.
     Returns:
         dict: {"status": "success", "context": "..."} OR
-              {"status": "blocked", "reason": "HARD_REFUSAL_CATEGORY"}
+              {"status": "blocked", "reason": "CATEGORY"} OR
+              {"status": "low_confidence", "context": ""}
     """
     pc_key = os.getenv("PINECONE_API_KEY")
     gm_key = os.getenv("GEMINI_API_KEY")
@@ -28,13 +41,11 @@ def retrieve_context(query, top_k=3):
         return {"status": "error", "message": "Missing credentials"}
 
     try:
-        # 1. Initialize Pinecone & AI Engine
+        # 1. Initialize & Embed
         pc = Pinecone(api_key=pc_key)
         index = pc.Index(index_name)
         genai.configure(api_key=gm_key)
 
-        # 2. Embed Query (Using Gemini Embedding-001 for index compatibility)
-        # Dimensions: 3072 (matches the gd-college index created in ingest.py)
         response = genai.embed_content(
             model="models/gemini-embedding-001",
             content=query,
@@ -42,7 +53,7 @@ def retrieve_context(query, top_k=3):
         )
         query_embedding = response['embedding']
 
-        # 3. Search Pinecone with Metadata
+        # 2. Query Pinecone
         search_results = index.query(
             vector=query_embedding,
             top_k=top_k,
@@ -52,34 +63,46 @@ def retrieve_context(query, top_k=3):
         matches = search_results.get('matches', [])
         valid_chunks = []
 
-        # 4. THE SAFETY FILTER (Post-Retrieval Guardrail)
+        logger.info(f"RAG-Search: '{query}' ({len(matches)} potential matches)")
+
+        # 3. The "Double-Filter" Loop
         for match in matches:
-            metadata = match.get('metadata', {})
-            is_sensitive = metadata.get('is_sensitive_topic', False)
             score = match.get('score', 0.0)
-            
-            # CRITICAL CHECK: If any match is sensitive, block the entire response
+            metadata = match.get('metadata', {})
+            text = metadata.get('text', '')
+            is_sensitive = metadata.get('is_sensitive_topic', False)
+            category = metadata.get('hard_refusal_category', "")
+
+            # --- GATE 1: SAFETY (Task 2.2) ---
             if is_sensitive:
-                # STOP immediately if metadata flags this as restricted
-                refusal_category = metadata.get('hard_refusal_category', 'GENERAL_POLICY_VIOLATION')
-                
-                logger.warning(f"RAG-BLOCK: sensitive content detected (Score: {score:.2f}) for query '{query}'. Category: {refusal_category}")
-                
-                # Return the block dictionary as per Requirement
+                # If it's sensitive, we STOP immediately as per PRD
+                refusal_cat = category or "GENERAL_POLICY_VIOLATION"
+                logger.warning(f"RAG-BLOCK: Sensitive topic detected (Score: {score:.2f}) | Category: {refusal_cat}")
                 return {
                     "status": "blocked", 
-                    "reason": refusal_category
+                    "reason": refusal_cat
                 }
 
-            # Else, collect the safe text
-            text = metadata.get('text', '')
+            # --- GATE 2: CONFIDENCE (Task 2.3) ---
+            threshold = get_threshold(category)
+            
+            if score < threshold:
+                logger.debug(f"RAG-DROP: Score {score:.2f} < Threshold {threshold} for chunk")
+                continue # Discard low quality chunk
+            
+            # Passed both gates
             if text:
                 valid_chunks.append(text)
 
-        # 5. Normal Retrieval Result
+        # 4. Final Decision
         if not valid_chunks:
-            return {"status": "success", "context": ""}
+            logger.info(f"RAG-FALLBACK: Low Confidence / No Valid Chunks for '{query}'")
+            return {
+                "status": "low_confidence", 
+                "context": ""
+            }
 
+        logger.info(f"RAG-SUCCESS: Retrieved {len(valid_chunks)} verified chunks.")
         combined_text = "\n\n".join(valid_chunks)
         return {
             "status": "success",
@@ -98,3 +121,7 @@ if __name__ == "__main__":
     # Test sensitive query
     print("\nTesting Sensitive Query (Should Block)...")
     print(retrieve_context("I want to talk about visa and immigration"))
+
+    # Test nonsense/low-confidence query
+    print("\nTesting Nonsense Query (Should Fallback)...")
+    print(retrieve_context("xyzabc123 non-existent college facility"))
