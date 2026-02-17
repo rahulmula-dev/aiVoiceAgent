@@ -35,24 +35,24 @@ class CallLogger:
             return number
         return number[:3] + "***" + number[-2:]
 
-    def log_event(self, event_type: str, event_name: str, latency_ms: int = None, meta: Dict[str, Any] = None):
+    def log_event(self, event_type: str, event_name: str, latency_ms: int = None, meta: Dict[str, Any] = None, trace_id: str = None):
         """
         Logs a single event with a timestamp.
-        
-        Args:
-            event_type: Category (e.g., 'stt', 'tts', 'llm', 'orchestrator', 'telephony')
-            event_name: Specific event (e.g., 'user_transcript_final', 'audio_stream_start')
-            latency_ms: Optional latency in milliseconds
-            meta: Additional metadata (e.g., text, confidence, tokens)
+        Auto-injects call_id and trace_id for traceability.
         """
         event_entry = {
             "timestamp": datetime.now().isoformat(),
             "type": event_type,
-            "event": event_name
+            "event": event_name,
+            "call_id": self.call_id  # Auto-inject ID
         }
         
         if latency_ms is not None:
             event_entry["latency_ms"] = latency_ms
+            
+        if trace_id:
+            event_entry["trace_id"] = trace_id
+            
         if meta:
             event_entry.update(meta)
         

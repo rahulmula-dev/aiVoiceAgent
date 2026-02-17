@@ -50,7 +50,7 @@ class StateMachine:
             CallState.CALL_END: []
         }
 
-    def transition_to(self, new_state: CallState):
+    def transition_to(self, new_state: CallState, trace_id: str = None):
         """
         Attempts to transition to a new state.
         Raises ValueError if transition is invalid.
@@ -71,7 +71,9 @@ class StateMachine:
                 
                 # 1. Log violation to JSON for debugging
                 if self.call_logger:
-                    self.call_logger.log_event("state_machine", "violation", meta={"msg": msg})
+                    self.call_logger.log_event("state_machine", "violation", 
+                                             meta={"msg": msg}, 
+                                             trace_id=trace_id)
                 
                 # 2. Report to CRM (Mock) - Meets Requirement
                 if self.crm_client:
@@ -89,7 +91,8 @@ class StateMachine:
         # 4. JSON Log Only (No console spam)
         if self.call_logger:
             self.call_logger.log_event("state_machine", "transition", 
-                                     meta={"from": old_state.value, "to": new_state.value})
+                                     meta={"from": old_state.value, "to": new_state.value},
+                                     trace_id=trace_id)
 
     def get_state(self):
         return self.current_state
