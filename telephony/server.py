@@ -151,19 +151,31 @@ async def handle_chat_stream(websocket: WebSocket):
     """
     WebSocket endpoint for Text-based testing (Mock STT/TTS).
     """
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+    
+    # Initialize Logger for Chat (Logs will be saved to disk)
+    call_logger = CallLogger(call_id=session_id, caller_number="web_chat")
+    bind_call_context(session_id, "web_chat")
+    call_logger.log_event("telephony", "chat_started")
+    
     await websocket.accept()
     
     # Use Mock Providers
     manager = create_custom_orchestrator(
         stt_provider_class=MockSTT,
         tts_provider_class=MockTTS,
-        call_logger=None # Optional: Add logger if needed for debugging
+        call_logger=call_logger # Logger now passed
     )
     
     try:
         await manager.handle_text_stream(websocket)
     except Exception as e:
         print(f"Chat Error: {e}")
+        call_logger.log_event("telephony", "chat_error", meta={"error": str(e)})
+    finally:
+        call_logger.generate_summary_line()
+        call_logger.save_log()
 
 
 if __name__ == "__main__":

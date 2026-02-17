@@ -25,7 +25,7 @@ class KnowledgeBaseEngine(Protocol):
     Contract for RAG/Knowledge Retrieval.
     (Supported: Pinecone, Weaviate, FAISS)
     """
-    def search(self, query: str, top_k: int = 2) -> str: ...
+    def search(self, query: str, top_k: int = 2) -> tuple[str, float]: ...
 
 class LLMEngine(Protocol):
     """
@@ -37,7 +37,8 @@ class LLMEngine(Protocol):
     async def generate_stream(
         self, 
         text: str, 
-        history: List[Any]
+        history: List[Any],
+        caller_number: Optional[str] = None
     ) -> AsyncGenerator[str, None]: ...
     
     async def generate_response(
@@ -59,6 +60,10 @@ class CRMEngine(Protocol):
     ) -> Any: ...
     
     async def schedule_callback(self, phone_number: str) -> bool: ...
+
+    async def get_ticket_status(self, ticket_id: str) -> dict: ...
+    
+    async def get_ticket_by_phone(self, phone_number: str) -> dict: ...
 
 class PolicyEngine(Protocol):
     """
