@@ -58,6 +58,22 @@ class VoiceOrchestrator:
         # Feature Config
         self.config = FeatureConfig()
 
+    def _create_task_with_log(self, coro):
+        """
+        Safety wrapper for fire-and-forget background tasks.
+        Ensures exceptions are logged instead of swallowed.
+        """
+        task = asyncio.create_task(coro)
+        def log_exception(t):
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Generate/CRM Background Task Failed: {e}", exc_info=True)
+        task.add_done_callback(log_exception)
+        return task
+
     async def _on_transcript(self, text, confidence=1.0):
         """
         Callback for when user input is received (either via STT or text chat).
@@ -175,11 +191,12 @@ class VoiceOrchestrator:
             refusal_text = self.policy.get_refusal_script(intent)
             
             # B. Log to CRM
-            asyncio.create_task(self.crm.create_ticket(
+            self._create_task_with_log(self.crm.create_ticket(
                 transcript=f"User said: {text}\nPolicy Trigger: {intent}",
                 summary=f"Security Violation: {intent}",
                 sentiment="SECURITY_ALERT",
-                call_logger=self.call_logger
+                call_logger=self.call_logger,
+                call_id=self.session.session_id if self.session else trace_id
             ))
             
             # C. Speak Refusal directly (Bypass Brain)
@@ -533,11 +550,12 @@ class VoiceOrchestrator:
                         await audio_queue.put(failure_msg)
                         full_ai_text = failure_msg
                         
-                        asyncio.create_task(self.crm.create_ticket(
+                        self._create_task_with_log(self.crm.create_ticket(
                             transcript=f"Blocked Response (Non-English/Speculative): {sentence}\nUser Query: {text}",
                             summary="English-Only Policy/Speculation Violation",
                             sentiment="QUALITY_FAILURE",
-                            call_logger=self.call_logger
+                            call_logger=self.call_logger,
+                            call_id=self.session.session_id if self.session else trace_id
                         ))
                         
                         # Stop the stream immediately
@@ -565,11 +583,12 @@ class VoiceOrchestrator:
                     ticket_summary = f"KB Miss - Escalation Required: {text}"
                     logger.warning(f"KB Miss Detected. Triggering Escalation Ticket for: {text}")
 
-                asyncio.create_task(self.crm.create_ticket(
+                self._create_task_with_log(self.crm.create_ticket(
                     transcript=text,
                     summary=ticket_summary,
                     sentiment=ticket_sentiment,
-                    call_logger=self.call_logger
+                    call_logger=self.call_logger,
+                    call_id=self.session.session_id
                 ))
             
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
@@ -681,7 +700,8 @@ class VoiceOrchestrator:
                     transcript=history_text,
                     summary=f"Call Session Log ({reason})",
                     sentiment="Final",
-                    call_logger=self.call_logger
+                    call_logger=self.call_logger,
+                    call_id=sid
                 )
                 
             if self.recorder:
