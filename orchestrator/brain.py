@@ -13,6 +13,7 @@ logger = logging.getLogger("Brain")
 load_dotenv()
 
 from contracts.interfaces import LLMEngine
+from contracts.config import FeatureConfig
 
 # Pillar 2: Anti-Freeze Timeouts
 LLM_TIMEOUT = 12.0
@@ -26,6 +27,7 @@ class Brain(LLMEngine):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.call_logger = call_logger
         self.crm_client = crm_client
+        self.config = FeatureConfig()
         
         # 1. Initialize Knowledge Base
         self.kb = KnowledgeBase()
@@ -108,16 +110,21 @@ class Brain(LLMEngine):
 
         try:
             # 1. RETRIEVE KNOWLEDGE
-            try:
-                # KB returns (content, top_score)
-                context_text, rag_score = await asyncio.wait_for(
-                    asyncio.to_thread(self.kb.search, text, self.call_logger, 3, trace_id),
-                    timeout=RAG_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
-                context_text = "No specific documents found due to timeout."
+            if self.config.override_retrieval:
+                logger.warning(f"[OVERRIDE] RAG Retrieval Disabled (env={self.config.env})")
+                context_text = "RAG Disabled by manual override."
                 rag_score = 0.0
+            else:
+                try:
+                    # KB returns (content, top_score)
+                    context_text, rag_score = await asyncio.wait_for(
+                        asyncio.to_thread(self.kb.search, text, self.call_logger, 3, trace_id),
+                        timeout=RAG_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
+                    context_text = "No specific documents found due to timeout."
+                    rag_score = 0.0
             
             # Grounding: Only true if text exists AND score is decent (> 0.58)
             # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise

@@ -14,6 +14,7 @@ from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from agent_logging import log_conversation_turn, CallLogger
 from .session_manager import SessionManager, SessionState
+from contracts.config import FeatureConfig
 
 logger = std_logging.getLogger("Orchestrator")
 
@@ -53,6 +54,9 @@ class VoiceOrchestrator:
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
         self.user_has_spoken = False  # Track if user has spoken at least once
+        
+        # Feature Config
+        self.config = FeatureConfig()
 
     async def _on_transcript(self, text, confidence=1.0):
         """
@@ -63,6 +67,12 @@ class VoiceOrchestrator:
         """
         # DEBUG: Log every callback invocation
         trace_id = str(uuid.uuid4())
+        
+        # 0. OVERRIDE: Disable Intake
+        if self.config.override_intake:
+            logger.warning(f"[OVERRIDE] Intake Disabled (env={self.config.env}). Ignoring input: '{text}'")
+            return
+
         logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}, trace={trace_id}")
         
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
@@ -455,6 +465,12 @@ class VoiceOrchestrator:
             self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id)
             
             escalation = self.policy.check_escalation(text)
+            
+            # OVERRIDE: Force Escalation
+            if self.config.override_escalation:
+                logger.warning(f"[OVERRIDE] Force Escalation Triggered (env={self.config.env})")
+                escalation = True
+                
             if escalation:
                 self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
                 escalation_msg = "ID 402: Transferring you to a human agent now."
