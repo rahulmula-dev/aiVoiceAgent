@@ -4,6 +4,7 @@ import base64
 import json
 import logging as std_logging
 import time
+import uuid
 from orchestrator.brain import Brain
 from orchestrator.interfaces import STTProvider, TTSProvider
 from crm.client import CRMClient
@@ -13,6 +14,7 @@ from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from agent_logging import log_conversation_turn, CallLogger
 from .session_manager import SessionManager, SessionState
+from contracts.config import FeatureConfig
 
 logger = std_logging.getLogger("Orchestrator")
 
@@ -52,6 +54,25 @@ class VoiceOrchestrator:
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
         self.user_has_spoken = False  # Track if user has spoken at least once
+        
+        # Feature Config
+        self.config = FeatureConfig()
+
+    def _create_task_with_log(self, coro):
+        """
+        Safety wrapper for fire-and-forget background tasks.
+        Ensures exceptions are logged instead of swallowed.
+        """
+        task = asyncio.create_task(coro)
+        def log_exception(t):
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Generate/CRM Background Task Failed: {e}", exc_info=True)
+        task.add_done_callback(log_exception)
+        return task
 
     async def _on_transcript(self, text, confidence=1.0):
         """
@@ -61,7 +82,14 @@ class VoiceOrchestrator:
             confidence: Deepgram confidence score (0.0-1.0), defaults to 1.0 for text chat
         """
         # DEBUG: Log every callback invocation
-        logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}")
+        trace_id = str(uuid.uuid4())
+        
+        # 0. OVERRIDE: Disable Intake
+        if self.config.override_intake:
+            logger.warning(f"[OVERRIDE] Intake Disabled (env={self.config.env}). Ignoring input: '{text}'")
+            return
+
+        logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}, trace={trace_id}")
         
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
         if not text.strip():
@@ -85,7 +113,8 @@ class VoiceOrchestrator:
                         # LOGGING: Record the detection and refusal in the call logs
                         if self.call_logger and self.session:
                             self.call_logger.log_event("stt", "user_transcript_final", 
-                                                     meta={"text": "[NON-ENGLISH SPEECH DETECTED] (Filtered by Deepgram)"})
+                                                     meta={"text": "[NON-ENGLISH SPEECH DETECTED] (Filtered by Deepgram)"},
+                                                     trace_id=trace_id)
                             self.session.conversation_history.append({"role": "user", "parts": ["[NON-ENGLISH SPEECH DETECTED]"]})
 
                         self.last_refusal_time = current_time
@@ -95,9 +124,10 @@ class VoiceOrchestrator:
                         
                         if self.call_logger:
                              self.call_logger.log_event("brain", "chunk_generated", 
-                                                      meta={"text": refusal_text, "rag_score": 0.0, "grounding": False, "validation_pass": True})
+                                                      meta={"text": refusal_text, "rag_score": 0.0, "grounding": False, "validation_pass": True},
+                                                      trace_id=trace_id)
                         
-                        self.response_task = asyncio.create_task(self.speak_refusal(refusal_text))
+                        self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
                 return
             else:
                 # Empty with higher confidence = Background silence, reset counter
@@ -128,9 +158,9 @@ class VoiceOrchestrator:
         
         # STATE: Transcribing / Input Received
         if self.mode == "audio":
-            self.state.transition_to(CallState.TRANSCRIBING)
+            self.state.transition_to(CallState.TRANSCRIBING, trace_id=trace_id)
         else:
-            self.state.transition_to(CallState.LISTENING) # Text chat is instant
+            self.state.transition_to(CallState.LISTENING, trace_id=trace_id) # Text chat is instant
             
         logger.info(f"USER: {text}")
         if self.session:
@@ -139,7 +169,7 @@ class VoiceOrchestrator:
             self.session.touch()
         
         if self.call_logger:
-            self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text})
+            self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text}, trace_id=trace_id)
         
         if self.response_task and not self.response_task.done():
             logger.debug(">>> BARGE-IN: Interrupting current AI response...")
@@ -161,21 +191,38 @@ class VoiceOrchestrator:
             refusal_text = self.policy.get_refusal_script(intent)
             
             # B. Log to CRM
-            asyncio.create_task(self.crm.create_ticket(
+            self._create_task_with_log(self.crm.create_ticket(
                 transcript=f"User said: {text}\nPolicy Trigger: {intent}",
                 summary=f"Security Violation: {intent}",
                 sentiment="SECURITY_ALERT",
-                call_logger=self.call_logger
+                call_logger=self.call_logger,
+                call_id=self.session.session_id if self.session else trace_id
             ))
             
             # C. Speak Refusal directly (Bypass Brain)
-            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text))
+            # C. Speak Refusal directly (Bypass Brain)
+            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+            
+            # --- DECISION LOG FOR POLICY REFUSAL ---
+            decision_meta = {
+                "intent": intent,
+                "confidence_score": 1.0, # Checked via deterministic policy
+                "chunks_used": [],
+                "crm_hit": False,
+                "governance_decision": f"Refusal: {intent}",
+                "refusal_flags": {"policy_violation": True}
+            }
+            if self.call_logger:
+                self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
+            logger.info(f"DECISION LOG: [Refusal: {intent}] | Policy Violation")
+            # ---------------------------------------
+            
             return 
 
         # 3. Start Parallel Response Generation (Normal Flow)
-        self.response_task = asyncio.create_task(self.generate_and_speak(text))
+        self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id))
 
-    async def speak_refusal(self, text):
+    async def speak_refusal(self, text, trace_id=None):
         """
         Helper to speak a static refusal message without using the Brain.
         """
@@ -185,7 +232,7 @@ class VoiceOrchestrator:
             logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
             self.consecutive_empty_frames = 0
         # Allow transition to SPEAKING even from ESCALATION
-        self.state.transition_to(CallState.SPEAKING)
+        self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
         
         try:
             # Add to history so LLM knows it refused
@@ -205,14 +252,14 @@ class VoiceOrchestrator:
             
             # LOGGING: Record the refusal in JSON logs
             if self.call_logger:
-                self.call_logger.log_event("brain", "refusal_spoken", meta={"text": text, "chunks": chunks_sent})
+                self.call_logger.log_event("brain", "refusal_spoken", meta={"text": text, "chunks": chunks_sent}, trace_id=trace_id)
         except asyncio.TimeoutError:
             logger.error(f"Refusal TTS Timed Out for text: {text}")
         except Exception as e:
             logger.error(f"Error in speak_refusal: {e}")
         finally:
             # CRITICAL: Always back to Listening so the agent doesn't stay deaf
-            self.state.transition_to(CallState.LISTENING)
+            self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
 
     async def handle_audio_stream(self, websocket):
         """
@@ -383,7 +430,7 @@ class VoiceOrchestrator:
                 await self.cleanup()
 
 
-    async def generate_and_speak(self, text, is_greeting=False):
+    async def generate_and_speak(self, text, is_greeting=False, intent="unknown", trace_id=None):
         """
         Streams AI thoughts into a parallel TTS queue for zero-lag audio.
         """
@@ -400,7 +447,7 @@ class VoiceOrchestrator:
                     if sentence is None: break
                     
                     # STATE: Speaking
-                    self.state.transition_to(CallState.SPEAKING)
+                    self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
                     
                     tts_start_time = time.time()
                     first_chunk_received = False
@@ -419,28 +466,35 @@ class VoiceOrchestrator:
                             if self.call_logger:
                                 self.call_logger.log_event("tts", "audio_stream_start", 
                                                            latency_ms=tts_latency, 
-                                                           meta={"text": sentence})
+                                                           meta={"text": sentence},
+                                                           trace_id=trace_id)
                         await self._send_response_chunk(chunk)
                     audio_queue.task_done()
                 
                 # Back to Listening when done speaking (if not escalated)
                 if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END]:
-                    self.state.transition_to(CallState.LISTENING)
+                    self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
 
             worker_task = asyncio.create_task(tts_worker())
 
             # 0. Check for Escalation (Policy)
             # STATE: Intent Eval
-            self.state.transition_to(CallState.INTENT_EVAL)
+            self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id)
             
             escalation = self.policy.check_escalation(text)
+            
+            # OVERRIDE: Force Escalation
+            if self.config.override_escalation:
+                logger.warning(f"[OVERRIDE] Force Escalation Triggered (env={self.config.env})")
+                escalation = True
+                
             if escalation:
-                self.state.transition_to(CallState.ESCALATION)
+                self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
                 escalation_msg = "ID 402: Transferring you to a human agent now."
                 await audio_queue.put(escalation_msg)
                 full_ai_text = escalation_msg
             elif is_greeting:
-                self.state.transition_to(CallState.INTENT_EVAL) # Re-confirm state logic
+                self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id) # Re-confirm state logic
                 await audio_queue.put(text)
                 full_ai_text = text
                 # Sync hardcoded greeting with session history
@@ -449,7 +503,7 @@ class VoiceOrchestrator:
                 # Track LLM Latency
                 llm_start_time = time.time()
                 if self.call_logger:
-                    self.call_logger.log_event("orchestrator", "llm_request_start")
+                    self.call_logger.log_event("orchestrator", "llm_request_start", trace_id=trace_id)
                 
                 # We are technically in RAG/Eval state before generating
                 # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
@@ -457,7 +511,7 @@ class VoiceOrchestrator:
                 # Extract Caller Number for Auto-ID
                 caller_num = self.session.caller_number if self.session else "unknown"
                 
-                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num):
+                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id):
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     
@@ -477,13 +531,13 @@ class VoiceOrchestrator:
                              "rag_score": metadata.get("rag_score", 0),
                              "grounding": metadata.get("has_grounding", False),
                              "validation_pass": is_safe
-                         })
+                         }, trace_id=trace_id)
 
                     if is_safe:
                         if not full_ai_text: # First sentence logic
                             llm_latency = int((time.time() - llm_start_time) * 1000)
                             if self.call_logger:
-                                self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency)
+                                self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency, trace_id=trace_id)
                         
                         full_ai_text += sentence + " "
                         await audio_queue.put(sentence)
@@ -491,16 +545,17 @@ class VoiceOrchestrator:
                         logger.warning(f"Response Validation Failed (English/Speculation): '{sentence}'")
                         
                         # FAILURE ACTION: English Refusal & Escalation (Policy Rule)
-                        self.state.transition_to(CallState.ESCALATION)
+                        self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
                         failure_msg = "I am currently trained to speak only in English. Please contact our admission office for assistance."
                         await audio_queue.put(failure_msg)
                         full_ai_text = failure_msg
                         
-                        asyncio.create_task(self.crm.create_ticket(
+                        self._create_task_with_log(self.crm.create_ticket(
                             transcript=f"Blocked Response (Non-English/Speculative): {sentence}\nUser Query: {text}",
                             summary="English-Only Policy/Speculation Violation",
                             sentiment="QUALITY_FAILURE",
-                            call_logger=self.call_logger
+                            call_logger=self.call_logger,
+                            call_id=self.session.session_id if self.session else trace_id
                         ))
                         
                         # Stop the stream immediately
@@ -528,11 +583,12 @@ class VoiceOrchestrator:
                     ticket_summary = f"KB Miss - Escalation Required: {text}"
                     logger.warning(f"KB Miss Detected. Triggering Escalation Ticket for: {text}")
 
-                asyncio.create_task(self.crm.create_ticket(
+                self._create_task_with_log(self.crm.create_ticket(
                     transcript=text,
                     summary=ticket_summary,
                     sentiment=ticket_sentiment,
-                    call_logger=self.call_logger
+                    call_logger=self.call_logger,
+                    call_id=self.session.session_id
                 ))
             
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
@@ -644,7 +700,8 @@ class VoiceOrchestrator:
                     transcript=history_text,
                     summary=f"Call Session Log ({reason})",
                     sentiment="Final",
-                    call_logger=self.call_logger
+                    call_logger=self.call_logger,
+                    call_id=sid
                 )
                 
             if self.recorder:

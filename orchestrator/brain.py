@@ -13,6 +13,7 @@ logger = logging.getLogger("Brain")
 load_dotenv()
 
 from contracts.interfaces import LLMEngine
+from contracts.config import FeatureConfig
 
 # Pillar 2: Anti-Freeze Timeouts
 LLM_TIMEOUT = 12.0
@@ -26,6 +27,7 @@ class Brain(LLMEngine):
         self.api_key = os.getenv("GEMINI_API_KEY")
         self.call_logger = call_logger
         self.crm_client = crm_client
+        self.config = FeatureConfig()
         
         # 1. Initialize Knowledge Base
         self.kb = KnowledgeBase()
@@ -97,7 +99,7 @@ class Brain(LLMEngine):
         """
         return []
 
-    async def generate_stream(self, text, history, caller_number=None):
+    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -108,16 +110,21 @@ class Brain(LLMEngine):
 
         try:
             # 1. RETRIEVE KNOWLEDGE
-            try:
-                # KB returns (content, top_score)
-                context_text, rag_score = await asyncio.wait_for(
-                    asyncio.to_thread(self.kb.search, text, self.call_logger),
-                    timeout=RAG_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
-                context_text = "No specific documents found due to timeout."
+            if self.config.override_retrieval:
+                logger.warning(f"[OVERRIDE] RAG Retrieval Disabled (env={self.config.env})")
+                context_text = "RAG Disabled by manual override."
                 rag_score = 0.0
+            else:
+                try:
+                    # KB returns (content, top_score)
+                    context_text, rag_score = await asyncio.wait_for(
+                        asyncio.to_thread(self.kb.search, text, self.call_logger, 3, trace_id),
+                        timeout=RAG_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
+                    context_text = "No specific documents found due to timeout."
+                    rag_score = 0.0
             
             # Grounding: Only true if text exists AND score is decent (> 0.58)
             # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise
@@ -172,14 +179,39 @@ class Brain(LLMEngine):
                 except Exception as e:
                      logger.error(f"CRM Auto-Lookup Failed: {e}")
 
-            # LOGGING: Enforcement Log
+            # --- DECISION LOG & EXPLAINABILITY (Story S3-3) ---
+            # Determine Governance Decision
+            governance_decision = "Allowed"
+            if not has_grounding and not crm_hit:
+                governance_decision = "Refusal: Low Confidence / KB Miss"
+            
+            # Prepare Readable Chunks (Split for JSON list if needed, or keep text)
+            chunks_list = context_text.split("\n\n") if context_text else []
+            
+            decision_meta = {
+                "intent": intent,
+                "confidence_score": round(rag_score, 2),
+                "chunks_used": chunks_list,
+                "crm_hit": crm_hit,
+                "governance_decision": governance_decision,
+                "refusal_flags": {
+                    "kb_miss": not has_grounding,
+                    "crm_miss": not crm_hit and is_status_query
+                }
+            }
+            
+            # 1. Structural Log (JSON)
             if self.call_logger:
-                self.call_logger.log_event("brain", "source_enforcement", 
-                                          meta={
-                                              "kb_hit": has_grounding, 
-                                              "crm_hit": crm_hit,
-                                              "kb_score": rag_score
-                                          })
+                self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
+            
+            # 2. Human-Readable Log (Console/File)
+            log_str = (f"DECISION LOG: [{governance_decision}] | "
+                       f"Intent: {intent} | "
+                       f"Score: {rag_score:.2f} | "
+                       f"Chunks: {len(chunks_list)} | "
+                       f"CRM: {crm_hit}")
+            logger.info(log_str)
+            # --------------------------------------------------
 
             # Metadata for Policy Engine
             sent_metadata = {
@@ -224,7 +256,8 @@ class Brain(LLMEngine):
                 # Structured log event for error fallback
                 if self.call_logger:
                     self.call_logger.log_event("brain", "error_fallback", 
-                                               meta={"reason": "quota_exceeded_429"})
+                                               meta={"reason": "quota_exceeded_429"},
+                                               trace_id=trace_id)
                 
                 # Structural change: yield tuple (text, metadata)
                 yield ("I am currently at capacity, please try again later.", {"error": True})
@@ -300,7 +333,7 @@ class Brain(LLMEngine):
             else:
                 yield "I am having a moment of silence (Internal Error). Please try again later."
 
-    async def generate_response(self, text, history=None):
+    async def generate_response(self, text, history=None, trace_id=None):
         """
         Standard non-streaming response for tests and simple fallbacks.
         """
@@ -309,7 +342,7 @@ class Brain(LLMEngine):
             
             
         full_text = ""
-        async for chunk, meta in self.generate_stream(text, history):
+        async for chunk, meta in self.generate_stream(text, history, trace_id=trace_id):
             full_text += chunk + " "
         return full_text.strip()
 

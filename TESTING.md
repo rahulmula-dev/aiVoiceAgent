@@ -38,6 +38,16 @@ We have implemented a **Mock Telephony Layer** that allows you to interact with 
    2. Open your browser to:
       [http://localhost:8000/chat-ui](http://localhost:8000/chat-ui)
 
+## 🎤 Zero-Cost "Voice Mode" (Browser Sandbox)
+
+We also have a browser-based microphone tester that mimics the Twilio stream directly. This allows you to test **speech-to-speech** latency and quality without a phone.
+
+1. **Start the Server**: `python run_server.py`
+2. **Open the Sandbox**:
+   [http://localhost:8000/static/tester.html](http://localhost:8000/static/tester.html)
+3. **Click "Start Call"** and speak into your microphone.
+
+
 ## 📞 Full Production Mode (Twilio)
 
 When you are ready for a real voice test:
