@@ -173,11 +173,27 @@ class VoiceOrchestrator:
             ))
             
             # C. Speak Refusal directly (Bypass Brain)
+            # C. Speak Refusal directly (Bypass Brain)
             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+            
+            # --- DECISION LOG FOR POLICY REFUSAL ---
+            decision_meta = {
+                "intent": intent,
+                "confidence_score": 1.0, # Checked via deterministic policy
+                "chunks_used": [],
+                "crm_hit": False,
+                "governance_decision": f"Refusal: {intent}",
+                "refusal_flags": {"policy_violation": True}
+            }
+            if self.call_logger:
+                self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
+            logger.info(f"DECISION LOG: [Refusal: {intent}] | Policy Violation")
+            # ---------------------------------------
+            
             return 
 
         # 3. Start Parallel Response Generation (Normal Flow)
-        self.response_task = asyncio.create_task(self.generate_and_speak(text, trace_id=trace_id))
+        self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id))
 
     async def speak_refusal(self, text, trace_id=None):
         """
@@ -387,7 +403,7 @@ class VoiceOrchestrator:
                 await self.cleanup()
 
 
-    async def generate_and_speak(self, text, is_greeting=False, trace_id=None):
+    async def generate_and_speak(self, text, is_greeting=False, intent="unknown", trace_id=None):
         """
         Streams AI thoughts into a parallel TTS queue for zero-lag audio.
         """
@@ -462,7 +478,7 @@ class VoiceOrchestrator:
                 # Extract Caller Number for Auto-ID
                 caller_num = self.session.caller_number if self.session else "unknown"
                 
-                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, trace_id=trace_id):
+                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id):
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     

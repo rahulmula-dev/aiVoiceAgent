@@ -97,7 +97,7 @@ class Brain(LLMEngine):
         """
         return []
 
-    async def generate_stream(self, text, history, caller_number=None, trace_id=None):
+    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -172,15 +172,39 @@ class Brain(LLMEngine):
                 except Exception as e:
                      logger.error(f"CRM Auto-Lookup Failed: {e}")
 
-            # LOGGING: Enforcement Log
+            # --- DECISION LOG & EXPLAINABILITY (Story S3-3) ---
+            # Determine Governance Decision
+            governance_decision = "Allowed"
+            if not has_grounding and not crm_hit:
+                governance_decision = "Refusal: Low Confidence / KB Miss"
+            
+            # Prepare Readable Chunks (Split for JSON list if needed, or keep text)
+            chunks_list = context_text.split("\n\n") if context_text else []
+            
+            decision_meta = {
+                "intent": intent,
+                "confidence_score": round(rag_score, 2),
+                "chunks_used": chunks_list,
+                "crm_hit": crm_hit,
+                "governance_decision": governance_decision,
+                "refusal_flags": {
+                    "kb_miss": not has_grounding,
+                    "crm_miss": not crm_hit and is_status_query
+                }
+            }
+            
+            # 1. Structural Log (JSON)
             if self.call_logger:
-                self.call_logger.log_event("brain", "source_enforcement", 
-                                          meta={
-                                              "kb_hit": has_grounding, 
-                                              "crm_hit": crm_hit,
-                                              "kb_score": rag_score
-                                          },
-                                          trace_id=trace_id)
+                self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
+            
+            # 2. Human-Readable Log (Console/File)
+            log_str = (f"DECISION LOG: [{governance_decision}] | "
+                       f"Intent: {intent} | "
+                       f"Score: {rag_score:.2f} | "
+                       f"Chunks: {len(chunks_list)} | "
+                       f"CRM: {crm_hit}")
+            logger.info(log_str)
+            # --------------------------------------------------
 
             # Metadata for Policy Engine
             sent_metadata = {
