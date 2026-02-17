@@ -97,7 +97,7 @@ class Brain(LLMEngine):
         """
         return []
 
-    async def generate_stream(self, text, history, caller_number=None):
+    async def generate_stream(self, text, history, caller_number=None, trace_id=None):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -111,7 +111,7 @@ class Brain(LLMEngine):
             try:
                 # KB returns (content, top_score)
                 context_text, rag_score = await asyncio.wait_for(
-                    asyncio.to_thread(self.kb.search, text, self.call_logger),
+                    asyncio.to_thread(self.kb.search, text, self.call_logger, 3, trace_id),
                     timeout=RAG_TIMEOUT
                 )
             except asyncio.TimeoutError:
@@ -179,7 +179,8 @@ class Brain(LLMEngine):
                                               "kb_hit": has_grounding, 
                                               "crm_hit": crm_hit,
                                               "kb_score": rag_score
-                                          })
+                                          },
+                                          trace_id=trace_id)
 
             # Metadata for Policy Engine
             sent_metadata = {
@@ -224,7 +225,8 @@ class Brain(LLMEngine):
                 # Structured log event for error fallback
                 if self.call_logger:
                     self.call_logger.log_event("brain", "error_fallback", 
-                                               meta={"reason": "quota_exceeded_429"})
+                                               meta={"reason": "quota_exceeded_429"},
+                                               trace_id=trace_id)
                 
                 # Structural change: yield tuple (text, metadata)
                 yield ("I am currently at capacity, please try again later.", {"error": True})
@@ -300,7 +302,7 @@ class Brain(LLMEngine):
             else:
                 yield "I am having a moment of silence (Internal Error). Please try again later."
 
-    async def generate_response(self, text, history=None):
+    async def generate_response(self, text, history=None, trace_id=None):
         """
         Standard non-streaming response for tests and simple fallbacks.
         """
@@ -309,7 +311,7 @@ class Brain(LLMEngine):
             
             
         full_text = ""
-        async for chunk, meta in self.generate_stream(text, history):
+        async for chunk, meta in self.generate_stream(text, history, trace_id=trace_id):
             full_text += chunk + " "
         return full_text.strip()
 

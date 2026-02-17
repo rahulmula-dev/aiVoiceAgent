@@ -44,7 +44,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
             logger.warning(f"KnowledgeBase Init Failed: {e}")
             self.index = None
 
-    def search(self, query, call_logger=None, top_k=3):
+    def search(self, query, call_logger=None, top_k=3, trace_id=None):
         """
         Search with strict Safety (Task 2.2) and Confidence (Task 2.3) gates.
         Returns: (context_text, top_confidence_score)
@@ -87,7 +87,8 @@ class KnowledgeBase(KnowledgeBaseEngine):
                         logger.warning(f"RAG-BLOCK: High-confidence sensitive content detected (Score: {score:.2f})")
                         if call_logger:
                             call_logger.log_event("retrieval", "rag_search_blocked", 
-                                                 meta={"reason": refusal_cat, "score": round(score, 2)})
+                                                 meta={"reason": refusal_cat, "score": round(score, 2)},
+                                                 trace_id=trace_id)
                         return "BLOCKED_BY_SAFETY_GUARDRAIL", score
                     else:
                         logger.debug(f"RAG-SKIP: Sensitive neighbor detected but score {score:.2f} < 0.70 (Likely collateral)")
@@ -107,16 +108,31 @@ class KnowledgeBase(KnowledgeBaseEngine):
             top_score = 0.0
             if scores:
                 top_score = max(scores)
+                
+                # Extract Top Match Metadata for Tracing (Sprint 2 Requirement)
+                # We use the metadata from the top-scoring match
+                top_match = next((m for m in matches if m.get('score') == top_score), {})
+                top_meta = top_match.get('metadata', {})
+                kb_version = top_meta.get('kb_version_id', 'unknown')
+                top_chunk_id = top_meta.get('chunk_id', 'unknown')
+
                 logger.info(f"RAG Search: Found {len(valid_chunks)} verified chunks (Top Score: {top_score:.2f})")
                 
                 if call_logger:
                     call_logger.log_event("retrieval", "rag_search_complete",
-                                         meta={"matches": len(valid_chunks), "top_score": round(top_score, 2)})
+                                         meta={
+                                             "matches": len(valid_chunks), 
+                                             "top_score": round(top_score, 2),
+                                             "kb_version_id": kb_version,
+                                             "top_chunk_id": top_chunk_id
+                                         },
+                                         trace_id=trace_id)
             else:
                 logger.info("RAG Search: 0 chunks passed confidence gates.")
                 if call_logger:
                     call_logger.log_event("retrieval", "rag_search_complete",
-                                         meta={"matches": 0, "top_score": 0})
+                                         meta={"matches": 0, "top_score": 0},
+                                         trace_id=trace_id)
                 return "LOW_CONFIDENCE_FALLBACK", 0.0
 
             return "\n\n".join(valid_chunks), top_score

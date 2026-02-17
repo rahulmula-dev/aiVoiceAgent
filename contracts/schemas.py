@@ -39,6 +39,8 @@ class CallContext(BaseModel):
     caller_number: str
     start_time: float
     transcript_log: List[str] = Field(default_factory=list)
+    trace_id: Optional[str] = Field(None, description="Unique ID for request tracing")
+    kb_version_id: Optional[str] = Field(None, description="Knowledge Base version identifier")
 
 class EscalationEvent(BaseModel):
     """
