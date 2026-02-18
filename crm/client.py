@@ -38,9 +38,13 @@ class CRMClient(CRMEngine):
             call_id (str): MANDATORY. Used for idempotency.
         """
         # 1. IDEMPOTENCY CHECK
-        if call_id and call_id in self.processed_calls:
-            existing_ticket = self.processed_calls[call_id]
-            logger.info(f"[CRM] Idempotency Hit: Ticket already exists for call {call_id} -> {existing_ticket}")
+        # Key = call_id + summary so each distinct ticket type per call is allowed.
+        # (e.g. "Query: fees", "Silence Termination", "Call Session Log" are all different keys)
+        # True duplicates (same call + same summary) are still blocked.
+        idempotency_key = f"{call_id}:{summary}" if call_id else None
+        if idempotency_key and idempotency_key in self.processed_calls:
+            existing_ticket = self.processed_calls[idempotency_key]
+            logger.info(f"[CRM] Idempotency Hit: Ticket '{summary}' already exists for call {call_id} -> {existing_ticket}")
             return {"status": "success", "ticket_id": existing_ticket, "message": "Already processed"}
 
         ticket_data = {
@@ -55,9 +59,9 @@ class CRMClient(CRMEngine):
             # 2. ATTEMPT CREATION WITH RETRY LOGIC
             ticket_id = await self._send_request_safe(ticket_data)
             
-            # Success: Cache the ID
-            if call_id:
-                self.processed_calls[call_id] = ticket_id
+            # Success: Cache the ID using the compound key
+            if idempotency_key:
+                self.processed_calls[idempotency_key] = ticket_id
                 
             logger.info(f"[CRM] Ticket logged successfully: {ticket_id}")
             

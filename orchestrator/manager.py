@@ -58,6 +58,14 @@ class VoiceOrchestrator:
         # Feature Config
         self.config = FeatureConfig()
 
+        # Silence Handling State (Story S4-2)
+        self.silence_task = None
+        self.silence_stage = 0  # 0: Normal, 1: Warned once, 2: Warned twice
+        self.last_interaction_time = time.time()
+
+        # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
+        self._cleanup_done = False
+
     def _create_task_with_log(self, coro):
         """
         Safety wrapper for fire-and-forget background tasks.
@@ -92,6 +100,11 @@ class VoiceOrchestrator:
         logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}, trace={trace_id}")
         
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
+        # CRITICAL FIX: Ignore input if session is ending/ended (Silence Monitor race condition)
+        if self.state.current_state == CallState.CALL_END or (self.session and self.session.current_state == SessionState.ENDED):
+            logger.warning(f"Ignoring input '{text}' for ended session.")
+            return
+
         if not text.strip():
             if confidence == 0.0:
                 # We trigger a refusal for SUSTAINED empty frames (likely non-English speech filtered by Deepgram)
@@ -100,10 +113,13 @@ class VoiceOrchestrator:
                     self.consecutive_empty_frames += 1
                     logger.debug(f"[EMPTY FRAME] Count: {self.consecutive_empty_frames} (Pausing or filtered noise)")
                     
-                    # Threshold of 6 = approx 4.5 seconds of sustained non-English filtering
-                    if self.consecutive_empty_frames >= 6:
+                    logger.debug(f"[EMPTY FRAME] Count: {self.consecutive_empty_frames} (Pausing or filtered noise)")
+                    
+                    # Threshold increased significantly to defer to the new Silence Timer (Story S4-2)
+                    # Was 6 (approx 4.5s), now 100 to avoid accidental "Non-English" refusal during normal silence.
+                    if self.consecutive_empty_frames >= 100:
                         # RATE LIMITING: Only refuse once every 10 seconds
-                        import time
+                        # Removed local import time to fix UnboundLocalError
                         current_time = time.time()
                         if current_time - self.last_refusal_time < 10:
                             return
@@ -146,6 +162,10 @@ class VoiceOrchestrator:
             if self.consecutive_empty_frames > 0:
                 logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames}) - received text")
                 self.consecutive_empty_frames = 0
+            
+            # SILENCE RESET: legitimate user text
+            self.last_interaction_time = time.time()
+            self.silence_stage = 0
         
         # LOW-QUALITY DETECTION: Catch mumbled/garbled non-English input
         # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
@@ -231,8 +251,11 @@ class VoiceOrchestrator:
         if self.consecutive_empty_frames > 0:
             logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
             self.consecutive_empty_frames = 0
-        # Allow transition to SPEAKING even from ESCALATION
-        self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
+        # Only transition to SPEAKING if we are NOT already terminating.
+        # Skipping this when in CALL_END prevents the state violation that would
+        # trigger a SYSTEM_ERROR CRM ticket and block the goodbye message.
+        if self.state.get_state() != CallState.CALL_END:
+            self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
         
         try:
             # Add to history so LLM knows it refused
@@ -258,8 +281,12 @@ class VoiceOrchestrator:
         except Exception as e:
             logger.error(f"Error in speak_refusal: {e}")
         finally:
-            # CRITICAL: Always back to Listening so the agent doesn't stay deaf
-            self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            # CRITICAL: Only go back to Listening if we are NOT already terminating
+            # This prevents the CALL_END -> LISTENING state violation during silence termination
+            if self.state.get_state() != CallState.CALL_END:
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            # Reset silence timer after speaking refusal (so we start counting silence from NOW)
+            self.last_interaction_time = time.time()
 
     async def handle_audio_stream(self, websocket):
         """
@@ -339,6 +366,9 @@ class VoiceOrchestrator:
                 )
                 self.recorder.start()
 
+                # Start Silence Monitor (Story S4-2)
+                self.silence_task = asyncio.create_task(self._monitor_silence())
+
                 # Initial Greeting
                 self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                 greeting = "Hello! I am CILA from GD College."
@@ -358,6 +388,11 @@ class VoiceOrchestrator:
                     data = json.loads(message["text"])
 
                     if data['event'] == 'media':
+                        # Break out if session has been terminated by silence monitor
+                        if self.state.get_state() == CallState.CALL_END:
+                            logger.debug("Media loop: session ended, stopping audio processing.")
+                            break
+
                         # STATE: Listening (Implicitly)
                         if self.state.get_state() != CallState.SPEAKING:
                              self.state.transition_to(CallState.LISTENING)
@@ -409,6 +444,9 @@ class VoiceOrchestrator:
             # Initial Greeting
             greeting = "Hello! I am CILA from GD College. (Text Mode)"
             self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
+
+            # Enable Silence Monitor for Text Mode testing
+            self.silence_task = asyncio.create_task(self._monitor_silence())
 
             from starlette.websockets import WebSocketDisconnect
             try:
@@ -601,6 +639,12 @@ class VoiceOrchestrator:
             if 'worker_task' in locals(): worker_task.cancel()
         except Exception as e:
             logger.error(f"Response Error: {e}")
+        finally:
+            # RESET SILENCE TIMER after AI finishes speaking
+            # This ensures we don't count the time the AI was talking as user silence
+            self.last_interaction_time = time.time()
+            if self.session and self.state.get_state() != CallState.ESCALATION:
+                self.silence_stage = 0
 
     async def _send_response_chunk(self, chunk):
         """
@@ -648,6 +692,12 @@ class VoiceOrchestrator:
 
     async def cleanup(self):
         """Final session archival and resource release (Pillar 3)."""
+        # GUARD: Prevent double-cleanup (e.g. silence termination + WebSocket disconnect both call this)
+        if self._cleanup_done:
+            logger.debug("Cleanup already completed for this session. Skipping.")
+            return
+        self._cleanup_done = True
+
         sid = self.session.session_id if self.session else "unknown"
         logger.info(f"Cleanup started for session {sid}.")
         
@@ -677,6 +727,14 @@ class VoiceOrchestrator:
                     await self.response_task
                 except asyncio.CancelledError:
                     pass
+
+                except asyncio.CancelledError:
+                    pass
+
+            # Cancel Silence Monitor
+            if self.silence_task and not self.silence_task.done():
+                logger.debug("Cleanup: Cancelling silence monitor")
+                self.silence_task.cancel()
 
             if self.transcriber: 
                 logger.debug("Cleanup: Closing Transcriber")
@@ -715,12 +773,122 @@ class VoiceOrchestrator:
             # 3. Final Log Archival
             if self.call_logger:
                 logger.info(f"Cleanup: Generating final summary for {sid}")
-                self.call_logger.generate_summary_line(status="completed", reason="user_hangup")
+                # Use the session's actual termination reason, not a hardcoded value
+                termination_reason = "user_hangup"
+                if self.session and self.session.termination_reason:
+                    termination_reason = self.session.termination_reason
+                self.call_logger.generate_summary_line(status="completed", reason=termination_reason)
                 self.call_logger.save_log(status="completed")
             
+            # Force close websocket to break any receive loops
+            # Wait briefly first to let any in-flight audio (e.g. goodbye TTS) finish transmitting
+            if self.websocket:
+                logger.debug("Cleanup: Waiting for in-flight audio before closing WebSocket...")
+                await asyncio.sleep(2.0)
+                logger.debug("Cleanup: Closing WebSocket connection")
+                try:
+                    await self.websocket.close()
+                except Exception as e:
+                    logger.debug(f"WebSocket close ignored (likely already closed): {e}")
+
         except Exception as e:
             # Fallback to sys.stderr (Pillar 3)
             import sys
             print(f"CRITICAL CLEANUP ERROR for {sid}: {e}", file=sys.stderr)
         finally:
             logger.info(f"Orchestrator session {sid} finalized.")
+
+    async def _monitor_silence(self):
+        """
+        Background task to monitor user silence and trigger re-engagement prompts.
+        Implements Story S4-2 logic:
+        10-20s silence -> prompt #1
+        next 10-20s silence -> prompt #2
+        continued silence -> termination
+        """
+        logger.debug("Starting Silence Monitor")
+        try:
+            while self.session and self.session.current_state != SessionState.ENDED:
+                await asyncio.sleep(1.0)
+                
+                # Check session health - stop if session is gone
+                if not self.session:
+                    break
+
+                # DEBUG: Trace silence monitor (Disabled for production)
+                # state = self.state.get_state()
+                # logger.debug(f"Silencer: Gap={time.time() - self.last_interaction_time:.1f}s State={state}")
+
+                # 1. Don't count silence while AI is speaking (or transitioning)
+                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION]:
+                    self.last_interaction_time = time.time()
+                    continue
+
+                # 2. Check Silence Duration
+                gap = time.time() - self.last_interaction_time
+                
+                # Verify we haven't just reset (race condition check)
+                if gap < 1.0:
+                    continue
+
+                # Stage 1: Initial Warning (10s+)
+                if gap > 10.0 and self.silence_stage == 0:
+                    logger.info(f"Silence Warning 1 triggered (Gap: {gap:.1f}s)")
+                    self.silence_stage = 1
+                    self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
+                    
+                    # Prompt #1 - await so it fully completes before the loop continues
+                    msg = "Are you still there?"
+                    await self.speak_refusal(msg)
+                    
+                # Stage 2: Secondary Warning (Another 10s passed since Prompt 1)
+                elif gap > 10.0 and self.silence_stage == 1:
+                    logger.info(f"Silence Warning 2 triggered (Gap: {gap:.1f}s)")
+                    self.silence_stage = 2
+                    self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
+                    
+                    # Prompt #2 - await so it fully completes before the loop continues
+                    msg = "I haven't heard from you for a while. I will have to end the call soon if you don't respond."
+                    await self.speak_refusal(msg)
+                    
+                # Stage 3: Termination (Another 10s passed since Prompt 2)
+                elif gap > 10.0 and self.silence_stage == 2:
+                    logger.warning(f"Silence Termination triggered (Gap: {gap:.1f}s)")
+                    self.silence_stage = 3 # Prevent loops
+
+                    # Set the real termination reason BEFORE cleanup so the summary log is correct
+                    if self.session:
+                        self.session.termination_reason = "silence_termination"
+
+                    # STEP 1: Speak goodbye FIRST, while WebSocket is still fully open.
+                    # We must NOT set CALL_END yet — that would break the media loop and
+                    # close the WebSocket before the audio chunks are delivered.
+                    goodbye = "Disconnecting due to silence. Goodbye."
+                    await self.speak_refusal(goodbye)
+
+                    # STEP 2: NOW transition to CALL_END.
+                    # speak_refusal's finally block tried to go to LISTENING, but we
+                    # set CALL_END here immediately after so the media loop will break
+                    # on the next iteration.
+                    self.state.transition_to(CallState.CALL_END)
+
+                    # STEP 3: Create CRM ticket (awaited so it's in the log before save)
+                    try:
+                        await self.crm.create_ticket(
+                            transcript="[System]: Call terminated due to extended user silence (30s+).",
+                            summary="Silence Termination",
+                            sentiment="Neutral",
+                            call_logger=self.call_logger,
+                            call_id=self.session.session_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to create Silence Termination CRM ticket: {e}")
+
+                    # STEP 4: Cleanup and exit monitor loop
+                    await self.cleanup()
+                    break
+                    
+        except asyncio.CancelledError:
+            logger.debug("Silence Monitor cancelled")
+        except Exception as e:
+            logger.error(f"Error in Silence Monitor: {e}", exc_info=True)

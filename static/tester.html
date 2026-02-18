@@ -242,9 +242,11 @@
                 };
 
                 ws.onclose = () => {
-                    log("WebSocket Closed");
-                    stopCall();
+                    log("WebSocket Closed - finishing audio...");
+                    // Wait for queued audio (e.g. goodbye message) to finish before teardown
+                    setTimeout(() => stopCall(), 3000);
                 };
+
 
                 ws.onerror = (e) => {
                     log(`WebSocket Error: ${e}`);

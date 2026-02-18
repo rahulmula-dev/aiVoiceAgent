@@ -21,6 +21,7 @@ class CallLogger:
         self.status = "in-progress"
         self.reason = "unknown"  # Termination reason: user_hangup, error, timeout, agent_ended
         self.events: List[Dict[str, Any]] = []
+        self._summary_written = False  # Guard: ensure summary is only written once
         
         # Log initialization
         self.log_event("orchestrator", "call_logger_initialized", 
@@ -61,11 +62,19 @@ class CallLogger:
     def generate_summary_line(self, status: str = None, reason: str = None):
         """
         Generates a saturated one-liner summary for logs.
+        Idempotent: only writes once per CallLogger instance, regardless of how many callers invoke it.
         
         Args:
             status: Call status (e.g., "completed", "error")
-            reason: Termination reason (e.g., "user_hangup", "error", "timeout", "agent_ended")
+            reason: Termination reason (e.g., "user_hangup", "silence_termination", "error")
         """
+        # GUARD: Only write once. The first caller wins (cleanup() sets the real reason).
+        # Subsequent calls from server finally blocks are no-ops.
+        if self._summary_written:
+            logger.debug(f"Summary already written for {self.call_id}. Skipping duplicate.")
+            return
+        self._summary_written = True
+
         try:
             if status:
                 self.status = status
