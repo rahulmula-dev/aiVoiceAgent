@@ -216,10 +216,10 @@ class VoiceOrchestrator:
                 summary=f"Security Violation: {intent}",
                 sentiment="SECURITY_ALERT",
                 call_logger=self.call_logger,
-                call_id=self.session.session_id if self.session else trace_id
+                call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                title=f"Security Alert: {intent}"
             ))
             
-            # C. Speak Refusal directly (Bypass Brain)
             # C. Speak Refusal directly (Bypass Brain)
             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
             
@@ -369,6 +369,22 @@ class VoiceOrchestrator:
                 # Start Silence Monitor (Story S4-2)
                 self.silence_task = asyncio.create_task(self._monitor_silence())
 
+                # LOG CALL TO CRM (New)
+                try:
+                    crm_id = await self.crm.log_call(
+                        call_id=self.session.session_id,
+                        caller_phone=self.session.caller_number,
+                        caller_type="new_student", # Default for now, could be dynamic
+                        summary="Incoming Call from Voice Agent",
+                        transcript="[Call Started]", 
+                        sentiment="Neutral"
+                    )
+                    if crm_id:
+                        self.session.crm_call_id = str(crm_id)
+                        logger.info(f"CRM Call Logged: {crm_id}")
+                except Exception as e:
+                    logger.error(f"Failed to log call to CRM: {e}")
+
                 # Initial Greeting
                 self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                 greeting = "Hello! I am CILA from GD College."
@@ -441,6 +457,22 @@ class VoiceOrchestrator:
             self.session = session
             self.state.transition_to(CallState.CALL_INIT)
             
+            # LOG CALL TO CRM (Text Mode)
+            try:
+                crm_id = await self.crm.log_call(
+                    call_id=self.session.session_id,
+                    caller_phone="web_chat",
+                    caller_type="prospect_chat",
+                    summary="Text Chat Session",
+                    transcript="[Chat Started]", 
+                    sentiment="Neutral"
+                )
+                if crm_id:
+                    self.session.crm_call_id = str(crm_id)
+                    logger.info(f"CRM Call Logged (Text Mode): {crm_id}")
+            except Exception as e:
+                logger.error(f"Failed to log text chat to CRM: {e}")
+
             # Initial Greeting
             greeting = "Hello! I am CILA from GD College. (Text Mode)"
             self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
@@ -593,7 +625,8 @@ class VoiceOrchestrator:
                             summary="English-Only Policy/Speculation Violation",
                             sentiment="QUALITY_FAILURE",
                             call_logger=self.call_logger,
-                            call_id=self.session.session_id if self.session else trace_id
+                            call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                            title="Quality Assurance Failure"
                         ))
                         
                         # Stop the stream immediately
@@ -626,7 +659,8 @@ class VoiceOrchestrator:
                     summary=ticket_summary,
                     sentiment=ticket_sentiment,
                     call_logger=self.call_logger,
-                    call_id=self.session.session_id
+                    call_id=self.session.crm_call_id or self.session.session_id,
+                    title=f"Support Request: {ticket_sentiment}"
                 ))
             
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
@@ -728,9 +762,6 @@ class VoiceOrchestrator:
                 except asyncio.CancelledError:
                     pass
 
-                except asyncio.CancelledError:
-                    pass
-
             # Cancel Silence Monitor
             if self.silence_task and not self.silence_task.done():
                 logger.debug("Cleanup: Cancelling silence monitor")
@@ -756,10 +787,11 @@ class VoiceOrchestrator:
 
                 await self.crm.create_ticket(
                     transcript=history_text,
-                    summary=f"Call Session Log ({reason})",
-                    sentiment="Final",
+                    summary=f"Call Log: {reason} (Session: {sid})",
+                    sentiment="Positive", # Default to positive for successful logs
                     call_logger=self.call_logger,
-                    call_id=sid
+                    call_id=self.session.crm_call_id or sid,
+                    title=f"Completed Session Log ({reason})"
                 )
                 
             if self.recorder:

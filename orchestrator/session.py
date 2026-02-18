@@ -20,6 +20,7 @@ class Session(BaseModel):
     # Identity (Pillar 1)
     session_id: str
     call_id: str
+    crm_call_id: Optional[str] = None
     caller_number: str = "unknown"
     start_time: datetime = Field(default_factory=datetime.now)
     end_time: Optional[datetime] = None

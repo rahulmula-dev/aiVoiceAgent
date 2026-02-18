@@ -58,6 +58,17 @@ class CRMEngine(Protocol):
         summary: str, 
         sentiment: str
     ) -> Any: ...
+
+    async def log_call(
+        self,
+        call_id: str,
+        caller_phone: str,
+        caller_type: str = "unknown",
+        summary: str = "",
+        transcript: str = "",
+        sentiment: str = "neutral",
+        duration_seconds: int = 0
+    ) -> Any: ...
     
     async def schedule_callback(self, phone_number: str) -> bool: ...
 
