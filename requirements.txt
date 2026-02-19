@@ -4,5 +4,5 @@ python-dotenv
 websockets
 httpx
 google-generativeai
-pinecone-client
+pinecone>=3.0.0
 pydantic

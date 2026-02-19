@@ -293,6 +293,14 @@ class VoiceOrchestrator:
         Main Loop: Coordinates the flow from Twilio (WebSocket) through STT, Brain, and TTS.
         """
         self.websocket = websocket
+        
+        # 0. INTAKE GUARDRAIL (Kill Switch)
+        if self.config.override_intake:
+            logger.critical(f"Connection Rejected: INTAKE_DISABLED is active (env={self.config.env})")
+            # Close with Policy Violation code (1008)
+            await websocket.close(code=1008, reason="Intake Disabled")
+            return
+
         self.mode = "audio"
         
         # Set the callback and connect

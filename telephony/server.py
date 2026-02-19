@@ -36,6 +36,28 @@ async def startup_event():
 async def root():
     return {"status": "GD College AI Voice Agent [Modular v2] - Active"}
 
+@app.get("/healthz")
+async def healthz():
+    """
+    Liveness Probe (K8s/Load Balancer).
+    Returns 200 OK if the server process is running.
+    """
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
+
+@app.get("/readyz")
+async def readyz():
+    """
+    Readiness Probe.
+    Checks if critical dependencies (CRM, Transcriber config) are ready.
+    """
+    # MOCK DEPENDENCY CHECK (Expand this as needed)
+    # 1. Check CRM API Reachability (Simulated)
+    # 2. Check Deepgram API Key presence
+    if not os.getenv("DEEPGRAM_API_KEY"):
+        return Response(content="Missing DEEPGRAM_API_KEY", status_code=503)
+        
+    return {"status": "ready", "services": {"crm": "mock_connected", "stt": "configured"}}
+
 @app.api_route("/voice", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """
