@@ -65,6 +65,11 @@ class Brain(LLMEngine):
 
             
             6. LIMITS: No immigration, medical, or legal advice.
+
+            7. RAPPORT BUILDING (Polite Exchange):
+               - If the user asks for dynamic info (like checking a status, ticket, or application) AND the [CURRENT CALL CONTEXT] shows "User Name: Unknown":
+                 - You MUST include a polite request for their name, e.g., "May I know who I am speaking with?"
+               - If you DO know their name, use it naturally in the conversation (e.g., "Sure, John, let me check...").
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -99,7 +104,7 @@ class Brain(LLMEngine):
         """
         return []
 
-    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None):
+    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -116,9 +121,20 @@ class Brain(LLMEngine):
                 rag_score = 0.0
             else:
                 try:
+                    # Context-Aware Follow-Ups (Story S4-9)
+                    # Augment short follow-up questions with known context for better vector matching
+                    search_query = text
+                    if call_context and len(text.split()) < 8:
+                        tags = []
+                        if call_context.program_interest: tags.append(call_context.program_interest)
+                        if call_context.intake: tags.append(call_context.intake)
+                        if tags:
+                            search_query = f"{text} (Context: {' '.join(tags)})"
+                            logger.info(f"Augmented RAG Query: '{search_query}'")
+
                     # KB returns (content, top_score)
                     context_text, rag_score = await asyncio.wait_for(
-                        asyncio.to_thread(self.kb.search, text, self.call_logger, 3, trace_id),
+                        asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
                         timeout=RAG_TIMEOUT
                     )
                 except asyncio.TimeoutError:
@@ -188,6 +204,9 @@ class Brain(LLMEngine):
             # Prepare Readable Chunks (Split for JSON list if needed, or keep text)
             chunks_list = context_text.split("\n\n") if context_text else []
             
+            if call_context:
+                call_context.retrieved_chunks_snapshot = chunks_list
+            
             decision_meta = {
                 "intent": intent,
                 "confidence_score": round(rag_score, 2),
@@ -219,7 +238,23 @@ class Brain(LLMEngine):
                 "has_grounding": has_grounding
             }
 
-            # 2. AUGMENT PROMPT with HIERARCHY
+            # S4-9: Context Injection
+            context_block = ""
+            if call_context:
+                last_intent = call_context.last_intents[-1] if call_context.last_intents else "unknown"
+                chunks_info = "Yes" if call_context.retrieved_chunks_snapshot else "None"
+                context_block = f"""
+                [CURRENT CALL CONTEXT]
+                User Name: {call_context.user_name or "Unknown"}
+                Program Interest: {call_context.program_interest or "Not specified"}
+                Intake: {call_context.intake or "Not specified"}
+                Mode: {call_context.study_mode or "Not specified"}
+                Campus: {call_context.campus or "Not specified"}
+                Last Intent: {last_intent}
+                Last Answer: {call_context.last_agent_answer_summary or "None"}
+                Last Retrieved Chunks: {chunks_info}
+                """
+
             rag_prompt = f"""
             [KB CONTEXT (General Info)]
             {context_text}
@@ -227,10 +262,13 @@ class Brain(LLMEngine):
             [CRM DATA (Dynamic Info)]
             {crm_context}
             
+            {context_block}
+            
             [USER QUESTION]
             {text}
             
             Answer the user based on the hierarchy: CRM for status, KB for general info.
+            Use [CURRENT CALL CONTEXT] to answer naturally (e.g. "As you are interested in Nursing...").
             """
             
             # 3. APPEND USER MSG TO HISTORY (Internal)
@@ -309,6 +347,8 @@ class Brain(LLMEngine):
             # 5. APPEND AI RESPONSE TO HISTORY (After success)
             if full_ai_text.strip():
                 history.append({"role": "model", "parts": [full_ai_text.strip()]})
+                if call_context:
+                    call_context.last_agent_answer_summary = full_ai_text.strip()
 
         except ResourceExhausted as quota_error:
             # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
@@ -400,5 +440,32 @@ if __name__ == "__main__":
         print("\nTesting CRM Enforcement...")
         res3 = await b.generate_response("Check status for ticket MOCK-12345")
         print(f"AI: {res3}")
+    
+    async def test():
+        # Inject Mock CRM
+        b = Brain(crm_client=MockCRM())
+        
+        print("\nTesting greeting (Brain only)...")
+        res1 = await b.generate_response("Hello!")
+        print(f"AI: {res1}")
+        
+        print("\nTesting retrieval (KB)...")
+        res2 = await b.generate_response("What are the college programs?")
+        print(f"AI: {res2}")
+        
+        # S4-9 Test
+        print("\nTesting Context Injection...")
+        from contracts.schemas import CallContext
+        ctx = CallContext(session_id="test", caller_number="999", start_time=0.0)
+        ctx.program_interest = "Nursing"
+        ctx.user_name = "John"
+        
+        # We need to call generate_stream directly or update generate_response to pass context
+        # For this test, let's just use generate_stream manually
+        print(f"Context: {ctx.program_interest}, {ctx.user_name}")
+        full_text = ""
+        async for chunk, meta in b.generate_stream("How long is the course?", [], call_context=ctx):
+            full_text += chunk + " "
+        print(f"AI (Context-Aware): {full_text.strip()}")
     
     asyncio.run(test())

@@ -1,0 +1,94 @@
+{
+    "programs": {
+        "nursing": [
+            "nursing",
+            "nurse",
+            "pn",
+            "practical nursing"
+        ],
+        "software": [
+            "software",
+            "development",
+            "sd",
+            "coding",
+            "programmer"
+        ],
+        "business": [
+            "business",
+            "management",
+            "administration",
+            "ba"
+        ],
+        "esthetics": [
+            "esthetics",
+            "aesthetic",
+            "skin",
+            "spa"
+        ],
+        "makeup": [
+            "makeup",
+            "make-up",
+            "artist",
+            "mua"
+        ],
+        "massage": [
+            "massage",
+            "therapy",
+            "rmt",
+            "masseur"
+        ],
+        "hairstyling": [
+            "hair",
+            "styling",
+            "barber",
+            "cut",
+            "salon"
+        ]
+    },
+    "intakes": {
+        "fall": [
+            "september",
+            "fall",
+            "sept",
+            "autumn"
+        ],
+        "winter": [
+            "january",
+            "winter",
+            "jan"
+        ],
+        "spring": [
+            "may",
+            "spring",
+            "april"
+        ]
+    },
+    "years": [
+        "2025",
+        "2026",
+        "2024"
+    ],
+    "modes": {
+        "online": [
+            "online",
+            "remote",
+            "distance",
+            "virtual"
+        ],
+        "in-person": [
+            "in-person",
+            "campus",
+            "offline",
+            "class",
+            "on-site"
+        ]
+    },
+    "campuses": {
+        "calgary": [
+            "calgary",
+            "ne",
+            "northeast",
+            "alberta"
+        ]
+    }
+}

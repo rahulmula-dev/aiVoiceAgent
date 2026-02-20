@@ -2,6 +2,7 @@ from enum import Enum
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from datetime import datetime
+from contracts.schemas import CallContext
 
 class SessionState(str, Enum):
     NEW = "NEW"
@@ -30,6 +31,7 @@ class Session(BaseModel):
     current_state: SessionState = SessionState.NEW
     
     # Memory & Context (Pillar 1)
+    call_context: CallContext = Field(default_factory=lambda: CallContext(session_id="temp", caller_number="unknown", start_time=0.0))
     conversation_history: List[Dict[str, str]] = []
     retrieved_chunks_cache: List[RetrievalChunk] = []
     last_intent: Optional[str] = None

@@ -58,6 +58,125 @@ async def readyz():
         
     return {"status": "ready", "services": {"crm": "mock_connected", "stt": "configured"}}
 
+@app.get("/api/live-context")
+async def get_live_context_gui():
+    """
+    Developer Tool: Auto-updating GUI for the Live RAM Cache.
+    """
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Live RAM Cache Monitor</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; }
+            h1 { color: #89b4fa; text-align: center; }
+            .status-bar { background-color: #313244; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+            .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background-color: #a6e3a1; margin-right: 8px; box-shadow: 0 0 8px #a6e3a1; }
+            .active-count { font-size: 1.2rem; font-weight: bold; color: #f9e2af; }
+            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+            .card { background-color: #181825; border: 1px solid #313244; border-radius: 10px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); transition: transform 0.2s; }
+            .card:hover { transform: translateY(-2px); border-color: #89b4fa; }
+            .card-title { color: #89b4fa; font-size: 1.2rem; margin-top: 0; margin-bottom: 15px; border-bottom: 1px solid #313244; padding-bottom: 10px; word-break: break-all; }
+            .field { margin-bottom: 8px; }
+            .label { color: #bac2de; font-weight: bold; display: inline-block; width: 120px; }
+            .value { color: #a6e3a1; font-family: monospace; font-size: 1.1rem; }
+            .value.null { color: #f38ba8; font-style: italic; }
+            .summary { background-color: #313244; padding: 10px; border-radius: 6px; margin-top: 15px; font-size: 0.9rem; font-style: italic; color: #bac2de; }
+            .empty-state { text-align: center; color: #6c7086; margin-top: 50px; font-size: 1.2rem; }
+        </style>
+    </head>
+    <body>
+        <h1>🧠 Live Agent Context Memory</h1>
+        <div class="status-bar">
+            <div>
+                <span class="status-indicator"></span>
+                <span>Live RAM Sync Active</span>
+            </div>
+            <div class="active-count">Active Calls: <span id="call-count">0</span></div>
+        </div>
+        
+        <div id="sessions-container" class="grid"></div>
+        
+        <div id="empty-state" class="empty-state">
+            <p>No active calls detected. Waiting for a connection...</p>
+        </div>
+
+        <script>
+            function formatValue(val) {
+                if (val === null || val === undefined) return '<span class="value null">None</span>';
+                return `<span class="value">${val}</span>`;
+            }
+
+            async function fetchContext() {
+                try {
+                    const response = await fetch('/api/live-context/data');
+                    const data = await response.json();
+                    
+                    document.getElementById('call-count').innerText = data.active_calls_count;
+                    
+                    const container = document.getElementById('sessions-container');
+                    const emptyState = document.getElementById('empty-state');
+                    
+                    if (data.active_calls_count === 0) {
+                        container.innerHTML = '';
+                        emptyState.style.display = 'block';
+                        return;
+                    }
+                    
+                    emptyState.style.display = 'none';
+                    let cardsHtml = '';
+                    
+                    for (const [sid, session] of Object.entries(data.sessions)) {
+                        cardsHtml += `
+                            <div class="card">
+                                <h2 class="card-title">📱 ${sid}</h2>
+                                <div class="field"><span class="label">Name:</span> ${formatValue(session.user_name)}</div>
+                                <div class="field"><span class="label">Program:</span> ${formatValue(session.program_interest)}</div>
+                                <div class="field"><span class="label">Intake:</span> ${formatValue(session.intake)}</div>
+                                <div class="field"><span class="label">Mode:</span> ${formatValue(session.study_mode)}</div>
+                                <div class="field"><span class="label">Campus:</span> ${formatValue(session.campus)}</div>
+                                
+                                <div class="summary">
+                                    <strong>Last AI Answer:</strong><br>
+                                    ${session.last_agent_answer_summary || 'Waiting for AI to speak...'}
+                                </div>
+                            </div>
+                        `;
+                    }
+                    container.innerHTML = cardsHtml;
+                    
+                } catch (e) {
+                    console.error("Failed to fetch live context", e);
+                }
+            }
+
+            // Refresh every 1.5 seconds
+            setInterval(fetchContext, 1500);
+            fetchContext();
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.get("/api/live-context/data")
+async def get_live_context_data():
+    """
+    Raw JSON data for the Live RAM Dashboard.
+    """
+    live_sessions = {}
+    for sid, session in default_session_manager.sessions.items():
+        live_sessions[sid] = session.call_context.dict()
+    
+    return {
+        "status": "LIVE_RAM_CACHE",
+        "active_calls_count": len(live_sessions),
+        "sessions": live_sessions
+    }
+
 @app.api_route("/voice", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """

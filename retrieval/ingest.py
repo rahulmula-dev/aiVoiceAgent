@@ -46,15 +46,23 @@ def get_safety_metadata(text):
 
 # --- 1. THE TRUTH SOURCE (Calgary, Canada Context) ---
 knowledge_chunks_raw = [
-    # Normal Facts
+    # --- GENERAL COLLEGE INFO ---
+    "GD College Mission: To empower students of all genders with skills for financial independence in beauty and cosmetology. We focus on business marketing, portfolio building, and job interview preparation.",
     "GD College is located in Calgary, Alberta, Canada. The specific address is #108, 1935-27 Ave NE, Calgary, AB T2E 7E4.",
-    "It is a recognized cosmetology school offering diploma programs in Esthetics, Makeup Artistry, Hairstyling, and Massage Therapy.",
-    "The GD College AI Voice Agent handles inbound calls from prospective students, existing students, and alumni. It operates 24/7 replacing the need for a human receptionist.",
-    "Admissions for the 2026 Batch are currently open. The tuition fees for the Computer Science diploma program are $15,000 per year.",
-    "GD College Policy: We prioritize student privacy and strictly follow Alberta's post-secondary guidelines.",
-    "CALL DURATION LIMIT: To ensure all students can be served, each automated session is restricted to a maximum of 5 minutes.",
+    "General Admissions: A high school diploma or equivalent is required. You can apply online via the GD College website or visit the campus.",
+    "Financial Aid: GD College offers various financial aid and payment options to help manage tuition costs. Contact the admissions office for details.",
+    "Class Schedules: We offer flexible schedules including morning, afternoon, evening, and weekend options.",
+
+    # --- PROGRAMS & DATES (2026) ---
+    "Advanced Esthetics Diploma: A 10-month on-site program (8-month intensive). Covers practical training with real clients. Next Batch: February 24, 2026.",
+    "Clinical Esthetician Diploma: A 5-month on-site professional certification. Includes job placement assistance. Next Batch: May 18, 2026.",
+    "Esthetician Diploma: A 5-month on-site program with state-of-the-art facilities. Next Batch: February 24, 2026.",
+    "Makeup Artist & Hairstylist Diploma: A 4-month on-site program. Requires high school diploma; no prior experience needed. Includes career counselling. Next Batch: February 24, 2026.",
+    "Massage Therapy Diploma: A 2-year on-site professional program. Next Batch: May 18, 2026.",
+    "Nail Technician Diploma: A 4-month (14-week) on-site course. Suitable for beginners. Next Batch: February 24, 2026.",
     
-    # HARD REFUSAL TARGETS (Actually Sensitive)
+    # --- POLICIES & SAFETY (Critical Guardrails) ---
+    "CALL DURATION LIMIT: To ensure all students can be served, each automated session is restricted to a maximum of 5 minutes.",
     "SENSITIVE: GD College does not provide immigration or visa advice. Students must contact IRCC directly.",
     "SENSITIVE: We have a zero-tolerance policy for harassment. Any legal action or lawsuit should be directed to our legal department."
 ]
@@ -107,6 +115,7 @@ def ingest_data():
             chunk_id = str(uuid.uuid4())
 
             # C. Generate Embedding (Gemini Embedding 001)
+            time.sleep(15)  # ADDED: Rate Limit buffer (Increased for Free Tier)
             response = genai.embed_content(
                 model="models/gemini-embedding-001",
                 content=text,
@@ -123,21 +132,22 @@ def ingest_data():
                 "hard_refusal_category": refusal_cat  # Requirement 5
             }
 
-            vectors.append({
+            # E. Immediate Upsert (Resilience)
+            vector_data = [{
                 "id": f"vec_{i}",
                 "values": response['embedding'],
                 "metadata": metadata
-            })
-            print(f"   - Processed chunk {i+1}/{len(final_chunks)} (Sensitive: {is_sensitive})")
+            }]
+            index.upsert(vectors=vector_data)
+            print(f"   [SUCCESS] Uploaded chunk {i+1}/{len(final_chunks)} (Sensitive: {is_sensitive})")
+            
         except Exception as e:
-            print(f"Error embedding chunk {i}: {e}")
+            print(f"   [FAILED] Chunk {i+1}: {e}")
+            if "429" in str(e):
+                print("      -> Waiting 60s for Rate Limit cooldown...")
+                time.sleep(60)
 
-    # Upsert to Pinecone
-    if vectors:
-        index.upsert(vectors=vectors)
-        print(f"\nSUCCESS: Uploaded {len(vectors)} facts with full metadata to the Brain!")
-    else:
-        print("\nFAILED: No vectors created.")
+    print("\nIngestion Process Complete.")
 
 if __name__ == "__main__":
     ingest_data()

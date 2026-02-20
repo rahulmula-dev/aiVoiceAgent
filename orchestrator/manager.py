@@ -14,6 +14,7 @@ from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from agent_logging import log_conversation_turn, CallLogger
 from .session_manager import SessionManager, SessionState
+from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
 
 logger = std_logging.getLogger("Orchestrator")
@@ -57,6 +58,9 @@ class VoiceOrchestrator:
         
         # Feature Config
         self.config = FeatureConfig()
+
+        # Context Manager (Story S4-9)
+        self.context_manager = ContextManager()
 
         # Silence Handling State (Story S4-2)
         self.silence_task = None
@@ -240,6 +244,30 @@ class VoiceOrchestrator:
             return 
 
         # 3. Start Parallel Response Generation (Normal Flow)
+        # S4-9: Update Context (Deterministic)
+        if self.session:
+            changes = self.context_manager.update_context(self.session.call_context, text, intent)
+            
+            # 5. Logging + Audit (Context Snapshot)
+            import hashlib
+            # Create a deterministic snapshot of just the persistent memory fields
+            memory_state = {
+                "program": self.session.call_context.program_interest,
+                "intake": self.session.call_context.intake,
+                "name": self.session.call_context.user_name,
+                "mode": self.session.call_context.study_mode,
+                "campus": self.session.call_context.campus
+            }
+            context_hash = hashlib.md5(json.dumps(memory_state, sort_keys=True).encode()).hexdigest()
+            
+            if self.call_logger:
+                 self.call_logger.log_event("context", "audit_snapshot", meta={
+                     "snapshot_hash": context_hash,
+                     "updated_fields": list(changes.keys()),
+                     "slot_extraction_result": changes,
+                     "reason_for_update": "Deterministic phrase match" if changes else "No new slots detected"
+                 }, trace_id=trace_id)
+
         self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id))
 
     async def speak_refusal(self, text, trace_id=None):
@@ -520,35 +548,50 @@ class VoiceOrchestrator:
 
             # Worker: Speaks chunks as they arrive from the brain
             async def tts_worker():
-                while True:
-                    sentence = await audio_queue.get()
-                    if sentence is None: break
+                total_chars = 0
+                worker_start_time = time.time()
+                try:
+                    while True:
+                        sentence = await audio_queue.get()
+                        if sentence is None: break
+                        total_chars += len(sentence)
+                        
+                        # STATE: Speaking
+                        self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
+                        
+                        tts_start_time = time.time()
+                        first_chunk_received = False
+                        
+                        async for chunk in self.synthesizer.speak(sentence):
+                            # DEFENSIVE: If task was cancelled during synthesis, stop immediately
+                            try:
+                                await asyncio.sleep(0) # Yield to let cancellation happen
+                            except asyncio.CancelledError:
+                                logger.debug("TTS stream interrupted by task cancellation.")
+                                raise
+    
+                            if not first_chunk_received:
+                                first_chunk_received = True
+                                tts_latency = int((time.time() - tts_start_time) * 1000)
+                                if self.call_logger:
+                                    self.call_logger.log_event("tts", "audio_stream_start", 
+                                                               latency_ms=tts_latency, 
+                                                               meta={"text": sentence},
+                                                               trace_id=trace_id)
+                            await self._send_response_chunk(chunk)
+                        audio_queue.task_done()
                     
-                    # STATE: Speaking
-                    self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
+                    # Calculate estimated playback duration (approx 10 chars per sec for natural TTS)
+                    estimated_play_time = total_chars / 10.0
+                    time_spent_generating = time.time() - worker_start_time
+                    remaining_time = estimated_play_time - time_spent_generating
                     
-                    tts_start_time = time.time()
-                    first_chunk_received = False
+                    if remaining_time > 0:
+                        logger.debug(f"Audio streamed to client. Sleeping {remaining_time:.1f}s to align with client playback.")
+                        await asyncio.sleep(remaining_time)
+                except asyncio.CancelledError:
+                    logger.debug("TTS Worker Cancelled.")
                     
-                    async for chunk in self.synthesizer.speak(sentence):
-                        # DEFENSIVE: If task was cancelled during synthesis, stop immediately
-                        try:
-                            await asyncio.sleep(0) # Yield to let cancellation happen
-                        except asyncio.CancelledError:
-                            logger.debug("TTS stream interrupted by task cancellation.")
-                            raise
-
-                        if not first_chunk_received:
-                            first_chunk_received = True
-                            tts_latency = int((time.time() - tts_start_time) * 1000)
-                            if self.call_logger:
-                                self.call_logger.log_event("tts", "audio_stream_start", 
-                                                           latency_ms=tts_latency, 
-                                                           meta={"text": sentence},
-                                                           trace_id=trace_id)
-                        await self._send_response_chunk(chunk)
-                    audio_queue.task_done()
-                
                 # Back to Listening when done speaking (if not escalated)
                 if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END]:
                     self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
@@ -589,7 +632,10 @@ class VoiceOrchestrator:
                 # Extract Caller Number for Auto-ID
                 caller_num = self.session.caller_number if self.session else "unknown"
                 
-                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id):
+                # Use persistent context
+                active_context = self.session.call_context if self.session else None
+                
+                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id, call_context=active_context):
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     
@@ -859,8 +905,8 @@ class VoiceOrchestrator:
                 # state = self.state.get_state()
                 # logger.debug(f"Silencer: Gap={time.time() - self.last_interaction_time:.1f}s State={state}")
 
-                # 1. Don't count silence while AI is speaking (or transitioning)
-                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION]:
+                # 1. Don't count silence while AI is speaking, buffering, or transcribing
+                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING]:
                     self.last_interaction_time = time.time()
                     continue
 
