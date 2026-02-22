@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import logging
+import time
 from unittest.mock import MagicMock, AsyncMock
 
 # Mock dependencies before imports
@@ -38,14 +39,23 @@ async def test_governance_strikes():
     manager.session.call_context = CallContext(
         session_id="test_session",
         caller_number="1234567890",
-        start_time="2026-02-22T23:00:00"
+        start_time=time.time()
     )
     manager.session.conversation_history = []
     
-    # 2. Strike 1: "Hola, ¿cómo estás?" (Non-English)
-    print("Action: Sending 'Hola, ¿cómo estás?' (Strike 1)")
+    # 2. Bypass Check: "mhm" (Short affirmation)
+    print("Action: Sending 'mhm' (Short affirmation)")
+    await manager._on_transcript("mhm", confidence=1.0)
+    await asyncio.sleep(0.1)
+    print(f"Result: Strike Count = {manager.language_strike_count}")
+    assert manager.language_strike_count == 0
+
+    # 3. Strike 1: "Hola, ¿cómo estás?" (Non-English, >15 chars)
+    print("\nAction: Sending 'Hola, ¿cómo estás?' (Strike 1)")
+    intent = manager.policy.classify_intent("Hola, ¿cómo estás?")
+    print(f"Detected Intent: {intent}")
     await manager._on_transcript("Hola, ¿cómo estás?", confidence=1.0)
-    await asyncio.sleep(0.1) # Wait for background task
+    await asyncio.sleep(0.1) 
     print(f"Result: Strike Count = {manager.language_strike_count}")
     assert manager.language_strike_count == 1
     # Check if correct refusal was used (via mock call analysis or looking at history)
@@ -59,15 +69,16 @@ async def test_governance_strikes():
     print(f"Result: Strike Count = {manager.language_strike_count}")
     assert manager.language_strike_count == 0
 
-    # 4. Strike 1 again: "Comment ça va?"
-    print("\nAction: Sending 'Comment ça va?' (Strike 1)")
-    await manager._on_transcript("Comment ça va?", confidence=1.0)
+    # 4. Strike 1 again: "Comment allez-vous aujourd'hui?"
+    print("\nAction: Sending 'Comment allez-vous aujourd'hui?' (Strike 1)")
+    await manager._on_transcript("Comment allez-vous aujourd'hui?", confidence=1.0)
+    await asyncio.sleep(0.1)
     assert manager.language_strike_count == 1
 
-    # 5. Strike 2: "Donde esta la biblioteca"
-    print("\nAction: Sending 'Donde esta la biblioteca' (Strike 2)")
-    await manager._on_transcript("Donde esta la biblioteca", confidence=1.0)
-    await asyncio.sleep(0.1) # Wait for background task
+    # 5. Strike 2: "¿Dónde está la biblioteca, por favor?"
+    print("\nAction: Sending '¿Dónde está la biblioteca, por favor?' (Strike 2)")
+    await manager._on_transcript("¿Dónde está la biblioteca, por favor?", confidence=1.0)
+    await asyncio.sleep(0.1) 
     print(f"Result: Strike Count = {manager.language_strike_count}")
     assert manager.language_strike_count == 2
     last_msg = manager.session.conversation_history[-1]['parts'][0]

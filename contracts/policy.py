@@ -106,8 +106,8 @@ class ResponsePolicyEngine:
         """
         Robust lightweight detection using langdetect with ASCII fallback.
         """
-        if not text or len(text.strip()) < 5: 
-            return True # Too short for reliable detection; assume English
+        if not text or len(text.strip()) < 15: 
+            return True # Too short for reliable detection (mhm, aha, names); assume English
             
         try:
             # 1. ASCII Ratio Check (First line of defense for Asian/Arabic scripts)
