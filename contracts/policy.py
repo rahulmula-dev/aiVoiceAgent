@@ -26,6 +26,9 @@ class PRDScripts:
     APOLOGY_INTERNAL_ERROR = "I am having a moment of silence. Please try again later."
     APOLOGY_STRUCTURAL_UPDATE = "I am currently undergoing a structural update. Check back in a few minutes!"
 
+    # Latency Fallback
+    LATENCY_FALLBACK = "I am experiencing a system delay, I will have a human agent follow up with you. Goodbye."
+
     # Escalation
     ESCALATION = "I apologize for the frustration. I will create a ticket so a human team member can follow up with you. Goodbye."
 

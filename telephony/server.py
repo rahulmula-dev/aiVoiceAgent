@@ -3,7 +3,7 @@ import os
 import logging
 import uvicorn
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, Request, Response
+from fastapi import FastAPI, WebSocket, Request, Response, Header, HTTPException, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
@@ -57,6 +57,29 @@ async def readyz():
         return Response(content="Missing DEEPGRAM_API_KEY", status_code=503)
         
     return {"status": "ready", "services": {"crm": "mock_connected", "stt": "configured"}}
+
+@app.post("/admin/reload-config")
+async def reload_config(x_admin_token: str = Header(...)):
+    """
+    Instantly reloads dynamic configuration flags. 
+    Protected by a simple admin token check.
+    """
+    from contracts.config import FeatureConfig
+    expected_token = os.getenv("ADMIN_RELOAD_TOKEN", "default-staging-token")
+    
+    if x_admin_token != expected_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Unauthorized configuration reload attempt."
+        )
+    
+    new_intake_state = FeatureConfig.reload_dynamic_flags()
+    
+    return {
+        "status": "success",
+        "message": "Configuration hot-reloaded successfully.",
+        "intake_enabled": new_intake_state
+    }
 
 @app.get("/api/live-context")
 async def get_live_context_gui():

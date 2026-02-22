@@ -136,15 +136,24 @@ class Brain(LLMEngine):
                             search_query = f"{text} (Context: {' '.join(tags)})"
                             logger.info(f"Augmented RAG Query: '{search_query}'")
 
+                    # TELEMETRY: Start RAG Timer
+                    rag_start_time = asyncio.get_event_loop().time()
+                    
                     # KB returns (content, top_score)
                     context_text, rag_score = await asyncio.wait_for(
                         asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
                         timeout=RAG_TIMEOUT
                     )
+                    
+                    # TELEMETRY: Finish RAG Timer
+                    rag_latency = asyncio.get_event_loop().time() - rag_start_time
+                    if self.call_logger:
+                        self.call_logger.log_event("retrieval", "rag_search_latency", latency_ms=int(rag_latency*1000), trace_id=trace_id)
                 except asyncio.TimeoutError:
                     logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
                     context_text = "No specific documents found due to timeout."
                     rag_score = 0.0
+                    rag_latency = RAG_TIMEOUT
             
             # Grounding: Only true if text exists AND score is decent (> 0.58)
             # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise

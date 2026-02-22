@@ -12,8 +12,12 @@ logger = logging.getLogger("crm")
 
 from contracts.interfaces import CRMEngine
 
-# Custom Exception for Retry Logic
+# Custom Exceptions
 class CRMConnectionError(Exception):
+    pass
+
+class SecurityError(Exception):
+    """Raised when security constraints are violated (e.g. Prod keys in Staging)."""
     pass
 
 class CRMClient(CRMEngine):
@@ -25,7 +29,16 @@ class CRMClient(CRMEngine):
         # Load API keys from .env
         self.api_key = os.getenv("CRM_API_KEY", "crm_test_key_123")
         self.base_url = os.getenv("CRM_BASE_URL", "http://72.61.172.170:8000")
+        self.app_env = os.getenv("APP_ENV", "production").lower()
         
+        # 1. CRM SECURITY GUARD (Task 1)
+        # Prevent production credentials in staging/development
+        if self.app_env in ["staging", "development", "test"]:
+            prod_indicators = ["live", "prod", "production"]
+            if any(indicator in self.api_key.lower() for indicator in prod_indicators):
+                logger.critical(f"FATAL SECURITY BREACH: Production CRM credentials detected in {self.app_env} environment!")
+                raise SecurityError(f"FATAL: Production CRM credentials detected in {self.app_env} environment.")
+
         self.headers = {
             "x-api-key": self.api_key,
             "Content-Type": "application/json"

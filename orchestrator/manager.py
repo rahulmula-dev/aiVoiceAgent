@@ -17,6 +17,11 @@ from .session_manager import SessionManager, SessionState
 from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
 
+# Task 4 & 5: Latency Management
+class LatencyBreachError(Exception):
+    """Raised when turn processing exceeds the 5.0s hard safety limit."""
+    pass
+
 logger = std_logging.getLogger("Orchestrator")
 
 class VoiceOrchestrator:
@@ -86,18 +91,22 @@ class VoiceOrchestrator:
         task.add_done_callback(log_exception)
         return task
 
-    async def _on_transcript(self, text, confidence=1.0):
+    async def _on_transcript(self, text, confidence=1.0, stt_latency: float = 0.0):
         """
         Callback for when user input is received (either via STT or text chat).
         Args:
             text: Transcribed text from user
             confidence: Deepgram confidence score (0.0-1.0), defaults to 1.0 for text chat
+            stt_latency: Measured STT processing time (Task 2)
         """
+        # Task 3 & 4: Start Turn Timer
+        turn_start_time = asyncio.get_event_loop().time()
+        
         # DEBUG: Log every callback invocation
         trace_id = str(uuid.uuid4())
         
         # 0. OVERRIDE: Disable Intake
-        if self.config.override_intake:
+        if not self.config.is_intake_enabled:
             logger.warning(f"[OVERRIDE] Intake Disabled (env={self.config.env}). Ignoring input: '{text}'")
             return
 
@@ -193,7 +202,10 @@ class VoiceOrchestrator:
             self.session.touch()
         
         if self.call_logger:
-            self.call_logger.log_event("stt", "user_transcript_final", meta={"text": text}, trace_id=trace_id)
+            self.call_logger.log_event("stt", "user_transcript_final", 
+                                     latency_ms=int(stt_latency * 1000), 
+                                     meta={"text": text, "confidence": confidence}, 
+                                     trace_id=trace_id)
         
         if self.response_task and not self.response_task.done():
             logger.debug(">>> BARGE-IN: Interrupting current AI response...")
@@ -270,8 +282,9 @@ class VoiceOrchestrator:
                      "slot_extraction_result": changes,
                      "reason_for_update": "Deterministic phrase match" if changes else "No new slots detected"
                  }, trace_id=trace_id)
-
-        self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id))
+        
+        # We start the task and let it handle its own errors (including LatencyBreachError)
+        self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id, turn_start_time=turn_start_time, stt_latency=stt_latency))
 
     async def speak_refusal(self, text, trace_id=None):
         """
@@ -326,7 +339,7 @@ class VoiceOrchestrator:
         self.websocket = websocket
         
         # 0. INTAKE GUARDRAIL (Kill Switch)
-        if self.config.override_intake:
+        if not self.config.is_intake_enabled:
             logger.critical(f"Connection Rejected: INTAKE_DISABLED is active (env={self.config.env})")
             # Close with Policy Violation code (1008)
             await websocket.close(code=1008, reason="Intake Disabled")
@@ -539,9 +552,10 @@ class VoiceOrchestrator:
                 await self.cleanup()
 
 
-    async def generate_and_speak(self, text, is_greeting=False, intent="unknown", trace_id=None):
+    async def generate_and_speak(self, text, is_greeting=False, intent="unknown", trace_id=None, turn_start_time: float = None, stt_latency: float = 0.0):
         """
         Streams AI thoughts into a parallel TTS queue for zero-lag audio.
+        Enforces 3s warning and 5s circuit breaker (Task 3 & 4).
         """
         if not self.session: return
         
@@ -644,6 +658,18 @@ class VoiceOrchestrator:
                 active_context = self.session.call_context if self.session else None
                 
                 async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id, call_context=active_context):
+                    # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
+                    if turn_start_time:
+                        current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                        
+                        # 5s Circuit Breaker (Hard Failure)
+                        if current_turn_elapsed > 5.0:
+                            raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
+                            
+                        # 3s Warning (Soft Logging)
+                        if not full_ai_text and current_turn_elapsed > 3.0:
+                             logger.warning(f"LATENCY_WARNING: Turn reached {current_turn_elapsed:.2f}s! Breakdown: STT={stt_latency:.2f}s, Process={current_turn_elapsed - stt_latency:.2f}s")
+
                     self.session.touch()
                     self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                     
@@ -727,6 +753,11 @@ class VoiceOrchestrator:
             
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
 
+        except LatencyBreachError as lbe:
+            # Task 5: Handle breach internally
+            sid = self.session.session_id if self.session else "unknown"
+            logger.error(f"[{sid}] Latency circuit breaker triggered: {lbe}")
+            await self._handle_latency_breach(sid)
         except asyncio.CancelledError:
             logger.info("AI thought-task cancelled by user interruption.")
             # Pillar 1: Identity snapshot 
@@ -887,6 +918,38 @@ class VoiceOrchestrator:
             print(f"CRITICAL CLEANUP ERROR for {sid}: {e}", file=sys.stderr)
         finally:
             logger.info(f"Orchestrator session {sid} finalized.")
+
+    async def _handle_latency_breach(self, sid: str):
+        """
+        Task 5: Fallback & CRM Ticketing for Latency Breach.
+        """
+        try:
+            # 1. Transition State
+            self.state.transition_to(CallState.CALL_END)
+            
+            # 2. Trigger Fallback TTS
+            msg = PRDScripts.LATENCY_FALLBACK
+            # Speak refusal handles the TTS stream
+            await self.speak_refusal(msg)
+            
+            # 3. Create CRM Callback Ticket (High Priority)
+            if self.session:
+                self.session.termination_reason = "latency_breach"
+                logger.warning(f"Creating Latency Breach CRM Ticket for {sid}")
+                
+                # Create ticket (The method itself handles internal backgrounding if needed, but we'll await)
+                await self.crm.create_ticket(
+                    transcript="[SYSTEM_EVENT] Call terminated due to sustained latency (>5.0s)",
+                    summary="High Latency detected (>5.0s) causing system circuit break.",
+                    sentiment="Negative",
+                    call_id=self.session.crm_call_id or sid,
+                    title="System_Latency_Breach"
+                )
+            
+            await self.cleanup()
+        except Exception as e:
+            logger.error(f"Error handling latency breach: {e}")
+            await self.cleanup()
 
     async def _monitor_silence(self):
         """

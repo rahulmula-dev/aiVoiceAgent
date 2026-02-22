@@ -107,9 +107,14 @@ class Transcriber(STTProvider):
                         speech_final = data.get("speech_final", False)
                         
                         if len(sentence) > 0:
+                            # TELEMETRY: Calculate STT Latency (from last voice chunk to transcript receipt)
+                            stt_latency = 0.0
+                            if hasattr(self, '_last_voice_timestamp'):
+                                stt_latency = asyncio.get_event_loop().time() - self._last_voice_timestamp
+                            
                             # Non-empty transcript - pass to manager
-                            logger.debug(f"USER FINAL: {sentence}")
-                            asyncio.create_task(self.on_transcript_callback(sentence, conf))
+                            logger.debug(f"USER FINAL: {sentence} (STT Latency: {stt_latency:.3f}s)")
+                            asyncio.create_task(self.on_transcript_callback(sentence, conf, stt_latency=stt_latency))
                         elif conf == 0.0 and speech_final:
                             # Empty + 0.0 + speech_final = Pass for state-aware detection
                             logger.debug(f"[EMPTY 0.0 + SPEECH_FINAL] Passing to manager")
@@ -147,6 +152,9 @@ class Transcriber(STTProvider):
                 # Classify packet
                 if len(non_silence_bytes) > len(audio_chunk) * 0.1:  # 10% activity threshold
                     self._voice_packets += 1
+                    # TELEMENTRY: Mark the timestamp of the most recent voice activity
+                    self._last_voice_timestamp = asyncio.get_event_loop().time()
+                    
                     if not hasattr(self, '_first_voice_detected'):
                         self._first_voice_detected = True
                         logger.debug(f"🎤 VOICE DETECTED! ({self.encoding} @ {self.sample_rate}Hz, Packet #{self._packet_counter})")

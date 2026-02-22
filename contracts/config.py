@@ -1,6 +1,7 @@
 import os
 import logging
 from dataclasses import dataclass
+from dotenv import load_dotenv
 
 logger = logging.getLogger("Config")
 
@@ -11,6 +12,20 @@ class FeatureConfig:
     Enforces access control based on environment.
     """
     
+    @classmethod
+    def reload_dynamic_flags(cls) -> bool:
+        """
+        Forces a reload of the .env file without restarting the Python process.
+        Returns the updated boolean state of INTAKE_ENABLED.
+        """
+        logger.info("Initiating hot-reload of environment variables...")
+        # override=True forces the new values from .env to overwrite current os.environ
+        load_dotenv(override=True) 
+        
+        intake_state = os.getenv("INTAKE_ENABLED", "true").lower() == "true"
+        logger.warning(f"Config Reloaded. INTAKE_ENABLED is now: {intake_state}")
+        return intake_state
+
     @property
     def env(self) -> str:
         return os.getenv("APP_ENV", "production").lower()
@@ -18,6 +33,11 @@ class FeatureConfig:
     @property
     def is_dev_or_staging(self) -> bool:
         return self.env in ["development", "staging", "test"]
+
+    @property
+    def is_intake_enabled(self) -> bool:
+        """Dynamic check for intake enablement."""
+        return os.getenv("INTAKE_ENABLED", "true").lower() == "true"
 
     @property
     def override_intake(self) -> bool:
