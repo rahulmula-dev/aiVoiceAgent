@@ -60,6 +60,7 @@ class VoiceOrchestrator:
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
         self.user_has_spoken = False  # Track if user has spoken at least once
+        self.language_strike_count = 0 # Strike tracker for non-English input (Task 3.4)
         
         # Feature Config
         self.config = FeatureConfig()
@@ -223,11 +224,32 @@ class VoiceOrchestrator:
         # Check for hard refusals or sensitive topics BEFORE touching the LLM/DB
         intent = self.policy.classify_intent(text)
         
+        # TASK 3.4: Reset strike counter on valid English input
+        if intent == "PROCEED":
+            if self.language_strike_count > 0:
+                logger.debug(f"[RESET] Language strike counter {self.language_strike_count}→0 (Valid English input)")
+                self.language_strike_count = 0
+
         if intent != "PROCEED":
             logger.warning(f"POLICY VIOLATION: {intent} detected for input: {text}")
             
-            # A. Get Refusal Script
-            refusal_text = self.policy.get_refusal_script(intent)
+            # --- TASK 3.4: STRIKE TRACKING ---
+            if intent == "HARD_REFUSAL_LANGUAGE":
+                self.language_strike_count += 1
+                logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
+                
+                if self.language_strike_count == 1:
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
+                elif self.language_strike_count == 2:
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
+                else: # Strike 3+
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
+                    # Definitive graceful termination
+                    self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
+                    return
+            else:
+                # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
+                refusal_text = self.policy.get_refusal_script(intent)
             
             # B. Log to CRM
             self._create_task_with_log(self.crm.create_ticket(
@@ -248,15 +270,16 @@ class VoiceOrchestrator:
                 "confidence_score": 1.0, # Checked via deterministic policy
                 "chunks_used": [],
                 "crm_hit": False,
-                "governance_decision": f"Refusal: {intent}",
-                "refusal_flags": {"policy_violation": True}
+                "governance_decision": "Blocked",
+                "refusal_flags": {
+                    "strike_count": self.language_strike_count if intent == "HARD_REFUSAL_LANGUAGE" else 0
+                }
             }
             if self.call_logger:
                 self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
-            logger.info(f"DECISION LOG: [Refusal: {intent}] | Policy Violation")
-            # ---------------------------------------
-            
-            return 
+            return
+
+
 
         # 3. Start Parallel Response Generation (Normal Flow)
         # S4-9: Update Context (Deterministic)
@@ -1045,3 +1068,30 @@ class VoiceOrchestrator:
             logger.debug("Silence Monitor cancelled")
         except Exception as e:
             logger.error(f"Error in Silence Monitor: {e}", exc_info=True)
+
+    async def _language_termination_flow(self, refusal_text, trace_id):
+        """
+        Task 3.4 & 3.6: Graceful termination for sustained non-English violations.
+        """
+        try:
+            # 1. Transition State
+            self.state.transition_to(CallState.CALL_END, trace_id=trace_id)
+            
+            # 2. Speak Final Goodbye (Awaited to ensure audio transmits)
+            await self.speak_refusal(refusal_text, trace_id=trace_id)
+            
+            # 3. CRM Ticket (Task 3.6)
+            self._create_task_with_log(self.crm.create_ticket(
+                transcript="[SYSTEM_EVENT] Call terminated due to language policy violation (3 strikes).",
+                summary="Language Barrier Termination (3 Strikes)",
+                sentiment="Negative",
+                call_logger=self.call_logger,
+                call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                title="Policy Termination: Language"
+            ))
+            
+            # 4. Final Cleanup
+            await self.cleanup()
+        except Exception as e:
+            logger.error(f"Error in language termination flow: {e}")
+            await self.cleanup()

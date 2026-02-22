@@ -15,6 +15,9 @@ class PRDScripts:
     REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
     REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
     REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
+    REFUSAL_LANGUAGE_1 = "I am currently designed to support English only. Please continue in English."
+    REFUSAL_LANGUAGE_2 = "I can only understand English. If the next input is not in English, I will have to end the call."
+    REFUSAL_LANGUAGE_3 = "I am ending the call now as I can only assist in English. Goodbye."
     REFUSAL_KB_MISS = "I do not have that information. A member of the GD College admissions team will follow up."
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
     
@@ -101,14 +104,37 @@ class ResponsePolicyEngine:
             
     def _is_english(self, text: str) -> bool:
         """
-        Simple heuristic: Ratio of ASCII characters to total length.
+        Robust lightweight detection using langdetect with ASCII fallback.
         """
-        if not text: return True
+        if not text or len(text.strip()) < 5: 
+            return True # Too short for reliable detection; assume English
+            
         try:
+            # 1. ASCII Ratio Check (First line of defense for Asian/Arabic scripts)
             ascii_chars = sum(1 for c in text if ord(c) < 128)
             ratio = ascii_chars / len(text)
-            return ratio >= 0.8 # Allow 20% for accents/emojis
-        except:
+            if ratio < 0.5:
+                return False
+
+            # 2. Langdetect Check (For Latin-based languages like Spanish/French)
+            from langdetect import detect_langs, DetectorFactory
+            DetectorFactory.seed = 0 # For deterministic results
+            
+            results = detect_langs(text.lower())
+            # Result format: [en:0.999997, es:0.000002]
+            top_lang = results[0]
+            
+            if top_lang.lang == 'en' and top_lang.prob > 0.5:
+                return True
+            
+            # Check if 'en' is present at all with decent probability
+            for res in results:
+                if res.lang == 'en' and res.prob > 0.8:
+                    return True
+                    
+            return False
+        except Exception:
+            # If langdetect fails (e.g. no features), fallback to True to avoid false refusals
             return True
 
     def validate_response(self, context: CallContext, response_text: str) -> bool:
