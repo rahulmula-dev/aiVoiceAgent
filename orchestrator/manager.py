@@ -8,7 +8,7 @@ import uuid
 from orchestrator.brain import Brain
 from orchestrator.interfaces import STTProvider, TTSProvider
 from crm.client import CRMClient
-from contracts.policy import ResponsePolicyEngine
+from contracts.policy import ResponsePolicyEngine, PRDScripts
 from contracts.schemas import CallContext
 from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
@@ -140,7 +140,7 @@ class VoiceOrchestrator:
                         self.last_refusal_time = current_time
                         self.consecutive_empty_frames = 0
                         
-                        refusal_text = "I am currently designed to support English only. Please contact our admission office for assistance."
+                        refusal_text = PRDScripts.REFUSAL_LANGUAGE
                         
                         if self.call_logger:
                              self.call_logger.log_event("brain", "chunk_generated", 
@@ -176,7 +176,7 @@ class VoiceOrchestrator:
         if confidence < 0.4:
             logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
             self.response_task = asyncio.create_task(
-                self.speak_refusal("I didn't quite catch that. Could you please repeat?")
+                self.speak_refusal(PRDScripts.APOLOGY_CLARIFICATION)
             )
             return
         
@@ -202,7 +202,10 @@ class VoiceOrchestrator:
                 self.call_logger.save_log(status="in-progress")
                 self.call_logger.log_event("orchestrator", "user_interruption")
             self.response_task.cancel()
-            await self.send_clear_buffer()
+            # B. Speak interruption prompt
+            self.response_task = asyncio.create_task(
+                self.speak_refusal(PRDScripts.INTERRUPTION, trace_id=trace_id)
+            )
 
         # 2. SECURITY & POLICY CHECK (Pre-Brain)
         # Check for hard refusals or sensitive topics BEFORE touching the LLM/DB
@@ -423,7 +426,7 @@ class VoiceOrchestrator:
 
                 # Initial Greeting
                 self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
-                greeting = "Hello! I am CILA from GD College."
+                greeting = PRDScripts.GREETING
                 self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
 
                 # 2. Main Media Loop
@@ -466,7 +469,7 @@ class VoiceOrchestrator:
             # Attempt to play goodbye message if socket still open
             try:
                 if self.websocket:
-                    goodbye_text = "I am having technical trouble. Please wait while I reconnect you or try calling back later. Goodbye."
+                    goodbye_text = PRDScripts.APOLOGY_FATAL
                     async for chunk in self.synthesizer.speak(goodbye_text):
                         await self.send_audio_response(chunk)
             except:
@@ -510,7 +513,7 @@ class VoiceOrchestrator:
                 logger.error(f"Failed to log text chat to CRM: {e}")
 
             # Initial Greeting
-            greeting = "Hello! I am CILA from GD College. (Text Mode)"
+            greeting = PRDScripts.GREETING_TEXT
             self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
 
             # Enable Silence Monitor for Text Mode testing
@@ -611,9 +614,14 @@ class VoiceOrchestrator:
                 
             if escalation:
                 self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
-                escalation_msg = "ID 402: Transferring you to a human agent now."
+                escalation_msg = PRDScripts.ESCALATION
                 await audio_queue.put(escalation_msg)
                 full_ai_text = escalation_msg
+                
+                # S4-5: End Call Gracefully on Escalation (No Live Transfer)
+                # Let it finish speaking, the worker handles state, then end call
+                asyncio.create_task(self._delayed_call_end())
+
             elif is_greeting:
                 self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id) # Re-confirm state logic
                 await audio_queue.put(text)
@@ -670,7 +678,7 @@ class VoiceOrchestrator:
                         
                         # FAILURE ACTION: English Refusal & Escalation (Policy Rule)
                         self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
-                        failure_msg = "I am currently trained to speak only in English. Please contact our admission office for assistance."
+                        failure_msg = PRDScripts.REFUSAL_LANGUAGE
                         await audio_queue.put(failure_msg)
                         full_ai_text = failure_msg
                         
@@ -768,15 +776,11 @@ class VoiceOrchestrator:
         self.mode = "audio" 
         await self._send_response_chunk(chunk)
 
-    async def send_clear_buffer(self):
-        if self.websocket and self.session:
-            try:
-                await self.websocket.send_text(json.dumps({
-                    "event": "clear",
-                    "streamSid": self.session.session_id
-                }))
-            except:
-                pass
+    async def _delayed_call_end(self, delay=5.0):
+        """Helper to let TTS finish speaking before terminating"""
+        await asyncio.sleep(delay)
+        if self.state.get_state() != CallState.CALL_END:
+             await self.cleanup()
 
     async def cleanup(self):
         """Final session archival and resource release (Pillar 3)."""
@@ -924,7 +928,7 @@ class VoiceOrchestrator:
                     self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
                     
                     # Prompt #1 - await so it fully completes before the loop continues
-                    msg = "Are you still there?"
+                    msg = PRDScripts.SILENCE_1
                     await self.speak_refusal(msg)
                     
                 # Stage 2: Secondary Warning (Another 10s passed since Prompt 1)
@@ -934,7 +938,7 @@ class VoiceOrchestrator:
                     self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
                     
                     # Prompt #2 - await so it fully completes before the loop continues
-                    msg = "I haven't heard from you for a while. I will have to end the call soon if you don't respond."
+                    msg = PRDScripts.SILENCE_2
                     await self.speak_refusal(msg)
                     
                 # Stage 3: Termination (Another 10s passed since Prompt 2)
@@ -949,7 +953,7 @@ class VoiceOrchestrator:
                     # STEP 1: Speak goodbye FIRST, while WebSocket is still fully open.
                     # We must NOT set CALL_END yet — that would break the media loop and
                     # close the WebSocket before the audio chunks are delivered.
-                    goodbye = "Disconnecting due to silence. Goodbye."
+                    goodbye = PRDScripts.SILENCE_TERMINATION
                     await self.speak_refusal(goodbye)
 
                     # STEP 2: NOW transition to CALL_END.

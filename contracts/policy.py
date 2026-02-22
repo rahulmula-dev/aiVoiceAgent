@@ -1,9 +1,46 @@
 from .schemas import EscalationEvent, CallContext
 
+class PRDScripts:
+    # Greetings
+    GREETING = "Hello! I am CILA from GD College."
+    GREETING_TEXT = "Hello! I am CILA from GD College. (Text Mode)"
+    
+    # Refusals
+    REFUSAL_SENSITIVE = "I cannot continue this conversation due to a violation of our safety policy. Goodbye."
+    REFUSAL_IMMIGRATION = "As an AI for GD College, I cannot provide immigration or visa advice. Please contact a specialized consultant."
+    REFUSAL_MEDICAL = "I am not authorized to provide medical advice. Please consult a healthcare professional."
+    REFUSAL_LEGAL = "I cannot offer legal advice. Please contact a qualified attorney."
+    REFUSAL_INTERNAL_STAFF = "I cannot discuss internal staff or HR matters."
+    REFUSAL_POLITICS = "I cannot discuss political opinions."
+    REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
+    REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
+    REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
+    REFUSAL_KB_MISS = "I do not have that information. A member of the GD College admissions team will follow up."
+    REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
+    
+    # Apologies
+    APOLOGY_CLARIFICATION = "I didn't quite catch that. Could you please repeat?"
+    APOLOGY_OVERLOADED = "I am currently overloaded with requests. Please try again in a few seconds."
+    APOLOGY_CAPACITY = "I am currently at capacity, please try again later."
+    APOLOGY_FATAL = "I am having technical trouble. Please wait while reconnecting or try calling back later. Goodbye."
+    APOLOGY_INTERNAL_ERROR = "I am having a moment of silence. Please try again later."
+    APOLOGY_STRUCTURAL_UPDATE = "I am currently undergoing a structural update. Check back in a few minutes!"
+
+    # Escalation
+    ESCALATION = "I apologize for the frustration. I will create a ticket so a human team member can follow up with you. Goodbye."
+
+    # Silence
+    SILENCE_1 = "Are you still there?"
+    SILENCE_2 = "I haven't heard from you for a while. I will have to end the call soon if you don't respond."
+    SILENCE_TERMINATION = "Disconnecting due to silence. Goodbye."
+
+    # Interruption
+    INTERRUPTION = "Should I continue from where I left off?"
+
 class ResponsePolicyEngine:
     """
     Standard implementation of Policy Engine.
-    Filters hallucinations, confidential info, and bad language.
+    Filters hallucinations, confidential info, bad language, and enforces PRD tone.
     """
     
     # --- 1. SENSITIVE CATEGORIES (Immediate Hangup or Severe Warning) ---
@@ -16,7 +53,11 @@ class ResponsePolicyEngine:
     HARD_REFUSAL_KEYWORDS = {
         "immigration": ["visa", "immigration", "permit", "greencard", "pr", "citizenship"],
         "medical": ["medical", "doctor", "diagnosis", "treatment", "prescription", "health advice"],
-        "legal": ["legal", "lawyer", "sue", "court", "attorney", "contract"]
+        "legal": ["legal", "lawyer", "sue", "court", "attorney", "contract"],
+        "internal_staff": ["salary", "hr", "staff issues", "employee", "paycheck", "hiring"],
+        "politics": ["politics", "political", "election", "government opinion", "democrat", "republican", "liberal", "conservative"],
+        "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
+        "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"]
     }
 
     ESCALATION_KEYWORDS = [
@@ -27,6 +68,17 @@ class ResponsePolicyEngine:
     SPECULATIVE_PHRASES = [
         "maybe", "might", "i think", "i believe", "possibly", "not sure", 
         "i guess", "could be", "probably"
+    ]
+
+    # --- 4. TONE & PERSONALITY (Governance Validation - PRD S4-5) ---
+    RUDE_KEYWORDS = [
+        "stupid", "idiot", "dumb", "shut up", "crazy", "moron", "fool"
+    ]
+
+    PERSUASIVE_KEYWORDS = [
+        "you must buy", "act now", "guaranteed", "limited time offer",
+        "don't miss out", "buy now", "click here", "subscribe now", "special offer",
+        "must enroll", "sign up immediately"
     ]
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -87,6 +139,11 @@ class ResponsePolicyEngine:
         except:
             pass # Safety fallback
             
+        # 5. Tone & Personality Governance
+        for rp in self.RUDE_KEYWORDS + self.PERSUASIVE_KEYWORDS:
+            if rp in lower_text:
+                return False
+
         return True
 
     def check_escalation(self, user_text: str) -> EscalationEvent | None:
@@ -132,18 +189,30 @@ class ResponsePolicyEngine:
         Returns the static script for a given refusal intent.
         """
         if intent == "SENSITIVE":
-            return "I cannot continue this conversation due to violation of our safety policy. Goodbye."
+            return PRDScripts.REFUSAL_SENSITIVE
             
         if intent == "HARD_REFUSAL_IMMIGRATION":
-            return "As an AI for GD College, I cannot provide immigration or visa advice. Please contact a calibrated immigration consultant."
+            return PRDScripts.REFUSAL_IMMIGRATION
             
         if intent == "HARD_REFUSAL_MEDICAL":
-            return "I am not authorized to provide medical advice. Please consult a healthcare professional."
+            return PRDScripts.REFUSAL_MEDICAL
             
         if intent == "HARD_REFUSAL_LEGAL":
-            return "I cannot offer legal advice. Please contact a qualified attorney."
+            return PRDScripts.REFUSAL_LEGAL
             
         if intent == "HARD_REFUSAL_LANGUAGE":
-            return "I can only speak English. Please ask your question in English."
+            return PRDScripts.REFUSAL_LANGUAGE
+            
+        if intent == "HARD_REFUSAL_INTERNAL_STAFF":
+            return PRDScripts.REFUSAL_INTERNAL_STAFF
+            
+        if intent == "HARD_REFUSAL_POLITICS":
+            return PRDScripts.REFUSAL_POLITICS
+            
+        if intent == "HARD_REFUSAL_COMPETITORS":
+            return PRDScripts.REFUSAL_COMPETITORS
+            
+        if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES":
+            return PRDScripts.REFUSAL_FINANCIAL_DISPUTES
 
-        return "I am unable to assist with that specific request."
+        return PRDScripts.REFUSAL_DEFAULT

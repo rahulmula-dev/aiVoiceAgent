@@ -14,6 +14,7 @@ load_dotenv()
 
 from contracts.interfaces import LLMEngine
 from contracts.config import FeatureConfig
+from contracts.policy import PRDScripts
 
 # Pillar 2: Anti-Freeze Timeouts
 LLM_TIMEOUT = 12.0
@@ -21,7 +22,7 @@ RAG_TIMEOUT = 5.0
 
 class Brain(LLMEngine):
     # 1. DEFINE SOURCE OF TRUTH FOR REFUSAL SCRIPT
-    KB_MISS_SCRIPT = "I do not have that information. A staff member will follow up."
+    KB_MISS_SCRIPT = PRDScripts.REFUSAL_KB_MISS
 
     def __init__(self, call_logger=None, crm_client=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -42,12 +43,15 @@ class Brain(LLMEngine):
             1. CONVERSATIONAL PRIORITY: 
                - If the user greets you (Hello, Hi, Hey) or asks "How are you?", respond conversationally and briefly: "I'm doing well, thank you! How can I help you with GD College today?"
                - This is a warm conversation. Do NOT use strict refusals for simple greetings or casual questions.
-
+               - IMPORTANT TONE ENFORCEMENT: You must be friendly but professional at all times.
+               - RESTRICTION: Do NOT use rude phrasing or overly casual slang.
+               - RESTRICTION: Do NOT use persuasive or sales-like language (like 'you must buy', 'act now', 'guaranteed').
+               
             2. LANGUAGE GUARDRAIL:
                - You are an English-only agent.
                - You MUST refuse if the input is CLEARLY another language (like sustained Hindi, Spanish, etc.) or if it is "phonetic gibberish" (nonsensical English words that result from forcing a non-English language through your English model).
                - DO NOT refuse broken English, slight repetitions, or conversational fillers.
-               - Refusal Output: "I am currently designed to support English only. Please contact our admission office for assistance."
+               - Refusal Output: "{PRDScripts.REFUSAL_LANGUAGE}"
 
             3. COLLEGE KNOWLEDGE (RAG):
                - Answer questions about GD College using the provided [CONTEXT].
@@ -110,7 +114,7 @@ class Brain(LLMEngine):
         Accepts a history list (managed externally).
         """
         if history is None:
-            yield "I am currently experiencing high traffic. Please try calling back later."
+            yield PRDScripts.APOLOGY_OVERLOADED
             return
 
         try:
@@ -285,7 +289,7 @@ class Brain(LLMEngine):
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
-                yield "I am taking too long to think. Please ask again."
+                yield PRDScripts.APOLOGY_CAPACITY
                 return
             except ResourceExhausted as quota_error:
                 # GRACEFUL HANDLING: Log single line instead of full traceback
@@ -298,7 +302,7 @@ class Brain(LLMEngine):
                                                trace_id=trace_id)
                 
                 # Structural change: yield tuple (text, metadata)
-                yield ("I am currently at capacity, please try again later.", {"error": True})
+                yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
                 return
             
             full_ai_text = ""
@@ -354,10 +358,10 @@ class Brain(LLMEngine):
             # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
             # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
             logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
-            yield ("I am currently at capacity, please try again later.", {"error": True})
+            yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
         except ResourceExhausted:
             logger.warning("Gemini Quota Exceeded during streaming.")
-            yield "My AI brain has reached its free-tier limit. I will be back in a minute!"
+            yield PRDScripts.APOLOGY_CAPACITY
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
@@ -367,11 +371,11 @@ class Brain(LLMEngine):
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
-                yield ("I am currently overloaded with requests. Please try again in a few seconds.", {"error": True})
+                yield (PRDScripts.APOLOGY_OVERLOADED, {"error": True})
             elif "404" in str(e):
-                yield "I am currently undergoing a structural update. Check back in a few minutes!"
+                yield PRDScripts.APOLOGY_STRUCTURAL_UPDATE
             else:
-                yield "I am having a moment of silence (Internal Error). Please try again later."
+                yield PRDScripts.APOLOGY_INTERNAL_ERROR
 
     async def generate_response(self, text, history=None, trace_id=None):
         """
