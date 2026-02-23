@@ -1,4 +1,5 @@
 from .schemas import EscalationEvent, CallContext
+import logging
 
 class PRDScripts:
     # Greetings
@@ -15,6 +16,7 @@ class PRDScripts:
     REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
     REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
     REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
+    # Task 3: Hard Language Refusal Scripts
     REFUSAL_LANGUAGE_1 = "I am currently designed to support English only. Please continue in English."
     REFUSAL_LANGUAGE_2 = "I can only understand English. If the next input is not in English, I will have to end the call."
     REFUSAL_LANGUAGE_3 = "I am ending the call now as I can only assist in English. Goodbye."
@@ -87,6 +89,14 @@ class ResponsePolicyEngine:
         "must enroll", "sign up immediately"
     ]
 
+    # --- 5. LANGUAGE DETECTION (Story S1-4) ---
+    COMMON_ENGLISH_WORDS = {
+        "ok", "okay", "fine", "yes", "yup", "no", "mhm", "hello", "hi", 
+        "can", "you", "about", "your", "more", "tell", "me", "the", "be", 
+        "what", "where", "how", "when", "why", "this", "that", "these", 
+        "those", "good", "bad", "thanks", "thank", "please", "help"
+    }
+
     def _contains_word(self, text: str, keyword: str) -> bool:
         """
         Helper: Checks if keyword exists in text as a distinct word or substring depending on type.
@@ -102,40 +112,60 @@ class ResponsePolicyEngine:
             # Substring match for longer distinct terms
             return keyword in text
             
-    def _is_english(self, text: str) -> bool:
+    def _is_english(self, text: str, detected_lang: str = None) -> bool:
         """
-        Robust lightweight detection using langdetect with ASCII fallback.
+        [GOVERNANCE] Bulletproof Failsafe English Detection (Expert Debugger Version).
+        Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
         """
-        if not text or len(text.strip()) < 15: 
-            return True # Too short for reliable detection (mhm, aha, names); assume English
-            
-        try:
-            # 1. ASCII Ratio Check (First line of defense for Asian/Arabic scripts)
-            ascii_chars = sum(1 for c in text if ord(c) < 128)
-            ratio = ascii_chars / len(text)
-            if ratio < 0.5:
-                return False
-
-            # 2. Langdetect Check (For Latin-based languages like Spanish/French)
-            from langdetect import detect_langs, DetectorFactory
-            DetectorFactory.seed = 0 # For deterministic results
-            
-            results = detect_langs(text.lower())
-            # Result format: [en:0.999997, es:0.000002]
-            top_lang = results[0]
-            
-            if top_lang.lang == 'en' and top_lang.prob > 0.5:
-                return True
-            
-            # Check if 'en' is present at all with decent probability
-            for res in results:
-                if res.lang == 'en' and res.prob > 0.8:
-                    return True
-                    
+        # 0. Authoritative STT Metadata Guard (Fixes "English Hallucinations" bypass)
+        if detected_lang and detected_lang != 'en':
             return False
-        except Exception:
-            # If langdetect fails (e.g. no features), fallback to True to avoid false refusals
+            
+        import re
+        import logging
+        from langdetect import detect_langs
+        policy_logger = logging.getLogger("Policy")
+        
+        text = text.strip()
+        if not text:
+            return True # Ignore truly empty strings
+
+        # 1. Dictionary-Based Priority (Prevents Langdetect false positives on short text)
+        words = re.findall(r'\b\w+\b', text.lower())
+        
+        # If any word in human-readable text is from our common list, we grant a bypass
+        # "Okay. Fine. Can you" -> "okay" is in list -> Bypass langdetect
+        if any(w in self.COMMON_ENGLISH_WORDS for w in words):
+            policy_logger.debug(f"[GOVERNANCE] Dictionary Bypass for: '{text}'")
             return True
+            
+        if len(text) < 4:
+            return True # Too short to reliably detect, give benefit of the doubt
+
+        # 2. ASCII/Latin Check (Catches Hindi/Bengali/Mandarin instantly)
+        # If less than 50% of the text is standard Latin characters, it's definitely foreign.
+        # Strips numbers and punctuation before checking ratio.
+        clean_text = re.sub(r'[^a-zA-Z\u00C0-\u017F]', '', text)
+        if not clean_text or len(re.findall(r'[a-zA-Z]', clean_text)) / len(clean_text) < 0.5:
+            policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
+            return False
+
+        # 3. Probabilistic Check (Catches Spanish, French, German)
+        try:
+            langs = detect_langs(text)
+            policy_logger.debug(f"[GOVERNANCE] Langdetect: {langs}")
+            
+            # If the top detected language is not English, block it.
+            if langs[0].lang != 'en':
+                policy_logger.warning(f"[GOVERNANCE] Blocked via Langdetect ({langs[0].lang}): '{text}'")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            # IF IT CRASHES, DEFAULT TO BLOCKED (False).
+            policy_logger.error(f"[GOVERNANCE] langdetect crashed on '{text}': {e}. Defaulting to BLOCKED.")
+            return False
 
     def validate_response(self, context: CallContext, response_text: str) -> bool:
         """
@@ -188,13 +218,13 @@ class ResponsePolicyEngine:
                 )
         return None
 
-    def classify_intent(self, user_text: str) -> str:
+    def classify_intent(self, user_text: str, detected_lang: str = None) -> str:
         """
         Classifies user intent into: 'PROCEED', 'SENSITIVE', 'HARD_REFUSAL_IMMIGRATION', etc.
         """
-        # 0. Check Language (Layer 1 - New)
-        # Block non-English input immediately
-        if not self._is_english(user_text):
+        # 0. Check Language (Layer 1 - Hard-coded Gate)
+        # Block non-English input immediately using STT metadata + Text heuristics
+        if not self._is_english(user_text, detected_lang=detected_lang):
             return "HARD_REFUSAL_LANGUAGE"
 
         lower = user_text.lower()

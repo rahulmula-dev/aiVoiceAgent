@@ -35,35 +35,48 @@ class Transcriber(STTProvider):
         Optimized for WiFi jitter and telephony audio (8kHz mulaw).
         """
         params = [
-            "model=nova-2",
+            "model=nova-2",        # nova-2: best multilingual support
             f"encoding={self.encoding}",
             f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
             "endpointing=300",
-            "language=multi"  # Allow Deepgram to use multi-language detection for better 0.0-confidence filtering
         ]
-        
+
+        if self.encoding == "mulaw":
+            params.append("detect_language=true") 
+        else:
+            # Task 3: Architect Rule - For browser (linear16), detect_language is unsupported.
+            # We use 'en' as the default engine to prevent 400 Errors.
+            params.append("language=en")
+
         url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
         headers = {
             "Authorization": f"Token {self.api_key}"
         }
 
+        logger.info(f"[DEEPGRAM] Connecting: encoding={self.encoding} rate={self.sample_rate}")
         try:
-            # Using additional_headers for websockets v15+ compatibility
+            with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
+                f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
+        except: pass
+
+        try:
             self.ws = await websockets.connect(url, additional_headers=headers)
-            logger.debug(f"SUCCESS - Deepgram Connected (Model: nova-2)")
+            logger.info(f"[DEEPGRAM] Connected OK (encoding={self.encoding}, rate={self.sample_rate})")
             try:
                 with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write("DEBUG: WebSocket Connected Successfully\n")
+                    f.write(f"CONNECTED OK: encoding={self.encoding} sample_rate={self.sample_rate}\n")
             except: pass
 
             asyncio.create_task(self._listen())
-            # NOTE: Removed custom KeepAlive JSON task as it may interfere with the binary audio stream 
-            # and cause Deepgram session resets.
             return True
         except Exception as e:
-            logger.error(f"ERROR - Deepgram Connection Failed: {e}")
+            logger.error(f"[DEEPGRAM] Connection FAILED: {e}")
+            try:
+                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
+                    f.write(f"CONNECTION FAILED: {e}\n")
+            except: pass
             return False
 
     async def _listen(self):
@@ -90,35 +103,41 @@ class Transcriber(STTProvider):
                     sentence = alt["transcript"]
                     conf = alt.get("confidence", 0)
                     is_final = data.get("is_final", False)
+                    detected_lang = data.get("language") # Task 3: Architect Rule - use STT metadata
 
-                    if sentence and sentence.strip() and is_final:
-                        log_msg = f">>> DG RAW: '{sentence}' (Conf: {conf:.2f}, Final: {is_final})\n"
+                    if sentence and sentence.strip():
+                        log_msg = f">>> DG RAW: '{sentence}' (Conf: {conf:.2f}, Final: {is_final}, Lang: {detected_lang})\n"
                         logger.debug(log_msg.strip())
-                        # If we had a call_logger injected here, we would use it.
-                        # For now, manager.py logs the final transcript.
-                        # But we can add a placeholder for future injection.
                         try:
                             with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
                                 f.write(log_msg)
                         except: pass
                     
-                    # Process final transcripts
-                    if is_final:
-                        speech_final = data.get("speech_final", False)
+                    # Process transcripts
+                    if len(sentence) > 0:
+                        # TELEMETRY: Calculate STT Latency
+                        stt_latency = 0.0
+                        if hasattr(self, '_last_voice_timestamp'):
+                            stt_latency = asyncio.get_event_loop().time() - self._last_voice_timestamp
                         
-                        if len(sentence) > 0:
-                            # TELEMETRY: Calculate STT Latency (from last voice chunk to transcript receipt)
-                            stt_latency = 0.0
-                            if hasattr(self, '_last_voice_timestamp'):
-                                stt_latency = asyncio.get_event_loop().time() - self._last_voice_timestamp
-                            
-                            # Non-empty transcript - pass to manager
-                            logger.debug(f"USER FINAL: {sentence} (STT Latency: {stt_latency:.3f}s)")
-                            asyncio.create_task(self.on_transcript_callback(sentence, conf, stt_latency=stt_latency))
-                        elif conf == 0.0 and speech_final:
-                            # Empty + 0.0 + speech_final = Pass for state-aware detection
-                            logger.debug(f"[EMPTY 0.0 + SPEECH_FINAL] Passing to manager")
-                            asyncio.create_task(self.on_transcript_callback("", 0.0))
+                        # Pass to manager
+                        if is_final:
+                            logger.debug(f"USER FINAL: {sentence} (Lang: {detected_lang}, STT Latency: {stt_latency:.3f}s)")
+                        
+                        asyncio.create_task(
+                            self.on_transcript_callback(
+                                sentence, 
+                                confidence=conf, 
+                                stt_latency=stt_latency,
+                                is_final=is_final,
+                                detected_lang=detected_lang
+                            )
+                        )
+                    elif conf == 0.0 and is_final:
+                        logger.debug(f"[EMPTY 0.0 + IS_FINAL] Unrecognized phonemes (Lang: {detected_lang})")
+                        asyncio.create_task(
+                            self.on_transcript_callback("", 0.0, is_final=True, detected_lang=detected_lang)
+                        )
                 else:
                     # DEBUG: Print EVERYTHING else
                     # print(f"DEBUG - DG Event: {data}")

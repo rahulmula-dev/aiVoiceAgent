@@ -58,6 +58,7 @@ class VoiceOrchestrator:
         self.mode = "audio"
         self.sid = "unknown" # Default session ID before call starts
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
+        self.last_empty_frame_time = 0 # Debounce tracker for STT burst artifacts
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
         self.user_has_spoken = False  # Track if user has spoken at least once
         self.language_strike_count = 0 # Strike tracker for non-English input (Task 3.4)
@@ -92,73 +93,137 @@ class VoiceOrchestrator:
         task.add_done_callback(log_exception)
         return task
 
-    async def _on_transcript(self, text, confidence=1.0, stt_latency: float = 0.0):
+    async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
         """
-        Callback for when user input is received (either via STT or text chat).
-        Args:
-            text: Transcribed text from user
-            confidence: Deepgram confidence score (0.0-1.0), defaults to 1.0 for text chat
-            stt_latency: Measured STT processing time (Task 2)
+        [GOVERNANCE] Expert Debugger Entry Point.
         """
+        raw_text = text.strip() if text else ""
+        
+        # 1. AGGRESSIVE LOGGING: We must see what the STT actually heard
+        # [STT RAW] is used by the Expert Debugger to diagnose "deafness" or "hallucinations"
+        # Progress counter added for better forensic visibility
+        logger.info(f"[STT RAW] Text: '{raw_text}' | is_final: {is_final} (Counter: {self.consecutive_empty_frames})")
+
+        if not is_final:
+            return # Only process complete sentences.
+            
+        # 2. Run the failsafe policy (EXACT logic per Debugger Plan)
+        # If there is text, run the char-ratio/langdetect guard.
+        if raw_text:
+            is_eng = self.policy._is_english(raw_text, detected_lang=detected_lang)
+            
+            if not is_eng:
+                logger.warning(f"[ORCHESTRATOR] Language violation caught: '{raw_text}'")
+                # INCREMENT PERMANENT STRIKE COUNTER HERE
+                self.language_strike_count += 1
+                
+                # TRIGGER 3-STRIKE REFUSAL AUDIO (Dynamic based on count)
+                trace_id = str(uuid.uuid4())
+                if self.language_strike_count == 1:
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
+                elif self.language_strike_count == 2:
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
+                else: # Strike 3+
+                    refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
+
+                if self.language_strike_count >= 3:
+                    logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
+                    self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
+                else:
+                    if self.response_task and not self.response_task.done():
+                        self.response_task.cancel()
+                    self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+                
+                return # CRITICAL: Return so it never hits the LLM
+        
+        # ... proceed with English processing ...
         # Task 3 & 4: Start Turn Timer
         turn_start_time = asyncio.get_event_loop().time()
-        
-        # DEBUG: Log every callback invocation
         trace_id = str(uuid.uuid4())
-        
-        # 0. OVERRIDE: Disable Intake
-        if not self.config.is_intake_enabled:
-            logger.warning(f"[OVERRIDE] Intake Disabled (env={self.config.env}). Ignoring input: '{text}'")
-            return
 
-        logger.debug(f"[CALLBACK TRIGGERED] text='{text}', confidence={confidence:.2f}, state={self.state.current_state}, trace={trace_id}")
-        
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
-        # CRITICAL FIX: Ignore input if session is ending/ended (Silence Monitor race condition)
-        if self.state.current_state == CallState.CALL_END or (self.session and self.session.current_state == SessionState.ENDED):
-            logger.warning(f"Ignoring input '{text}' for ended session.")
-            return
-
         if not text.strip():
             if confidence == 0.0:
-                # We trigger a refusal for SUSTAINED empty frames (likely non-English speech filtered by Deepgram)
-                # Threshold increased to 6 to avoid false positives during natural English thinking pauses.
-                if self.state.current_state == CallState.LISTENING and self.user_has_spoken:
-                    self.consecutive_empty_frames += 1
-                    logger.debug(f"[EMPTY FRAME] Count: {self.consecutive_empty_frames} (Pausing or filtered noise)")
-                    
-                    logger.debug(f"[EMPTY FRAME] Count: {self.consecutive_empty_frames} (Pausing or filtered noise)")
-                    
-                    # Threshold increased significantly to defer to the new Silence Timer (Story S4-2)
-                    # Was 6 (approx 4.5s), now 100 to avoid accidental "Non-English" refusal during normal silence.
-                    if self.consecutive_empty_frames >= 100:
-                        # RATE LIMITING: Only refuse once every 10 seconds
-                        # Removed local import time to fix UnboundLocalError
+                # ── DEBOUNCE FIX: Filter millisecond-interval STT burst artifacts ────────────
+                # Deepgram sometimes sends multiple empty frames in <50ms, which 
+                # incorrectly triggers strikes. We require 200ms between increments.
+                stt_current_time = time.time()
+                if stt_current_time - self.last_empty_frame_time < 0.2:
+                    logger.debug(f"[DEBOUNCE] Filtering STT burst artifact for {self.sid}")
+                    return
+                
+                self.last_empty_frame_time = stt_current_time
+                self.consecutive_empty_frames += 1
+                
+                # Threshold for the very first turn is lowered from 25 to 6 to catch non-English starts before silence timeouts.
+                # Threshold for active conversation (post-warmup) remains at 4.
+                limit = 6 if not self.user_has_spoken else 4
+                
+                if self.consecutive_empty_frames >= limit:
+                        # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
+                        # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
+                        # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
+                        # We MUST use the same strike counter as the text-based path so that 
+                        # violations accumulate across BOTH detection methods.
+                        # ───────────────────────────────────────────────────────────────────────
                         current_time = time.time()
                         if current_time - self.last_refusal_time < 10:
                             return
-                        
-                        logger.warning(f"[NON-ENGLISH DETECTED] {self.consecutive_empty_frames} consecutive empty frames - refusing")
-                        
-                        # LOGGING: Record the detection and refusal in the call logs
-                        if self.call_logger and self.session:
-                            self.call_logger.log_event("stt", "user_transcript_final", 
-                                                     meta={"text": "[NON-ENGLISH SPEECH DETECTED] (Filtered by Deepgram)"},
-                                                     trace_id=trace_id)
-                            self.session.conversation_history.append({"role": "user", "parts": ["[NON-ENGLISH SPEECH DETECTED]"]})
 
+                        self.language_strike_count += 1
+                        logger.warning(f"[GOVERNANCE] Unrecognized-language speech detected (empty+0.0 frames). Strike: {self.language_strike_count}/3")
+                        
+                        # LOGGING: Record in call logs
+                        if self.call_logger and self.session:
+                            self.call_logger.log_event("stt", "user_transcript_final",
+                                                     meta={"text": f"[UNRECOGNIZED LANGUAGE SPEECH] Strike {self.language_strike_count}/3"},
+                                                     trace_id=trace_id)
+                            self.call_logger.log_event("brain", "decision_trace", meta={
+                                "intent": "HARD_REFUSAL_LANGUAGE",
+                                "confidence_score": 1.0,
+                                "chunks_used": [],
+                                "crm_hit": False,
+                                "governance_decision": "Blocked",
+                                "refusal_flags": {"strike_count": self.language_strike_count, "method": "phoneme_empty"}
+                            }, trace_id=trace_id)
+                            self.session.conversation_history.append({"role": "user", "parts": [f"[UNRECOGNIZED LANGUAGE SPEECH - Strike {self.language_strike_count}]"]})
+                        
+                        # CRM Ticket — fire on every strike
+                        self._create_task_with_log(self.crm.create_ticket(
+                            transcript=f"[SYSTEM] Unrecognized phonemes (Hindi/Bengali/etc.). Strike {self.language_strike_count}/3.",
+                            summary=f"Security Violation: HARD_REFUSAL_LANGUAGE (phoneme, Strike {self.language_strike_count})",
+                            sentiment="SECURITY_ALERT",
+                            call_logger=self.call_logger,
+                            call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                            title=f"Policy: Language Barrier Strike {self.language_strike_count}"
+                        ))
+                        
                         self.last_refusal_time = current_time
                         self.consecutive_empty_frames = 0
-                        
-                        refusal_text = PRDScripts.REFUSAL_LANGUAGE
-                        
-                        if self.call_logger:
-                             self.call_logger.log_event("brain", "chunk_generated", 
-                                                      meta={"text": refusal_text, "rag_score": 0.0, "grounding": False, "validation_pass": True},
-                                                      trace_id=trace_id)
-                        
-                        self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
-                return
+
+                        # Pick refusal script by strike number
+                        if self.language_strike_count == 1:
+                            refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
+                        elif self.language_strike_count == 2:
+                            refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
+                        else:
+                            refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
+
+                        # Strike 3: Graceful termination
+                        if self.language_strike_count >= 3:
+                            logger.warning("[GOVERNANCE] Strike 3 (phoneme path) — initiating graceful termination flow.")
+                            self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
+                        else:
+                            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+                    
+                # [FORENSIC FIX]: Empty frames with 0.0 confidence are proof of "Foreign Speech".
+                # Update last_interaction_time to prevent the generic Silence Monitor from firing 
+                # and resetting the strike counter (even on the first turn).
+                self.last_interaction_time = time.time()
+                self.silence_stage = 0
+                    
+                return # 🟢 FIXED: Return here to prevent fall-through to clarification check
+
             else:
                 # Empty with higher confidence = Background silence, reset counter
                 if self.consecutive_empty_frames > 0:
@@ -198,6 +263,11 @@ class VoiceOrchestrator:
             
         logger.info(f"USER: {text}")
         if self.session:
+            # [FORENSIC FIX]: Mark that user has spoken to enable stricter empty-frame governance
+            if not self.user_has_spoken:
+                logger.debug("[GOVERNANCE] First valid transcript received. Enabling strict empty-frame checks.")
+                self.user_has_spoken = True
+                
             log_conversation_turn(self.session.session_id, "USER", text)
             self.session.conversation_history.append({"role": "user", "parts": [text]})
             self.session.touch()
@@ -208,28 +278,23 @@ class VoiceOrchestrator:
                                      meta={"text": text, "confidence": confidence}, 
                                      trace_id=trace_id)
         
-        if self.response_task and not self.response_task.done():
-            logger.debug(">>> BARGE-IN: Interrupting current AI response...")
-            if self.call_logger:
-                # Checkpoint: Save logs immediately to prevent data loss
-                self.call_logger.save_log(status="in-progress")
-                self.call_logger.log_event("orchestrator", "user_interruption")
-            self.response_task.cancel()
-            # B. Speak interruption prompt
-            self.response_task = asyncio.create_task(
-                self.speak_refusal(PRDScripts.INTERRUPTION, trace_id=trace_id)
-            )
-
-        # 2. SECURITY & POLICY CHECK (Pre-Brain)
-        # Check for hard refusals or sensitive topics BEFORE touching the LLM/DB
-        intent = self.policy.classify_intent(text)
+        # 2. SECURITY & POLICY CHECK (Pre-Brain & Pre-Barge-in)
+        # [GOVERNANCE] CRITICAL: Policy check MUST execute before barge-in handling.
+        # This prevents users from bypassing the gate by interrupting the AI.
+        intent = self.policy.classify_intent(text, detected_lang=detected_lang)
+        logger.debug(f"[GOVERNANCE] Input: '{text}', Intent: {intent}, Strike: {self.language_strike_count} | Detected Lang: {detected_lang}")
         
-        # TASK 3.4: Reset strike counter on valid English input
-        if intent == "PROCEED":
+        # [FORENSIC FIX]: If the user speaks valid English (Anything EXCEPT a language refusal),
+        # we reset the language strike counter. This ensures that one-off language mistakes
+        # or STT glitches don't lead to unfair terminations if the user is otherwise speaking English.
+        if intent != "HARD_REFUSAL_LANGUAGE":
             if self.language_strike_count > 0:
-                logger.debug(f"[RESET] Language strike counter {self.language_strike_count}→0 (Valid English input)")
+                logger.info(f"[RESET] Resetting language strike counter (was {self.language_strike_count}) - valid English received")
                 self.language_strike_count = 0
-
+        
+        # --- RAG SHORT-CIRCUIT ---
+        # [GOVERNANCE] If policy violation is detected, abort immediately.
+        # NEVER let valid English barge-in logic run for a non-English violation.
         if intent != "PROCEED":
             logger.warning(f"POLICY VIOLATION: {intent} detected for input: {text}")
             
@@ -244,43 +309,44 @@ class VoiceOrchestrator:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
                 else: # Strike 3+
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
-                    # Definitive graceful termination
-                    self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
-                    return
             else:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
+
+            # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
+            if intent == "HARD_REFUSAL_LANGUAGE" and self.language_strike_count >= 3:
+                logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
+                self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
+                return # SHORT-CIRCUIT: Do not proceed to barge-in or brain
             
-            # B. Log to CRM
-            self._create_task_with_log(self.crm.create_ticket(
-                transcript=f"User said: {text}\nPolicy Trigger: {intent}",
-                summary=f"Security Violation: {intent}",
-                sentiment="SECURITY_ALERT",
-                call_logger=self.call_logger,
-                call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
-                title=f"Security Alert: {intent}"
-            ))
+            # D. Strikes 1-2 and other refusals: Speak refusal, stay on call
+            # Cancel any thinking/speaking first so refusal can be heard
+            if self.response_task and not self.response_task.done():
+                self.response_task.cancel()
+                
+        # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
+        if self.response_task and not self.response_task.done():
+            is_speaking = self.state.get_state() == CallState.SPEAKING
+            logger.debug(f">>> BARGE-IN DETECTED: state={self.state.get_state()}, speaking={is_speaking}")
             
-            # C. Speak Refusal directly (Bypass Brain)
-            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
-            
-            # --- DECISION LOG FOR POLICY REFUSAL ---
-            decision_meta = {
-                "intent": intent,
-                "confidence_score": 1.0, # Checked via deterministic policy
-                "chunks_used": [],
-                "crm_hit": False,
-                "governance_decision": "Blocked",
-                "refusal_flags": {
-                    "strike_count": self.language_strike_count if intent == "HARD_REFUSAL_LANGUAGE" else 0
-                }
-            }
             if self.call_logger:
-                self.call_logger.log_event("brain", "decision_trace", meta=decision_meta, trace_id=trace_id)
-            return
-
-
-
+                # Checkpoint: Save logs immediately to prevent data loss
+                self.call_logger.save_log(status="in-progress")
+                self.call_logger.log_event("orchestrator", "user_interruption", meta={"is_speaking": is_speaking})
+            
+            self.response_task.cancel()
+            
+            # B. Only speak interruption prompt IF the AI was actually talking
+            if is_speaking:
+                logger.debug("AI was speaking. triggering interruption prompt.")
+                self.response_task = asyncio.create_task(
+                    self.speak_refusal(PRDScripts.INTERRUPTION, trace_id=trace_id)
+                )
+                # CRITICAL: If we are speaking the interruption prompt, stop processing THIS turn
+                # to allow the user to respond to the prompt.
+                return
+            else:
+                logger.debug("AI was only thinking/transcribing. Silently cancelling old task.")
         # 3. Start Parallel Response Generation (Normal Flow)
         # S4-9: Update Context (Deterministic)
         if self.session:
@@ -339,6 +405,13 @@ class VoiceOrchestrator:
             logger.info(f"AI (Refusal): {text} (Sent {chunks_sent} audio chunks)")
             if self.session:
                 log_conversation_turn(self.session.session_id, "AI", text)
+            
+            # SYNC FIX: Wait for the agent to finish speaking before allowing more input
+            if self.mode == "audio":
+                # Estimate how long it will take to speak the text (Approx 15 chars/sec)
+                duration = len(text) / 15.0
+                logger.debug(f"Refusal streamed to client. Sleeping {duration:.1f}s to align with client playback.")
+                await asyncio.sleep(duration)
             
             # LOGGING: Record the refusal in JSON logs
             if self.call_logger:
@@ -685,8 +758,8 @@ class VoiceOrchestrator:
                     if turn_start_time:
                         current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
                         
-                        # 5s Circuit Breaker (Hard Failure)
-                        if current_turn_elapsed > 5.0:
+                        # 12s Circuit Breaker (Hard Failure - Increased from 5s to handle RAG/LLM spikes)
+                        if current_turn_elapsed > 12.0:
                             raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                             
                         # 3s Warning (Soft Logging)
@@ -853,26 +926,19 @@ class VoiceOrchestrator:
         except:
             pass # Swallow errors during cleanup
         
-        # 1. Cancel background response task if still running
-        if self.response_task and not self.response_task.done():
-            logger.debug("Cleanup: Cancelling background response task")
-            self.response_task.cancel()
-            try:
-                await self.response_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error(f"Error during response task cancellation: {e}")
         # 🟢 CRITICAL: Wrap in try/except (Pillar 3)
         try:
             # 1. Cancel background response task
+            # GUARD: Do NOT cancel if the task is _language_termination_flow (it calls us, we must not self-destruct)
             if self.response_task and not self.response_task.done():
-                logger.debug("Cleanup: Cancelling background response task")
-                self.response_task.cancel()
-                try:
-                    await self.response_task
-                except asyncio.CancelledError:
-                    pass
+                # Check if we are being called FROM the termination flow (stack guard)
+                if not getattr(self, '_language_termination_active', False):
+                    logger.debug("Cleanup: Cancelling background response task")
+                    self.response_task.cancel()
+                    try:
+                        await self.response_task
+                    except asyncio.CancelledError:
+                        pass
 
             # Cancel Silence Monitor
             if self.silence_task and not self.silence_task.done():
@@ -947,13 +1013,13 @@ class VoiceOrchestrator:
         Task 5: Fallback & CRM Ticketing for Latency Breach.
         """
         try:
-            # 1. Transition State
-            self.state.transition_to(CallState.CALL_END)
-            
-            # 2. Trigger Fallback TTS
+            # 1. Trigger Fallback TTS FIRST (Ensures user hears it before closure)
             msg = PRDScripts.LATENCY_FALLBACK
             # Speak refusal handles the TTS stream
             await self.speak_refusal(msg)
+            
+            # 2. Transition State AFTER audio is sent
+            self.state.transition_to(CallState.CALL_END)
             
             # 3. Create CRM Callback Ticket (High Priority)
             if self.session:
@@ -1071,27 +1137,34 @@ class VoiceOrchestrator:
 
     async def _language_termination_flow(self, refusal_text, trace_id):
         """
-        Task 3.4 & 3.6: Graceful termination for sustained non-English violations.
+        [GOVERNANCE] Architect-Grade Strike 3 Termination.
+        1. Async CRM Ticket (SECURITY_ALERT)
+        2. Final Goodbye TTS
+        3. Sever Connection (Cleanup)
         """
+        self._language_termination_active = True
+        logger.warning(f"[GOVERNANCE] Initiating Final Termination for trace {trace_id}")
         try:
-            # 1. Transition State
-            self.state.transition_to(CallState.CALL_END, trace_id=trace_id)
-            
-            # 2. Speak Final Goodbye (Awaited to ensure audio transmits)
-            await self.speak_refusal(refusal_text, trace_id=trace_id)
-            
-            # 3. CRM Ticket (Task 3.6)
+            # 1. CRM Ticket (Architect Rule: High Priority SECURITY_ALERT Triggered FIRST)
             self._create_task_with_log(self.crm.create_ticket(
-                transcript="[SYSTEM_EVENT] Call terminated due to language policy violation (3 strikes).",
+                transcript="[GOVERNANCE] Call terminated due to language policy violation (3 strikes).",
                 summary="Language Barrier Termination (3 Strikes)",
-                sentiment="Negative",
+                sentiment="SECURITY_ALERT",
                 call_logger=self.call_logger,
                 call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
                 title="Policy Termination: Language"
             ))
+
+            # 2. Speak Final Goodbye (Awaited to ensure audio transmits fully before closure)
+            await self.speak_refusal(refusal_text, trace_id=trace_id)
             
-            # 4. Final Cleanup
+            # 3. Transition State & Cleanup AFTER audio is sent
+            self.state.transition_to(CallState.CALL_END, trace_id=trace_id)
+            
+            # 4. Final Cleanup (will NOT self-cancel this task due to _language_termination_active guard)
             await self.cleanup()
         except Exception as e:
-            logger.error(f"Error in language termination flow: {e}")
+            logger.error(f"[GOVERNANCE] Error in language termination flow: {e}")
             await self.cleanup()
+        finally:
+            self._language_termination_active = False
