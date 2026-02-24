@@ -60,6 +60,7 @@ class VoiceOrchestrator:
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
         self.last_empty_frame_time = 0 # Debounce tracker for STT burst artifacts
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
+        self.non_english_run_start = time.time()  # Use time.time() NOT 0.0 — avoids epoch gap bug
         self.user_has_spoken = False  # Track if user has spoken at least once
         self.language_strike_count = 0 # Strike tracker for non-English input (Task 3.4)
         
@@ -144,6 +145,21 @@ class VoiceOrchestrator:
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
         if not text.strip():
             if confidence == 0.0:
+                # ── STATE GUARD: Only count empty frames when actively LISTENING ──────────────
+                # When the AI is SPEAKING, Deepgram naturally receives silence from the
+                # microphone and sends empty+0.0 frames. These are NOT non-English speech.
+                # We must NOT count them or English speakers will get false strikes.
+                current_call_state = self.state.get_state()
+                if current_call_state != CallState.LISTENING:
+                    logger.debug(f"[DEBOUNCE] Ignoring empty frame in state {current_call_state} (not LISTENING)")
+                    return
+
+                # ── STATE GUARD: Only start counting AFTER user has spoken once ──────────────
+                # Before the user speaks, empty frames are just background/mic noise.
+                if not self.user_has_spoken:
+                    logger.debug("[DEBOUNCE] Ignoring empty frame before first speech")
+                    return
+
                 # ── DEBOUNCE FIX: Filter millisecond-interval STT burst artifacts ────────────
                 # Deepgram sometimes sends multiple empty frames in <50ms, which 
                 # incorrectly triggers strikes. We require 200ms between increments.
@@ -153,13 +169,24 @@ class VoiceOrchestrator:
                     return
                 
                 self.last_empty_frame_time = stt_current_time
+                
+                # Track the start of this non-English "run" (resets when English text comes in)
+                if self.consecutive_empty_frames == 0:
+                    self.non_english_run_start = time.time()  # Fresh start for each new run
                 self.consecutive_empty_frames += 1
+                non_english_duration = time.time() - self.non_english_run_start
                 
-                # Threshold for the very first turn is lowered from 25 to 6 to catch non-English starts before silence timeouts.
-                # Threshold for active conversation (post-warmup) remains at 4.
-                limit = 6 if not self.user_has_spoken else 4
+                logger.debug(f"[PHONEME] Empty frame #{self.consecutive_empty_frames}, run={non_english_duration:.1f}s")
                 
-                if self.consecutive_empty_frames >= limit:
+                # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
+                # Fire a language strike ONLY when BOTH conditions are met:
+                #   1. At least 4 frames in this run (rules out a single noise spike)
+                #   2. Run has been active ≥ 12 seconds (rules out fast background noise bursts
+                #      and normal English thinking pauses which are always < 10s)
+                # 12s > silence monitor's 10s threshold → silence fires first for truly silent
+                # users; for active non-English speakers the run accumulates across sentences.
+                # ─────────────────────────────────────────────────────────────────────────────
+                if self.consecutive_empty_frames >= 4 and non_english_duration >= 12.0:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -200,6 +227,7 @@ class VoiceOrchestrator:
                         
                         self.last_refusal_time = current_time
                         self.consecutive_empty_frames = 0
+                        self.non_english_run_start = time.time()  # Reset to NOW, not 0.0
 
                         # Pick refusal script by strike number
                         if self.language_strike_count == 1:
@@ -216,11 +244,18 @@ class VoiceOrchestrator:
                         else:
                             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
                     
-                # [FORENSIC FIX]: Empty frames with 0.0 confidence are proof of "Foreign Speech".
-                # Update last_interaction_time to prevent the generic Silence Monitor from firing 
-                # and resetting the strike counter (even on the first turn).
-                self.last_interaction_time = time.time()
-                self.silence_stage = 0
+                # COORDINATION: Do NOT update last_interaction_time for empty frames.
+                # 
+                # If we reset it here, the silence monitor can never fire for a user who
+                # goes silent (because empty frames keep resetting the timer).
+                # 
+                # For non-English speakers: last_interaction_time is reset by speak_refusal
+                # after each language warning, giving them time to respond in English.
+                # For truly silent users: last_interaction_time was last set by AI speaking,
+                # so the silence monitor fires correctly at 10s.
+                #
+                # NOTE: last_interaction_time intentionally NOT reset here.
+                # NOTE: silence_stage intentionally NOT reset here.
                     
                 return # 🟢 FIXED: Return here to prevent fall-through to clarification check
 
@@ -229,6 +264,7 @@ class VoiceOrchestrator:
                 if self.consecutive_empty_frames > 0:
                     logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames})")
                     self.consecutive_empty_frames = 0
+                    self.non_english_run_start = time.time()  # Anchor to now, never epoch
                 logger.debug(f"[FILTER] Empty transcript (confidence: {confidence:.2f}) - background silence")
                 return
         else:
@@ -241,6 +277,7 @@ class VoiceOrchestrator:
             if self.consecutive_empty_frames > 0:
                 logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames}) - received text")
                 self.consecutive_empty_frames = 0
+                self.non_english_run_start = time.time()  # Reset run timer — English resets everything
             
             # SILENCE RESET: legitimate user text
             self.last_interaction_time = time.time()
@@ -632,7 +669,7 @@ class VoiceOrchestrator:
             try:
                 while True:
                     text = await websocket.receive_text()
-                    await self._on_transcript(text)
+                    await self._on_transcript(text, confidence=1.0, is_final=True)
             except WebSocketDisconnect:
                 logger.info(f"Text Chat Disconnected: {self.sid}")
             except Exception as e:
@@ -671,6 +708,15 @@ class VoiceOrchestrator:
                         
                         # STATE: Speaking
                         self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
+                        
+                        # CRITICAL: Reset non-English frame counter when AI starts speaking.
+                        # Without this, frames accumulated during the "LISTENING while generating"
+                        # window carry over and falsely extend the non_english_run duration,
+                        # causing spurious language strikes after every normal AI reply.
+                        if self.consecutive_empty_frames > 0:
+                            logger.debug(f"[RESET] Non-English counter {self.consecutive_empty_frames}→0 (AI speaking)")
+                            self.consecutive_empty_frames = 0
+                            self.non_english_run_start = time.time()  # Anchor to now, never epoch
                         
                         tts_start_time = time.time()
                         first_chunk_received = False

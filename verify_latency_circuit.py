@@ -64,7 +64,7 @@ async def test_latency_breach():
     print("Simulating User Transcript: 'Help me'...")
     try:
         # We call _on_transcript directly
-        await orch._on_transcript("Help me", confidence=1.0, stt_latency=0.5)
+        await orch._on_transcript("Help me", confidence=1.0, stt_latency=0.5, is_final=True)
         # Wait for the background task to actually run and hit the latency breach
         if orch.response_task:
             await orch.response_task
