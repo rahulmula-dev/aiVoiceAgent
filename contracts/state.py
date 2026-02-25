@@ -30,13 +30,14 @@ class StateMachine:
             
             CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION],
             
-            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION],
+            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION],
             
             CallState.TRANSCRIBING: [
                 CallState.INTENT_EVAL, 
                 CallState.LISTENING,
                 CallState.SPEAKING,
-                CallState.CALL_END
+                CallState.CALL_END,
+                CallState.ESCALATION
             ],
             
             CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING],

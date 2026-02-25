@@ -65,7 +65,14 @@ class ResponsePolicyEngine:
         "internal_staff": ["salary", "hr", "staff issues", "employee", "paycheck", "hiring"],
         "politics": ["politics", "political", "election", "government opinion", "democrat", "republican", "liberal", "conservative"],
         "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
-        "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"]
+        "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"],
+        # T4 fix: Catch explicit jailbreak translation commands before they reach the LLM.
+        # "translate", "en español", "traduce" etc. are injection vectors, not college queries.
+        "language_bypass": [
+            "translate", "traduce", "en español", "español", "in spanish",
+            "in french", "in hindi", "auf deutsch", "en français",
+            "other language", "different language", "switch language"
+        ]
     }
 
     ESCALATION_KEYWORDS = [
@@ -73,9 +80,12 @@ class ResponsePolicyEngine:
     ]
 
     # --- 3. SPECULATIVE LANGUAGE (Uncertainty Ban) ---
+    # These phrases must only match speculative *facts*, not conversational phrases.
+    # e.g. block "the fee might be $10,000" but NOT "I'm not sure I understand."
     SPECULATIVE_PHRASES = [
-        "maybe", "might", "i think", "i believe", "possibly", "not sure", 
-        "i guess", "could be", "probably"
+        "maybe", "might", "i think", "i believe", "possibly",
+        "not sure about",   # narrowed from "not sure" to avoid catching clarification phrases
+        "i guess", "could be around", "probably"  # "could be" alone too broad
     ]
 
     # --- 4. TONE & PERSONALITY (Governance Validation - PRD S4-5) ---
@@ -130,19 +140,10 @@ class ResponsePolicyEngine:
         if not text:
             return True # Ignore truly empty strings
 
-        # 1. Dictionary-Based Priority (Prevents Langdetect false positives on short text)
-        words = re.findall(r'\b\w+\b', text.lower())
-        
-        # If any word in human-readable text is from our common list, we grant a bypass
-        # "Okay. Fine. Can you" -> "okay" is in list -> Bypass langdetect
-        if any(w in self.COMMON_ENGLISH_WORDS for w in words):
-            policy_logger.debug(f"[GOVERNANCE] Dictionary Bypass for: '{text}'")
-            return True
-            
         if len(text) < 4:
             return True # Too short to reliably detect, give benefit of the doubt
 
-        # 2. ASCII/Latin Check (Catches Hindi/Bengali/Mandarin instantly)
+        # 1. ASCII/Latin Check (Catches Hindi/Bengali/Mandarin instantly)
         # If less than 50% of the text is standard Latin characters, it's definitely foreign.
         # Strips numbers and punctuation before checking ratio.
         clean_text = re.sub(r'[^a-zA-Z\u00C0-\u017F]', '', text)
@@ -150,54 +151,88 @@ class ResponsePolicyEngine:
             policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
             return False
 
-        # 3. Probabilistic Check (Catches Spanish, French, German)
+        # 2. Probabilistic Check (Catches Spanish, French, German, bilingual mixing)
+        # S4 Hardening Fix: Threshold lowered to 0.60 to block mixed/foreign lean.
+        # Dictionary bypass REMOVED to prevent "VIP pass" for mixed sentences.
         try:
-            langs = detect_langs(text)
-            policy_logger.debug(f"[GOVERNANCE] Langdetect: {langs}")
-            
-            # If the top detected language is not English, block it.
-            if langs[0].lang != 'en':
-                policy_logger.warning(f"[GOVERNANCE] Blocked via Langdetect ({langs[0].lang}): '{text}'")
-                return False
+            detected_langs = detect_langs(text)
+            policy_logger.debug(f"[GOVERNANCE] Langdetect Raw: {detected_langs}")
+
+            if detected_langs:
+                top_lang = detected_langs[0]
                 
-            return True
-            
+                # If the top language is NOT English, and we are 60% sure, STRIKE IT.
+                if top_lang.lang != 'en' and top_lang.prob > 0.60:
+                    policy_logger.warning(f"[GOVERNANCE] Mixed/Foreign language detected: {top_lang.lang} ({top_lang.prob:.2f}). Triggering Strike.")
+                    return False # This will trigger the refusal strike
+                    
+                # If the top language is English, but confidence is terrible, treat as garbage
+                if top_lang.lang == 'en' and top_lang.prob < 0.35:
+                    policy_logger.warning(f"[GOVERNANCE] English confidence too low ({top_lang.prob:.2f}). Treating as hallucinated garbage.")
+                    return False 
+                    
+                policy_logger.debug(f"[GOVERNANCE] PASSED (en={top_lang.prob:.2f}): '{text}'")
+                return True # Passes as valid English
+
         except Exception as e:
-            # IF IT CRASHES, DEFAULT TO BLOCKED (False).
-            policy_logger.error(f"[GOVERNANCE] langdetect crashed on '{text}': {e}. Defaulting to BLOCKED.")
-            return False
+            policy_logger.error(f"[GOVERNANCE] langdetect failed: {e}")
+            return True # Fail-safe
 
     def validate_response(self, context: CallContext, response_text: str) -> bool:
         """
         Pre-flight check before TTS speaks.
-        Returns True if safe, False if blocked.
+        Returns True if safe to speak, False if the output should be blocked.
+        When False, the caller (manager.py) substitutes PRDScripts.REFUSAL_LANGUAGE.
         """
+        import logging as _logging
+        _logger = _logging.getLogger("Policy")
         lower_text = response_text.lower()
-        
-        # 1. Check for confidential/harmful
+
+        # 1. Check for harmful / sensitive content
         for keyword in self.SENSITIVE_KEYWORDS:
-            if keyword in lower_text: # Keep strict substring for sensitive (e.g. 'killing')
+            if keyword in lower_text:
                 return False
-                
-        # 2. Check strict length (don't ramble)
-        if len(response_text) > 500: # Arbitrary token limit for voice
+
+        # 2. Strict length cap
+        if len(response_text) > 500:
             return False
-            
-        # 3. Check Speculative Language (Story S1-4)
+
+        # 3. Speculative language ban
         for phrase in self.SPECULATIVE_PHRASES:
             if phrase in lower_text:
                 return False
 
-        # 4. English Heuristic Check (Story S1-4)
-        # Ratio of ASCII characters to total length
-        try:
-            ascii_chars = sum(1 for c in response_text if ord(c) < 128)
-            ratio = ascii_chars / len(response_text)
-            if ratio < 0.8: # Allow 20% for names/accents, but block full foreign text
-                return False
-        except:
-            pass # Safety fallback
-            
+        # 4. OUTPUT LANGUAGE GATE — Hard deterministic check (T1 fix)
+        # Prevents jailbreak prompts from leaking RAG data in a foreign language.
+        # Two layers:
+        #   a) Non-Latin script fast-path (Hindi, Mandarin, Arabic, etc.)
+        #   b) Latin-script foreign language slow-path (Spanish, French, German)
+        if response_text:
+            try:
+                from langdetect import detect_langs
+
+                # 4a. Fast ASCII ratio check — catches Devanagari / CJK / Arabic instantly
+                ascii_ratio = sum(c.isascii() for c in response_text) / len(response_text)
+                if ascii_ratio < 0.85:
+                    _logger.warning(f"[OUTPUT GOVERNANCE] Non-ASCII ratio {ascii_ratio:.2f} — blocking output.")
+                    return False
+
+                # 4b. Langdetect check — catches Latin-script foreign output (Spanish, French, etc.)
+                # Guard: langdetect is unreliable on short chunks (e.g. "Hello Akanksha." = 2 words).
+                # Minimum 30 chars before running probabilistic detection.
+                # Short chunks are still protected by the ASCII ratio check above.
+                if len(response_text) >= 30:
+                    detected = detect_langs(response_text)
+                    if detected:
+                        top = detected[0]
+                        if top.lang != 'en' and top.prob > 0.70:
+                            _logger.warning(f"[OUTPUT GOVERNANCE] LLM output in {top.lang} ({top.prob:.2f}) — blocking.")
+                            return False
+
+            except Exception as e:
+                # If detection fails, allow output — a detection crash ≠ a violation.
+                _logger.error(f"[OUTPUT GOVERNANCE] Language detection failed: {e}")
+
         # 5. Tone & Personality Governance
         for rp in self.RUDE_KEYWORDS + self.PERSUASIVE_KEYWORDS:
             if rp in lower_text:
@@ -273,5 +308,9 @@ class ResponsePolicyEngine:
             
         if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES":
             return PRDScripts.REFUSAL_FINANCIAL_DISPUTES
+
+        # T4 fix: Translation/jailbreak bypass → English-only refusal
+        if intent == "HARD_REFUSAL_LANGUAGE_BYPASS":
+            return PRDScripts.REFUSAL_LANGUAGE
 
         return PRDScripts.REFUSAL_DEFAULT

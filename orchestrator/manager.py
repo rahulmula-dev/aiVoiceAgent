@@ -127,12 +127,17 @@ class VoiceOrchestrator:
                 else: # Strike 3+
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
 
+                # 🟢 S4 Hardening: Hard LLM Bypass
+                if self.response_task and not self.response_task.done():
+                    self.response_task.cancel()
+                    logger.debug("[GOVERNANCE] Cancelled pending LLM task for Hard Bypass (Text Strike).")
+                
+                self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+
                 if self.language_strike_count >= 3:
                     logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
                     self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
                 else:
-                    if self.response_task and not self.response_task.done():
-                        self.response_task.cancel()
                     self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
                 
                 return # CRITICAL: Return so it never hits the LLM
@@ -237,6 +242,13 @@ class VoiceOrchestrator:
                         else:
                             refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
 
+                        # 🟢 S4 Hardening: Hard LLM Bypass (Phoneme Path)
+                        if self.response_task and not self.response_task.done():
+                            self.response_task.cancel()
+                            logger.debug("[GOVERNANCE] Cancelled pending LLM task for Hard Bypass (Phoneme Strike).")
+                        
+                        self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+
                         # Strike 3: Graceful termination
                         if self.language_strike_count >= 3:
                             logger.warning("[GOVERNANCE] Strike 3 (phoneme path) — initiating graceful termination flow.")
@@ -287,8 +299,15 @@ class VoiceOrchestrator:
         # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
         if confidence < 0.4:
             logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
+            
+            # 🟢 S4 Hardening: Hard LLM Bypass
+            if self.response_task and not self.response_task.done():
+                self.response_task.cancel()
+                logger.debug("[GOVERNANCE] Cancelled pending LLM task for Hard Bypass (Low CONF).")
+            
+            self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
             self.response_task = asyncio.create_task(
-                self.speak_refusal(PRDScripts.APOLOGY_CLARIFICATION)
+                self.speak_refusal(PRDScripts.APOLOGY_CLARIFICATION, trace_id=trace_id)
             )
             return
         
@@ -350,6 +369,13 @@ class VoiceOrchestrator:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
 
+            # 🟢 S4 Hardening: Hard LLM Bypass (Policy Violation)
+            if self.response_task and not self.response_task.done():
+                self.response_task.cancel()
+                logger.debug(f"[GOVERNANCE] Cancelled pending LLM task for Hard Bypass ({intent}).")
+            
+            self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+
             # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
             if intent == "HARD_REFUSAL_LANGUAGE" and self.language_strike_count >= 3:
                 logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
@@ -357,9 +383,8 @@ class VoiceOrchestrator:
                 return # SHORT-CIRCUIT: Do not proceed to barge-in or brain
             
             # D. Strikes 1-2 and other refusals: Speak refusal, stay on call
-            # Cancel any thinking/speaking first so refusal can be heard
-            if self.response_task and not self.response_task.done():
-                self.response_task.cancel()
+            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+            return # SHORT-CIRCUIT
                 
         # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
         if self.response_task and not self.response_task.done():
