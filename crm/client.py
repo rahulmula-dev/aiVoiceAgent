@@ -106,13 +106,14 @@ class CRMClient(CRMEngine):
         except httpx.RequestError as e:
             raise CRMConnectionError(f"Connection Failed: {e}")
 
-    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None):
+    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None):
         """
         Creates a ticket in LeadSquared for the interaction.
         Arguments:
             call_id (str): MANDATORY. This should be the ID returned by `log_call` if possible, 
                            OR the session ID if the CRM accepts external IDs.
                            (Based on "CALL_ID_HERE", it's likely the CRM internal ID).
+            structured_turns (list, optional): S4-11 metadata.
         """
         # 1. IDEMPOTENCY CHECK
         idempotency_key = f"{call_id}:{summary}" if call_id else None
@@ -128,17 +129,28 @@ class CRMClient(CRMEngine):
         # Allow custom title or default to template
         final_title = title or f"Voice Agent Ticket - {sentiment}"
         
+        # Enforce call_id is a valid scalar string (preventing PydanticValidationError input_type=list or input=null)
+        if isinstance(call_id, list):
+            call_id_str = str(call_id[0]) if call_id else "unknown_call_id"
+        elif call_id:
+            call_id_str = str(call_id)
+        else:
+            call_id_str = "unknown_call_id"
+            
         # DEBUG: Append short Call ID to title so user can distinguish them on dashboard
-        if call_id:
-             short_id = str(str(call_id)[-4:]) if len(str(call_id)) > 4 else str(call_id)
+        if call_id_str:
+             short_id = call_id_str[-4:] if len(call_id_str) > 4 else call_id_str
              final_title = f"{final_title} | Call-{short_id}"
 
         ticket_data = {
-            "call_id": call_id,
+            "call_id": call_id_str,
             "title": final_title,
             "description": summary,
             "status": "OPEN",
-            "priority": priority
+            "priority": priority,
+            "metadata": {
+                "structured_turns": structured_turns
+            } if structured_turns else {}
         }
         
         try:

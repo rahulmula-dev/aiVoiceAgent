@@ -3,8 +3,10 @@ import asyncio
 import base64
 import json
 import logging as std_logging
+import re
 import time
 import uuid
+from datetime import datetime
 from orchestrator.brain import Brain
 from orchestrator.interfaces import STTProvider, TTSProvider
 from crm.client import CRMClient
@@ -94,6 +96,25 @@ class VoiceOrchestrator:
         task.add_done_callback(log_exception)
         return task
 
+    def _is_multi_step(self, text: str) -> bool:
+        """Heuristic to detect if a response contains a structured sequence or list."""
+        if not text: return False
+        
+        # 1. Numbered lists (1., 2., 3. or 1), 2), 3))
+        if re.search(r'(\d[\.\)]\s)', text): return True
+        
+        # 2. Sequential markers
+        sequences = ["first", "second", "third", "finally", "next step", "step one", "then"]
+        text_lower = text.lower()
+        # Count matches
+        matches = sum(1 for word in sequences if f" {word}" in f" {text_lower}")
+        if matches >= 2: return True
+        
+        # 3. Bullet points
+        if re.search(r'([\n\s][\-\*\•]\s)', text): return True
+        
+        return False
+
     async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
         """
         [GOVERNANCE] Expert Debugger Entry Point.
@@ -106,7 +127,17 @@ class VoiceOrchestrator:
         logger.info(f"[STT RAW] Text: '{raw_text}' | is_final: {is_final} (Counter: {self.consecutive_empty_frames})")
 
         if not is_final:
-            return # Only process complete sentences.
+            # S4-11: Immediate Audio Stop on Interruption (Partial Transcript)
+            if self.response_task and not self.response_task.done():
+                if self.state.get_state() == CallState.SPEAKING:
+                    logger.info(f">>> IMMEDIATE STOP: Partial transcript received: '{raw_text}'")
+                    self.synthesizer.stop_current_speech(self.sid)
+                    self._create_task_with_log(self._send_clear_message())
+                    self.state.transition_to(CallState.INTERRUPTED)
+            
+            # Reset silence timer on partials so the monitor doesn't trigger while user is talking
+            self.last_interaction_time = time.time()
+            return # Only process complete sentences for LLM.
             
         # 2. Run the failsafe policy (EXACT logic per Debugger Plan)
         # If there is text, run the char-ratio/langdetect guard.
@@ -115,6 +146,14 @@ class VoiceOrchestrator:
             
             if not is_eng:
                 logger.warning(f"[ORCHESTRATOR] Language violation caught: '{raw_text}'")
+                
+                # FORENSIC: Log the exact text that was blocked so we don't have invisible strikes
+                if self.call_logger:
+                    self.call_logger.log_event("stt", "user_transcript_final", 
+                                             latency_ms=int(stt_latency * 1000), 
+                                             meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE"}, 
+                                             trace_id=str(uuid.uuid4()))
+                                             
                 # INCREMENT PERMANENT STRIKE COUNTER HERE
                 self.language_strike_count += 1
                 
@@ -147,11 +186,12 @@ class VoiceOrchestrator:
             if confidence == 0.0:
                 # ── STATE GUARD: Only count empty frames when actively LISTENING ──────────────
                 # When the AI is SPEAKING, Deepgram naturally receives silence from the
-                # microphone and sends empty+0.0 frames. These are NOT non-English speech.
-                # We must NOT count them or English speakers will get false strikes.
                 current_call_state = self.state.get_state()
+                # [GOVERNANCE FIX]: ONLY allow empty frame detection during LISTENING.
+                # If we allow it during SPEAKING, the AI's own voice being sent back as empty
+                # frames to Deepgram over a 12-second long sentence triggers a false strike!
                 if current_call_state != CallState.LISTENING:
-                    logger.debug(f"[DEBOUNCE] Ignoring empty frame in state {current_call_state} (not LISTENING)")
+                    logger.debug(f"[DEBOUNCE] Ignoring empty frame in state {current_call_state}")
                     return
 
                 # ── STATE GUARD: Only start counting AFTER user has spoken once ──────────────
@@ -350,21 +390,23 @@ class VoiceOrchestrator:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
 
-            # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
-            if intent == "HARD_REFUSAL_LANGUAGE" and self.language_strike_count >= 3:
-                logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
-                self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
-                return # SHORT-CIRCUIT: Do not proceed to barge-in or brain
-            
-            # D. Strikes 1-2 and other refusals: Speak refusal, stay on call
-            # Cancel any thinking/speaking first so refusal can be heard
-            if self.response_task and not self.response_task.done():
-                self.response_task.cancel()
-                
+                if self.language_strike_count >= 3:
+                    logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
+                    self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
+                else:
+                    if self.response_task and not self.response_task.done():
+                        self.response_task.cancel()
+                    self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+                return
+
         # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
         if self.response_task and not self.response_task.done():
-            is_speaking = self.state.get_state() == CallState.SPEAKING
-            logger.debug(f">>> BARGE-IN DETECTED: state={self.state.get_state()}, speaking={is_speaking}")
+            # [S4-11 FIX]: Check both SPEAKING and INTERRUPTED states
+            # Because a partial transcript might have already flipped the state to INTERRUPTED
+            current_state = self.state.get_state()
+            is_speaking = current_state in [CallState.SPEAKING, CallState.INTERRUPTED, CallState.TRANSCRIBING]
+            
+            logger.debug(f">>> BARGE-IN DETECTED: state={current_state}, speaking={is_speaking}")
             
             if self.call_logger:
                 # Checkpoint: Save logs immediately to prevent data loss
@@ -372,15 +414,17 @@ class VoiceOrchestrator:
                 self.call_logger.log_event("orchestrator", "user_interruption", meta={"is_speaking": is_speaking})
             
             self.response_task.cancel()
-            
-            # B. Only speak interruption prompt IF the AI was actually talking
             if is_speaking:
-                logger.debug("AI was speaking. triggering interruption prompt.")
+                # [S4-11]: Immediate Stop & Clear (Final Transcript mirroring Partial logic)
+                logger.info(f">>> IMMEDIATE STOP: Interrupted by final transcript: '{raw_text}'")
+                partial_text = self.synthesizer.stop_current_speech(self.sid)
+                self._create_task_with_log(self._send_clear_message())
+                self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
+
+                logger.debug("AI was speaking. triggering barge-in handler.")
                 self.response_task = asyncio.create_task(
-                    self.speak_refusal(PRDScripts.INTERRUPTION, trace_id=trace_id)
+                    self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
                 )
-                # CRITICAL: If we are speaking the interruption prompt, stop processing THIS turn
-                # to allow the user to respond to the prompt.
                 return
             else:
                 logger.debug("AI was only thinking/transcribing. Silently cancelling old task.")
@@ -412,6 +456,67 @@ class VoiceOrchestrator:
         # We start the task and let it handle its own errors (including LatencyBreachError)
         self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id, turn_start_time=turn_start_time, stt_latency=stt_latency))
 
+    async def handle_barge_in(self, call_id: str, caller_input: str, trace_id: str = None, partial_text: str = None):
+        """
+        Story S4-11: Core Barge-in logic.
+        """
+        if not self.session: return
+
+        # STEP A — Stop TTS + Mark Interrupted
+        if partial_text is None:
+            partial_text = self.synthesizer.stop_current_speech(call_id)
+            self._create_task_with_log(self._send_clear_message())
+            self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
+        
+        # Identify the turn being interrupted
+        prev_turn = None
+        if self.session.structured_turns:
+            prev_turn = self.session.structured_turns[-1]
+            prev_turn["agent_response_status"] = "interrupted"
+            prev_turn["agent_partial_response"] = partial_text
+        
+        # STEP B — Classify + Respond (Call Brain)
+        classification, response, is_multi_step, topic = await self.brain.generate_with_classification(
+            session=self.session,
+            caller_input=caller_input,
+            trace_id=trace_id
+        )
+        
+        # STEP C — Update Interrupted Turn
+        if classification == "NEW_TOPIC" and prev_turn:
+            prev_turn["agent_response_status"] = "abandoned"
+            
+        if prev_turn:
+            prev_turn["barge_in_classification"] = classification
+            
+        # Phase 6: Soft Continuation Logic
+        if prev_turn and prev_turn.get("is_multi_step") and classification == "NEW_TOPIC" and not prev_turn.get("continuation_offered"):
+            # Append soft offer to the end of the new response
+            if response and not response.endswith(("?", ".")): response += "."
+            response += " I can also finish walking you through the remaining steps if that's helpful."
+            prev_turn["continuation_offered"] = True
+
+        # STEP D — Create New Turn Entry
+        new_id = len(self.session.structured_turns) + 1
+        new_turn = {
+            "turn_id": new_id,
+            "caller_input": caller_input,
+            "topic": topic,
+            "agent_response_status": "completed",
+            "agent_partial_response": None,
+            "barge_in_classification": None,
+            "is_multi_step": is_multi_step,
+            "continuation_offered": False,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.session.structured_turns.append(new_turn)
+        self.session.current_speaking_turn_id = new_id
+        if hasattr(self, 'session_manager') and self.session_manager:
+            self.session_manager.save_session(self.session)
+
+        # Speak it
+        await self.speak_refusal(response, trace_id=trace_id)
+
     async def speak_refusal(self, text, trace_id=None):
         """
         Helper to speak a static refusal message without using the Brain.
@@ -421,12 +526,14 @@ class VoiceOrchestrator:
         if self.consecutive_empty_frames > 0:
             logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
             self.consecutive_empty_frames = 0
+            self.non_english_run_start = time.time()
         # Only transition to SPEAKING if we are NOT already terminating.
         # Skipping this when in CALL_END prevents the state violation that would
         # trigger a SYSTEM_ERROR CRM ticket and block the goodbye message.
         if self.state.get_state() != CallState.CALL_END:
             self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
         
+        is_cancelled = False
         try:
             # Add to history so LLM knows it refused
             if self.session:
@@ -435,7 +542,7 @@ class VoiceOrchestrator:
             # Speak it with a safety timeout to prevent "dead silence"
             chunks_sent = 0
             async with asyncio.timeout(10.0): # 10s max for refusal tts
-                async for chunk in self.synthesizer.speak(text):
+                async for chunk in self.synthesizer.speak(text, call_id=self.sid):
                     await self._send_response_chunk(chunk)
                     chunks_sent += 1
             
@@ -448,22 +555,38 @@ class VoiceOrchestrator:
                 # Estimate how long it will take to speak the text (Approx 15 chars/sec)
                 duration = len(text) / 15.0
                 logger.debug(f"Refusal streamed to client. Sleeping {duration:.1f}s to align with client playback.")
-                await asyncio.sleep(duration)
-            
+                # We sleep in small chunks so it can be cancelled instantly without clinging to a long timer
+                for _ in range(int(duration * 10)):
+                    await asyncio.sleep(0.1)
+
             # LOGGING: Record the refusal in JSON logs
             if self.call_logger:
                 self.call_logger.log_event("brain", "refusal_spoken", meta={"text": text, "chunks": chunks_sent}, trace_id=trace_id)
+        except asyncio.CancelledError:
+            is_cancelled = True
+            logger.info("Speak-refusal task cancelled by user interruption.")
+            raise
         except asyncio.TimeoutError:
             logger.error(f"Refusal TTS Timed Out for text: {text}")
         except Exception as e:
             logger.error(f"Error in speak_refusal: {e}")
         finally:
-            # CRITICAL: Only go back to Listening if we are NOT already terminating
-            # This prevents the CALL_END -> LISTENING state violation during silence termination
-            if self.state.get_state() != CallState.CALL_END:
+            # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
+            if not is_cancelled and self.state.get_state() != CallState.CALL_END:
                 self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
-            # Reset silence timer after speaking refusal (so we start counting silence from NOW)
             self.last_interaction_time = time.time()
+
+    async def _send_clear_message(self):
+        """Sends a 'clear' event to the client to purge audio buffers."""
+        if self.websocket:
+            try:
+                # Use identical sid resolution as _send_response_chunk to ensure frontend matches it
+                target_sid = self.sid or (self.session.session_id if self.session else None)
+                msg = {"event": "clear", "streamSid": target_sid}
+                await self.websocket.send_text(json.dumps(msg))
+                logger.debug(f"[TELEPHONY] Sent 'clear' event to client {target_sid}")
+            except Exception as e:
+                logger.error(f"Failed to send clear message: {e}")
 
     async def handle_audio_stream(self, websocket):
         """
@@ -484,8 +607,24 @@ class VoiceOrchestrator:
         self.transcriber.set_callback(self._on_transcript)
         connected = await self.transcriber.connect()
         
-        # if not connected: logic removed as we don't await result here
-        # We assume connection will succeed or log error in background task
+        if not connected:
+            logger.error("[TELEPHONY] Audio stream aborted: STT provider failed to connect.")
+            if self.session:
+                self.session.termination_reason = "system_failure"
+            
+            # Immediately tell the user we're broken and hang up
+            self.state.transition_to(CallState.ESCALATION)
+            try:
+                # We can wait for TTS generator to finish delivering this pre-recorded/synthesized text
+                goodbye_text = PRDScripts.APOLOGY_FATAL
+                async for chunk in self.synthesizer.speak(goodbye_text):
+                    await self._send_response_chunk(chunk)
+                await asyncio.sleep(2) # Give audio time to play on client side
+            except Exception as e:
+                logger.error(f"Failed to play connect-failure audio: {e}")
+            
+            await self.cleanup()
+            return
 
         sid = None
         call_sid = None
@@ -594,8 +733,8 @@ class VoiceOrchestrator:
                             logger.debug("Media loop: session ended, stopping audio processing.")
                             break
 
-                        # STATE: Listening (Implicitly)
-                        if self.state.get_state() != CallState.SPEAKING:
+                        # STATE: Start of call
+                        if self.state.get_state() == CallState.CALL_INIT:
                              self.state.transition_to(CallState.LISTENING)
 
                         payload = base64.b64decode(data['media']['payload'])
@@ -693,6 +832,23 @@ class VoiceOrchestrator:
         if not self.session: return
         
         try:
+            # S4-11: Structured Turn Entry
+            if self.session:
+                new_id = len(self.session.structured_turns) + 1
+                turn = {
+                    "turn_id": new_id,
+                    "caller_input": text,
+                    "topic": "General", 
+                    "agent_response_status": "completed",
+                    "agent_partial_response": None,
+                    "barge_in_classification": None,
+                    "is_multi_step": False,
+                    "continuation_offered": False,
+                    "timestamp": datetime.now().isoformat()
+                }
+                self.session.structured_turns.append(turn)
+                self.session.current_speaking_turn_id = new_id
+
             full_ai_text = ""
             audio_queue = asyncio.Queue()
 
@@ -721,7 +877,7 @@ class VoiceOrchestrator:
                         tts_start_time = time.time()
                         first_chunk_received = False
                         
-                        async for chunk in self.synthesizer.speak(sentence):
+                        async for chunk in self.synthesizer.speak(sentence, call_id=self.sid):
                             # DEFENSIVE: If task was cancelled during synthesis, stop immediately
                             try:
                                 await asyncio.sleep(0) # Yield to let cancellation happen
@@ -751,138 +907,151 @@ class VoiceOrchestrator:
                 except asyncio.CancelledError:
                     logger.debug("TTS Worker Cancelled.")
                     
-                # Back to Listening when done speaking (if not escalated)
-                if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END]:
-                    self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                finally:
+                    # Back to Listening when done speaking (if not escalated)
+                    # [FIX]: Don't overwrite state if user already started INTERRUPTED, TRANSCRIBING, or if AI is generating
+                    if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED, CallState.TRANSCRIBING, CallState.INTENT_EVAL, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
+                        self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                        # Reset interaction time so silence monitor starts counting from NOW
+                        self.last_interaction_time = time.time()
 
             worker_task = asyncio.create_task(tts_worker())
-
-            # 0. Check for Escalation (Policy)
-            # STATE: Intent Eval
-            self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id)
             
-            escalation = self.policy.check_escalation(text)
-            
-            # OVERRIDE: Force Escalation
-            if self.config.override_escalation:
-                logger.warning(f"[OVERRIDE] Force Escalation Triggered (env={self.config.env})")
-                escalation = True
+            try:
+                # 0. Check for Escalation (Policy)
+                # STATE: Intent Eval
+                self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id)
                 
-            if escalation:
-                self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
-                escalation_msg = PRDScripts.ESCALATION
-                await audio_queue.put(escalation_msg)
-                full_ai_text = escalation_msg
+                escalation = self.policy.check_escalation(text)
                 
-                # S4-5: End Call Gracefully on Escalation (No Live Transfer)
-                # Let it finish speaking, the worker handles state, then end call
-                asyncio.create_task(self._delayed_call_end())
+                # OVERRIDE: Force Escalation
+                if self.config.override_escalation:
+                    logger.warning(f"[OVERRIDE] Force Escalation Triggered (env={self.config.env})")
+                    escalation = True
+                    
+                if escalation:
+                    self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+                    escalation_msg = PRDScripts.ESCALATION
+                    await audio_queue.put(escalation_msg)
+                    full_ai_text = escalation_msg
+                    
+                    # S4-5: End Call Gracefully on Escalation (No Live Transfer)
+                    # Let it finish speaking, the worker handles state, then end call
+                    asyncio.create_task(self._delayed_call_end())
 
-            elif is_greeting:
-                self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id) # Re-confirm state logic
-                await audio_queue.put(text)
-                full_ai_text = text
-                # Sync hardcoded greeting with session history
-                self.session.conversation_history.append({"role": "model", "parts": [text]})
-            else:
-                # Track LLM Latency
-                llm_start_time = time.time()
-                if self.call_logger:
-                    self.call_logger.log_event("orchestrator", "llm_request_start", trace_id=trace_id)
-                
-                # We are technically in RAG/Eval state before generating
-                # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
-                
-                # Extract Caller Number for Auto-ID
-                caller_num = self.session.caller_number if self.session else "unknown"
-                
-                # Use persistent context
-                active_context = self.session.call_context if self.session else None
-                
-                async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id, call_context=active_context):
-                    # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
-                    if turn_start_time:
-                        current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                        
-                        # 12s Circuit Breaker (Hard Failure - Increased from 5s to handle RAG/LLM spikes)
-                        if current_turn_elapsed > 12.0:
-                            raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
-                            
-                        # 3s Warning (Soft Logging)
-                        if not full_ai_text and current_turn_elapsed > 3.0:
-                             logger.warning(f"LATENCY_WARNING: Turn reached {current_turn_elapsed:.2f}s! Breakdown: STT={stt_latency:.2f}s, Process={current_turn_elapsed - stt_latency:.2f}s")
-
-                    self.session.touch()
-                    self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
-                    
-                    # Policy Check per sentence
-                    context = CallContext(
-                        session_id=self.session.session_id,
-                        caller_number="unknown",
-                        start_time=self.session.start_time.timestamp()
-                    )
-                    
-                    is_safe = self.policy.validate_response(context, sentence)
-                    
-                    # Log Brain Performance
+                elif is_greeting:
+                    self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id) # Re-confirm state logic
+                    await audio_queue.put(text)
+                    full_ai_text = text
+                    # Sync hardcoded greeting with session history
+                    self.session.conversation_history.append({"role": "model", "parts": [text]})
+                else:
+                    # Track LLM Latency
+                    llm_start_time = time.time()
                     if self.call_logger:
-                         self.call_logger.log_event("brain", "chunk_generated", meta={
-                             "text": sentence, 
-                             "rag_score": metadata.get("rag_score", 0),
-                             "grounding": metadata.get("has_grounding", False),
-                             "validation_pass": is_safe
-                         }, trace_id=trace_id)
+                        self.call_logger.log_event("orchestrator", "llm_request_start", trace_id=trace_id)
+                    
+                    # We are technically in RAG/Eval state before generating
+                    # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
+                    
+                    # Extract Caller Number for Auto-ID
+                    caller_num = self.session.caller_number if self.session else "unknown"
+                    
+                    # Use persistent context
+                    active_context = self.session.call_context if self.session else None
+                    
+                    async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id, call_context=active_context):
+                        # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
+                        if turn_start_time:
+                            current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                            if current_turn_elapsed > 12.0:
+                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
+                                
+                        self.session.touch()
+                        self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
+                        
+                        context = CallContext(
+                            session_id=self.session.session_id,
+                            caller_number=caller_num,
+                            start_time=self.session.start_time.timestamp()
+                        )
+                        
+                        is_safe = self.policy.validate_response(context, sentence)
+                        
+                        if self.call_logger:
+                             self.call_logger.log_event("brain", "chunk_generated", meta={
+                                 "text": sentence, 
+                                 "rag_score": metadata.get("rag_score", 0),
+                                 "grounding": metadata.get("has_grounding", False),
+                                 "validation_pass": is_safe
+                             }, trace_id=trace_id)
 
-                    if is_safe:
-                        if not full_ai_text: # First sentence logic
-                            llm_latency = int((time.time() - llm_start_time) * 1000)
-                            if self.call_logger:
-                                self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency, trace_id=trace_id)
-                        
-                        full_ai_text += sentence + " "
-                        await audio_queue.put(sentence)
-                    else:
-                        logger.warning(f"Response Validation Failed (English/Speculation): '{sentence}'")
-                        
-                        # FAILURE ACTION: English Refusal & Escalation (Policy Rule)
-                        self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
-                        failure_msg = PRDScripts.REFUSAL_LANGUAGE
-                        await audio_queue.put(failure_msg)
-                        full_ai_text = failure_msg
-                        
-                        self._create_task_with_log(self.crm.create_ticket(
-                            transcript=f"Blocked Response (Non-English/Speculative): {sentence}\nUser Query: {text}",
-                            summary="English-Only Policy/Speculation Violation",
-                            sentiment="QUALITY_FAILURE",
-                            call_logger=self.call_logger,
-                            call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
-                            title="Quality Assurance Failure"
-                        ))
-                        
-                        # Stop the stream immediately
-                        break
-            
-            await audio_queue.put(None)
-            await worker_task
-            
+                        if is_safe:
+                            if not full_ai_text: # First sentence logic
+                                llm_latency = int((time.time() - llm_start_time) * 1000)
+                                if self.call_logger:
+                                    self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency, trace_id=trace_id)
+                            
+                            full_ai_text += sentence + " "
+                            await audio_queue.put(sentence)
+                        else:
+                            logger.warning(f"Response Validation Failed: '{sentence}'")
+                            self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+                            # Fix: Output default refusal instead of falsely claiming a language error
+                            failure_msg = PRDScripts.REFUSAL_DEFAULT
+                            await audio_queue.put(failure_msg)
+                            full_ai_text = failure_msg
+                            
+                            self._create_task_with_log(self.crm.create_ticket(
+                                transcript=f"Blocked Response: {sentence}\nUser Query: {text}",
+                                summary="Policy Violation",
+                                sentiment="QUALITY_FAILURE",
+                                call_logger=self.call_logger,
+                                call_id=self.session.crm_call_id or self.session.session_id,
+                                title="Quality Assurance Failure"
+                            ))
+                            break
+                
+                # S4-11: Detect if this turn was a multi-step answer for future continuation offers
+                if turn:
+                    turn["is_multi_step"] = self._is_multi_step(full_ai_text)
+                    if turn["is_multi_step"]:
+                        logger.debug(f"[S4-11] Turn {turn['turn_id']} flagged as MULTI-STEP")
+
+                # S4-11: Ensure worker task is done before finishing parent task
+                await audio_queue.join()
+                await audio_queue.put(None)
+                await worker_task
+                
+            except asyncio.CancelledError:
+                logger.debug("generate_and_speak cancelled. Cleaning up worker...")
+                worker_task.cancel()
+                try: await worker_task
+                except asyncio.CancelledError: pass
+                raise
+            except Exception as e:
+                logger.error(f"Error in generate_and_speak: {e}", exc_info=True)
+                worker_task.cancel()
+                raise
+            finally:
+                # Ensure worker is dead
+                if not worker_task.done():
+                    worker_task.cancel()
+                
             logger.info(f"AI: {full_ai_text.strip()}")
             log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
+            self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
             if self.call_logger:
                 self.call_logger.save_log(status="in-progress")
             
-            # CRM Background Task (Don't block audio)
+            # CRM Background Task
             if not is_greeting:
                 ticket_sentiment = "Neutral"
                 ticket_summary = f"Query: {text}"
-                
-                # Check for KB Miss / Escalation Logic
-                # If the AI spoke the mandatory fallback script, we must escalate.
-                # Use the Brain's official check (Single Source of Truth)
                 if Brain.is_kb_refusal(full_ai_text):
-                    ticket_sentiment = "ESCALATION" # Or "High" priority mapping in CRM
+                    ticket_sentiment = "ESCALATION"
                     ticket_summary = f"KB Miss - Escalation Required: {text}"
-                    logger.warning(f"KB Miss Detected. Triggering Escalation Ticket for: {text}")
 
                 self._create_task_with_log(self.crm.create_ticket(
                     transcript=text,
@@ -902,9 +1071,21 @@ class VoiceOrchestrator:
             await self._handle_latency_breach(sid)
         except asyncio.CancelledError:
             logger.info("AI thought-task cancelled by user interruption.")
+            
             # Pillar 1: Identity snapshot 
             if self.session:
                 self.session.interruption_snapshot = {"text": text, "timestamp": time.time()}
+                
+                # [S4-11 FIX]: Evaluate multi-step even on partial interruption
+                if 'turn' in locals() and turn and 'full_ai_text' in locals():
+                    turn["is_multi_step"] = self._is_multi_step(full_ai_text)
+                    logger.debug(f"[S4-11] Partial turn evaluated as MULTI-STEP: {turn['is_multi_step']}")
+                    
+                # [S4-11 FIX]: Push partial text to history so AI remembers what it said before barge-in
+                if 'full_ai_text' in locals() and full_ai_text.strip():
+                    logger.info(f"AI (Partial before interrupt): {full_ai_text.strip()}")
+                    self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
+            
             if 'worker_task' in locals(): worker_task.cancel()
         except Exception as e:
             logger.error(f"Response Error: {e}")
@@ -954,6 +1135,29 @@ class VoiceOrchestrator:
         await asyncio.sleep(delay)
         if self.state.get_state() != CallState.CALL_END:
              await self.cleanup()
+
+    def _is_multi_step(self, text: str) -> bool:
+        """
+        S4-11: Heuristic to detect if a response is a structured multi-step answer.
+        Matches admission steps, document checklists, or numbered lists.
+        """
+        if not text: return False
+        
+        # 1. Numbering detection (1., 2., Step 1, etc.)
+        if re.search(r'(\d+[\.\)\-]\s+|Step\s+\d+)', text, re.IGNORECASE):
+            return True
+            
+        # 2. Keyword detection
+        keywords = ["admission process", "document checklist", "following steps", "firstly", "secondly", "finally", "list of items"]
+        if any(kw in text.lower() for kw in keywords):
+            return True
+            
+        # 3. Complexity detection (Long responses with multiple sentences often imply structure)
+        sentences = re.split(r'[\.\?\!]\s+', text)
+        if len(sentences) >= 4:
+            return True
+            
+        return False
 
     async def cleanup(self):
         """Final session archival and resource release (Pillar 3)."""
@@ -1015,18 +1219,15 @@ class VoiceOrchestrator:
                     sentiment="Positive", # Default to positive for successful logs
                     call_logger=self.call_logger,
                     call_id=self.session.crm_call_id or sid,
-                    title=f"Completed Session Log ({reason})"
+                    title=f"Completed Session Log ({reason})",
+                    structured_turns=self.session.structured_turns
                 )
                 
             if self.recorder:
                 logger.info(">>> CLEANUP: Saving Recording...")
                 self.recorder.close()
                 
-            # 2. End and remove session from manager (Pillar 2)
-            if self.session:
-                self.session_manager.end_session(sid)
-                
-            # 3. Final Log Archival
+            # 2. Final Log Archival
             if self.call_logger:
                 logger.info(f"Cleanup: Generating final summary for {sid}")
                 # Use the session's actual termination reason, not a hardcoded value
@@ -1035,6 +1236,10 @@ class VoiceOrchestrator:
                     termination_reason = self.session.termination_reason
                 self.call_logger.generate_summary_line(status="completed", reason=termination_reason)
                 self.call_logger.save_log(status="completed")
+                
+            # 3. End and remove session from manager (Pillar 2)
+            if self.session:
+                self.session_manager.end_session(sid)
             
             # Force close websocket to break any receive loops
             # Wait briefly first to let any in-flight audio (e.g. goodbye TTS) finish transmitting
@@ -1078,7 +1283,8 @@ class VoiceOrchestrator:
                     summary="High Latency detected (>5.0s) causing system circuit break.",
                     sentiment="Negative",
                     call_id=self.session.crm_call_id or sid,
-                    title="System_Latency_Breach"
+                    title="System_Latency_Breach",
+                    structured_turns=self.session.structured_turns
                 )
             
             await self.cleanup()
@@ -1108,7 +1314,8 @@ class VoiceOrchestrator:
                 # logger.debug(f"Silencer: Gap={time.time() - self.last_interaction_time:.1f}s State={state}")
 
                 # 1. Don't count silence while AI is speaking, buffering, or transcribing
-                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING]:
+                # [FIX]: Include INTERRUPTED state to prevent premature 'Are you still there?' prompts
+                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED]:
                     self.last_interaction_time = time.time()
                     continue
 
@@ -1167,7 +1374,8 @@ class VoiceOrchestrator:
                             summary="Silence Termination",
                             sentiment="Neutral",
                             call_logger=self.call_logger,
-                            call_id=self.session.session_id
+                            call_id=self.session.session_id,
+                            structured_turns=self.session.structured_turns
                         )
                     except Exception as e:
                         logger.error(f"Failed to create Silence Termination CRM ticket: {e}")
@@ -1198,7 +1406,8 @@ class VoiceOrchestrator:
                 sentiment="SECURITY_ALERT",
                 call_logger=self.call_logger,
                 call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
-                title="Policy Termination: Language"
+                title="Policy Termination: Language",
+                structured_turns=self.session.structured_turns if self.session else None
             ))
 
             # 2. Speak Final Goodbye (Awaited to ensure audio transmits fully before closure)

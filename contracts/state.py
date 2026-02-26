@@ -12,6 +12,7 @@ class CallState(Enum):
     RETRIEVAL = "RETRIEVAL"
     RESPONSE_VALIDATION = "RESPONSE_VALIDATION"
     SPEAKING = "SPEAKING"
+    INTERRUPTED = "INTERRUPTED"
     ESCALATION = "ESCALATION"
     CALL_END = "CALL_END"
 
@@ -28,15 +29,18 @@ class StateMachine:
         self.ALLOWED_TRANSITIONS = {
             CallState.CALL_INIT: [CallState.LISTENING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL],
             
-            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION],
+            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.TRANSCRIBING],
             
-            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION],
+            CallState.INTERRUPTED: [CallState.LISTENING, CallState.CALL_END, CallState.TRANSCRIBING, CallState.SPEAKING],
+
+            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED],
             
             CallState.TRANSCRIBING: [
                 CallState.INTENT_EVAL, 
                 CallState.LISTENING,
                 CallState.SPEAKING,
-                CallState.CALL_END
+                CallState.CALL_END,
+                CallState.INTERRUPTED
             ],
             
             CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING],

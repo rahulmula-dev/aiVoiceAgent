@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, Protocol, List, Any, Optional
+from typing import AsyncGenerator, Protocol, List, Any, Optional, Dict
 from .schemas import TranscriptSegment, LLMRequest, LLMResponse, CallContext, EscalationEvent
 
 class STTEngine(Protocol):
@@ -17,7 +17,8 @@ class TTSEngine(Protocol):
     Contract for Text-To-Speech Modules.
     (Supported: Deepgram Aura, ElevenLabs, OpenAI)
     """
-    async def speak(self, text: str) -> AsyncGenerator[bytes, None]: ...
+    async def speak(self, text: str, call_id: Optional[str] = None) -> AsyncGenerator[bytes, None]: ...
+    def stop_current_speech(self, call_id: str) -> str: ...
     async def close(self) -> None: ...
 
 class KnowledgeBaseEngine(Protocol):
@@ -56,7 +57,8 @@ class CRMEngine(Protocol):
         self, 
         transcript: str, 
         summary: str, 
-        sentiment: str
+        sentiment: str,
+        structured_turns: Optional[List[Dict[str, Any]]] = None
     ) -> Any: ...
 
     async def log_call(

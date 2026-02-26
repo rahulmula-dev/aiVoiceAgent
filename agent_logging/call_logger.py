@@ -137,6 +137,16 @@ class CallLogger:
             # Use a shallow copy to avoid "list changed size" errors
             events_snapshot = list(self.events)
             
+            structured_turns = []
+            try:
+                from orchestrator.session_manager import default_session_manager
+                session = default_session_manager.get_session(self.call_id)
+                if session and hasattr(session, 'structured_turns'):
+                    # Convert to dict if they are Pydantic objects, but they are just simple dicts in the implementation
+                    structured_turns = session.structured_turns
+            except Exception as sm_err:
+                logger.debug(f"Could not retrieve structured_turns for log: {sm_err}")
+            
             log_data = {
                 "call_id": self.call_id,
                 "start_time": self.start_time.isoformat(),
@@ -144,6 +154,7 @@ class CallLogger:
                 "duration_seconds": duration,
                 "caller_number": self.caller_number,
                 "status": self.status,
+                "structured_turns": structured_turns,
                 "events": events_snapshot
             }
             

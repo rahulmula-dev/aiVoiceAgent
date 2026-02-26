@@ -32,12 +32,14 @@ class Session(BaseModel):
     
     # Memory & Context (Pillar 1)
     call_context: CallContext = Field(default_factory=lambda: CallContext(session_id="temp", caller_number="unknown", start_time=0.0))
-    conversation_history: List[Dict[str, str]] = []
+    conversation_history: List[Dict[str, Any]] = []
     retrieved_chunks_cache: List[RetrievalChunk] = []
     last_intent: Optional[str] = None
     
     # Barge-In Snapshot (Pillar 1)
     interruption_snapshot: Optional[Dict[str, Any]] = None
+    structured_turns: List[Dict[str, Any]] = []
+    current_speaking_turn_id: Optional[int] = None
 
     # Resilience Tracking (Pillar 2 & 3)
     termination_reason: str = "normal"

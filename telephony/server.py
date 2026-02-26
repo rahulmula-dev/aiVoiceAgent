@@ -270,6 +270,7 @@ async def handle_media_stream(websocket: WebSocket):
         call_logger.generate_summary_line()
         call_logger.save_log()
         logger.info(f"Forensic Audit trace finalized for {session_id}")
+        default_session_manager.end_session(session_id)
 
 @app.websocket("/ws/browser")
 async def handle_browser_stream(websocket: WebSocket):
@@ -301,7 +302,11 @@ async def handle_browser_stream(websocket: WebSocket):
     
     # 3. Handle Stream (Protocol mimicking)
     # The browser client MUST send Twilio-formatted JSON messages for this to work.
-    await manager.handle_audio_stream(websocket)
+    try:
+        await manager.handle_audio_stream(websocket)
+    finally:
+        default_session_manager.end_session(session_id)
+
 @app.get("/chat-ui", response_class=HTMLResponse)
 async def chat_ui():
     """
@@ -329,7 +334,8 @@ async def handle_chat_stream(websocket: WebSocket):
     manager = create_custom_orchestrator(
         stt_provider_class=MockSTT,
         tts_provider_class=MockTTS,
-        call_logger=call_logger # Logger now passed
+        call_logger=call_logger,
+        session_manager=default_session_manager
     )
     
     try:

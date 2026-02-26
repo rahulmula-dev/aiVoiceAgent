@@ -160,6 +160,7 @@
         let scriptProcessor;
         let isConnected = false;
         let nextPlayTime = 0;
+        let activeSources = [];
 
         const STATUS_DIV = document.getElementById('status');
         const WS_INDICATOR = document.getElementById('wsIndicator');
@@ -235,8 +236,10 @@
                     } else if (msg.event === 'clear') {
                         // Clear buffer (Interruption)
                         log("⚠️ Interruption - Clearing Buffer");
-                        // We can't strictly "clear" the AudioContext buffer queue easily without creating new nodes,
-                        // but resetting nextPlayTime helps sync.
+                        activeSources.forEach(source => {
+                            try { source.stop(); } catch(e) {}
+                        });
+                        activeSources = [];
                         nextPlayTime = audioContext.currentTime;
                     }
                 };
@@ -317,6 +320,13 @@
                 nextPlayTime = audioContext.currentTime;
             }
             source.start(nextPlayTime);
+            
+            // Track source to allow interruption
+            activeSources.push(source);
+            source.onended = () => {
+                activeSources = activeSources.filter(s => s !== source);
+            };
+
             nextPlayTime += buffer.duration;
         }
 

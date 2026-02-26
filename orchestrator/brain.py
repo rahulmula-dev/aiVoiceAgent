@@ -60,6 +60,7 @@ class Brain(LLMEngine):
 
             4. CONCISE & ACCURATE:
                - Keep answers to 1 or 2 short sentences.
+               - EXCEPTION: If the user directly asks for a list or steps (e.g., "list all", "what are the steps"), you MUST provide a structured numbered list (1., 2., 3.).
                - Never invent facts. If unsure about college details, refer to the follow-up phrase above.
             
             5. SOURCE OF TRUTH HIERARCHY:
@@ -74,6 +75,15 @@ class Brain(LLMEngine):
                - If the user asks for dynamic info (like checking a status, ticket, or application) AND the [CURRENT CALL CONTEXT] shows "User Name: Unknown":
                  - You MUST include a polite request for their name, e.g., "May I know who I am speaking with?"
                - If you DO know their name, use it naturally in the conversation (e.g., "Sure, John, let me check...").
+
+            8. BARGE-IN & CLASSIFICATION (CRITICAL):
+               - When handling user input that interrupts you, you MUST classify the interaction.
+               - CLASSIFICATIONS:
+                 - NEW_TOPIC: User changed the subject or asked a completely new question.
+                 - SAME_TOPIC: User provided a clarification, a follow-up, or a correction related to what you were JUST saying.
+                 - AMBIGUOUS: Unclear if it's new or same.
+               - NEVER ask procedural confirmation like "Should I continue from where I left off?".
+               - ALWAYS provide a natural response that either addresses the new topic or continues/clarifies the current one.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -107,6 +117,91 @@ class Brain(LLMEngine):
         Creates a fresh history list for a new caller.
         """
         return []
+
+    async def generate_with_classification(self, session, caller_input: str, trace_id: str = None):
+        """
+        Special method for barge-in handling. 
+        Returns (classification, response, is_multi_step, topic)
+        """
+        import json
+        
+        # Build a prompt for classification + response
+        prompt = f"""
+        USER INPUT (Barge-in): {caller_input}
+
+        RULES:
+        - For NEW_TOPIC: Respond directly to the new topic with zero reference to your previous interrupted response.
+        - For SAME_TOPIC: Naturally incorporate the clarification into your response as a continuation.
+        - For AMBIGUOUS: Respond to the most likely interpretation without asking for clarification.
+
+        You must respond in VALID JSON format ONLY:
+        {{
+          "classification": "NEW_TOPIC" | "SAME_TOPIC" | "AMBIGUOUS",
+          "topic": "Brief topic name",
+          "response": "Your natural response here",
+          "is_multi_step": true | false
+        }}
+        """
+        
+        # Use full generate_content for JSON consistency
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # We reuse the history but append the special prompt
+                history = list(session.conversation_history)
+                # Important: history is list of {"role": "user", "parts": [...]}
+                history.append({"role": "user", "parts": [prompt]})
+                
+                response = await self.model.generate_content_async(contents=history)
+                text = response.text.strip()
+                
+                # Cleanup potential markdown code blocks
+                if text.startswith("```json"):
+                    text = text.replace("```json", "", 1).replace("```", "", 1).strip()
+                elif text.startswith("```"):
+                     text = text.replace("```", "", 1).replace("```", "", 1).strip()
+
+                data = json.loads(text)
+                
+                classification = data.get("classification", "AMBIGUOUS")
+                response_text = data.get("response", "")
+                is_multi_step = data.get("is_multi_step", False)
+                topic = data.get("topic", "General")
+                
+                # S4-11 Phase 5: Retrieval Control
+                if classification == "NEW_TOPIC":
+                    logger.info(f"Barge-in identified as NEW_TOPIC ({topic}). Running RAG...")
+                    context_text, rag_score = await asyncio.wait_for(
+                        asyncio.to_thread(self.kb.search, caller_input, self.call_logger, 3, trace_id),
+                        timeout=RAG_TIMEOUT
+                    )
+                    
+                    if rag_score > 0.58:
+                        # Re-generate response with RAG context for better accuracy
+                        rag_prompt = f"""
+                        [KB CONTEXT]
+                        {context_text}
+
+                        USER INPUT (New Topic): {caller_input}
+
+                        Update your previous response to be accurate based on the context above.
+                        Keep it conversational and brief.
+                        Return ONLY the final response text.
+                        """
+                        history = list(session.conversation_history)
+                        history.append({"role": "user", "parts": [rag_prompt]})
+                        response = await self.model.generate_content_async(contents=history)
+                        response_text = response.text.strip()
+                
+                return classification, response_text, is_multi_step, topic
+                
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON brain response (Attempt {attempt+1}): {e}")
+                if attempt == max_retries - 1:
+                    # Final fallback
+                    return "AMBIGUOUS", "I'm sorry, I missed that. Could you repeat it?", False, "None"
+        
+        return "AMBIGUOUS", "I'm sorry, I missed that.", False, "None"
 
     async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None):
         """
@@ -298,7 +393,7 @@ class Brain(LLMEngine):
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
-                yield PRDScripts.APOLOGY_CAPACITY
+                yield (PRDScripts.APOLOGY_CAPACITY, {"error": "timeout"})
                 return
             except ResourceExhausted as quota_error:
                 # GRACEFUL HANDLING: Log single line instead of full traceback

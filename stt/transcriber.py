@@ -41,6 +41,9 @@ class Transcriber(STTProvider):
             "interim_results=true",
             "smart_format=true",
             "endpointing=300",
+            "replace=GED:GD",
+            "replace=male:Nail",
+            "replace=Male:Nail",
         ]
 
         if self.encoding == "mulaw":
@@ -199,6 +202,9 @@ class Transcriber(STTProvider):
                 await self.ws.send(audio_chunk)
             except Exception as e:
                 logger.error(f"ERROR - Failed to send audio: {e}")
+                raise ConnectionError(f"STT Connection Dropped: {e}")
+        else:
+            raise ConnectionError("STT Connection is not established or was closed.")
 
     async def close(self):
         """Gracefully closes the connection"""

@@ -22,6 +22,8 @@ class Synthesizer(TTSEngine):
         # Deepgram Aura Options
         self.url = f"https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding={encoding}&sample_rate={sample_rate}&container=none"
         self._client = None
+        self._active_texts = {} # call_id -> current_text
+        self._stop_signals = set() # call_id
 
     async def _get_client(self):
         # Pillar 3: Persistence for Latency Reduction
@@ -33,13 +35,17 @@ class Synthesizer(TTSEngine):
             logger.debug("Persistent TTS HTTP client initialized.")
         return self._client
 
-    async def speak(self, text_input):
+    async def speak(self, text_input, call_id=None):
         """
         Converts text to audio bytes using Deepgram Aura.
         Yields bytes asynchronously as they arrive.
         """
         if not text_input or not text_input.strip():
             return
+        
+        if call_id:
+            self._active_texts[call_id] = text_input
+            self._stop_signals.discard(call_id)
 
         logger.debug(f"Synthesizing audio stream ({len(text_input)} chars)")
         
@@ -60,13 +66,21 @@ class Synthesizer(TTSEngine):
                     
                     first_chunk = True
                     async for chunk in response.aiter_bytes(chunk_size=1024):
+                        if call_id in self._stop_signals:
+                            logger.debug(f"Stop signal received for {call_id}. Interrupting TTS.")
+                            break
                         if chunk:
                             if first_chunk:
                                 logger.debug(f"First audio chunk received from Deepgram (Size: {len(chunk)})")
                                 first_chunk = False
                             yield chunk
                 # If we successfully finished the stream, break the retry loop
-                break
+                if not (call_id in self._stop_signals):
+                    break
+                else:
+                    # Clear active text if we stopped
+                    self._active_texts.pop(call_id, None)
+                    break
                             
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as e:
                 logger.warning(f"TTS Connection Issue (Attempt {attempt+1}/{max_retries}): {e}")
@@ -80,6 +94,24 @@ class Synthesizer(TTSEngine):
             except Exception as e:
                 logger.error(f"TTS Unexpected Error: {e}")
                 return
+            finally:
+                if call_id and call_id in self._active_texts and not (call_id in self._stop_signals):
+                     # If we finished naturally (not interrupted), we can keep it or clear it
+                     # The manager might need to know what WAS spoken.
+                     # Let's keep it until next speak or explicit stop? 
+                     # Blueprint says: "Returns last spoken partial text." 
+                     # If it finished, maybe return nothing?
+                     pass
+
+    def stop_current_speech(self, call_id: str) -> str:
+        """
+        Stops TTS playback immediately.
+        Returns last spoken partial text.
+        """
+        self._stop_signals.add(call_id)
+        text = self._active_texts.pop(call_id, "")
+        logger.info(f"Interrupted speech for {call_id}: '{text}'")
+        return text
 
     async def close(self):
         if self._client and not self._client.is_closed:
