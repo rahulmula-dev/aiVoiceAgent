@@ -175,7 +175,7 @@ class VoiceOrchestrator:
                 
                 self.last_empty_frame_time = stt_current_time
                 
-                # Track the start of this non-English "run" (resets when English text comes in)
+                # Track the start of this non-English "run" (resets when high-confidence English text comes in)
                 if self.consecutive_empty_frames == 0:
                     self.non_english_run_start = time.time()  # Fresh start for each new run
                 self.consecutive_empty_frames += 1
@@ -186,12 +186,11 @@ class VoiceOrchestrator:
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
                 # Fire a language strike ONLY when BOTH conditions are met:
                 #   1. At least 4 frames in this run (rules out a single noise spike)
-                #   2. Run has been active ≥ 12 seconds (rules out fast background noise bursts
+                #   2. Run has been active ≥ 5.0 seconds (rules out fast background noise bursts
                 #      and normal English thinking pauses which are always < 10s)
-                # 12s > silence monitor's 10s threshold → silence fires first for truly silent
-                # users; for active non-English speakers the run accumulates across sentences.
+                # 5s threshold is aggressive to catch non-English speakers quickly.
                 # ─────────────────────────────────────────────────────────────────────────────
-                if self.consecutive_empty_frames >= 4 and non_english_duration >= 12.0:
+                if self.consecutive_empty_frames >= 3 and non_english_duration >= 5.0:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -226,7 +225,7 @@ class VoiceOrchestrator:
                             summary=f"Security Violation: HARD_REFUSAL_LANGUAGE (phoneme, Strike {self.language_strike_count})",
                             sentiment="SECURITY_ALERT",
                             call_logger=self.call_logger,
-                            call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                            call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "system_gen"),
                             title=f"Policy: Language Barrier Strike {self.language_strike_count}"
                         ))
                         
@@ -272,24 +271,35 @@ class VoiceOrchestrator:
                 return # 🟢 FIXED: Return here to prevent fall-through to clarification check
 
             else:
-                # Empty with higher confidence = Background silence, reset counter
-                if self.consecutive_empty_frames > 0:
-                    logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames})")
-                    self.consecutive_empty_frames = 0
-                    self.non_english_run_start = time.time()  # Anchor to now, never epoch
+                # Empty with higher confidence = Background silence
+                # [GOVERNANCE] Do NOT reset the run counter on background silence if 
+                # a non-English run is active. We only reset on REAL English text.
                 logger.debug(f"[FILTER] Empty transcript (confidence: {confidence:.2f}) - background silence")
                 return
         else:
-            # Mark that user has spoken (enable non-English detection)
-            if not self.user_has_spoken:
-                logger.debug("[FIRST SPEECH] User has spoken - enabling non-English detection")
-                self.user_has_spoken = True
+            # Non-empty transcript received.
+            # ── HALLUCINATION PROTECTION ──────────────────────────────────────────
+            # If the confidence is low (< 0.75), we suspect it's a "forced English"
+            # hallucination of foreign speech (Deepgram forcing audio into English words).
+            # In this case, we do NOT reset the non-English run counter.
+            # ──────────────────────────────────────────────────────────────────────
+            if confidence < 0.75:
+                # ── EXTREME PROTECTION: Treat < 0.35 as a non-English phoneme ────────
+                # If it's truly garbled, it counts as an increment to the run.
+                if confidence < 0.35:
+                    self.consecutive_empty_frames += 1
+                    logger.warning(f"[GOVERNANCE] Garbled text detected as non-English signal. Counter: {self.consecutive_empty_frames}")
+                else:
+                    logger.debug(f"[GOVERNANCE] Low-confidence text '{text}' ({confidence:.2f}) - preserving status quo.")
             
-            # Non-empty transcript received, reset counter
+            # [REFINEMENT]: Reset run timer on ANY non-empty transcript to prevent 
+            # silence from old frames bleeding into new speech turns.
             if self.consecutive_empty_frames > 0:
                 logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames}) - received text")
                 self.consecutive_empty_frames = 0
-                self.non_english_run_start = time.time()  # Reset run timer — English resets everything
+            
+            # Always reset run timer when valid text is processing to keep it fresh
+            self.non_english_run_start = time.time() 
             
             # SILENCE RESET: legitimate user text
             self.last_interaction_time = time.time()
@@ -343,10 +353,10 @@ class VoiceOrchestrator:
         # [FORENSIC FIX]: If the user speaks valid English (Anything EXCEPT a language refusal),
         # we reset the language strike counter. This ensures that one-off language mistakes
         # or STT glitches don't lead to unfair terminations if the user is otherwise speaking English.
-        if intent != "HARD_REFUSAL_LANGUAGE":
-            if self.language_strike_count > 0:
-                logger.info(f"[RESET] Resetting language strike counter (was {self.language_strike_count}) - valid English received")
-                self.language_strike_count = 0
+        # [GOVERNANCE] Language strikes are cumulative for the session (Pillar 1).
+        # We do NOT reset them here, even if the user speaks English, 
+        # to prevent "strike-cycling" where a user intersperses 
+        # foreign speech with English to bypass termination.
         
         # --- RAG SHORT-CIRCUIT ---
         # [GOVERNANCE] If policy violation is detected, abort immediately.
@@ -368,6 +378,16 @@ class VoiceOrchestrator:
             else:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
+                
+                # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Competitors, Fees, etc.)
+                self._create_task_with_log(self.crm.create_ticket(
+                    transcript=text,
+                    summary=f"Policy Violation: {intent}",
+                    sentiment="SECURITY_ALERT" if "SENSITIVE" in intent else "Neutral",
+                    call_logger=self.call_logger,
+                    call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                    title=f"Policy Refusal: {intent}"
+                ))
 
             # 🟢 S4 Hardening: Hard LLM Bypass (Policy Violation)
             if self.response_task and not self.response_task.done():
@@ -880,7 +900,7 @@ class VoiceOrchestrator:
                             summary="English-Only Policy/Speculation Violation",
                             sentiment="QUALITY_FAILURE",
                             call_logger=self.call_logger,
-                            call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                            call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "quality_check"),
                             title="Quality Assurance Failure"
                         ))
                         
@@ -914,7 +934,7 @@ class VoiceOrchestrator:
                     summary=ticket_summary,
                     sentiment=ticket_sentiment,
                     call_logger=self.call_logger,
-                    call_id=self.session.crm_call_id or self.session.session_id,
+                    call_id=self.session.crm_call_id or self.session.session_id if self.session else "unknown_context",
                     title=f"Support Request: {ticket_sentiment}"
                 ))
             

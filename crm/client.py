@@ -134,7 +134,7 @@ class CRMClient(CRMEngine):
              final_title = f"{final_title} | Call-{short_id}"
 
         ticket_data = {
-            "call_id": call_id,
+            "call_id": call_id or "unknown",
             "title": final_title,
             "description": summary,
             "status": "OPEN",

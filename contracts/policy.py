@@ -1,5 +1,7 @@
 from .schemas import EscalationEvent, CallContext
 import logging
+import re
+from langdetect import detect_langs
 
 class PRDScripts:
     # Greetings
@@ -101,10 +103,34 @@ class ResponsePolicyEngine:
 
     # --- 5. LANGUAGE DETECTION (Story S1-4) ---
     COMMON_ENGLISH_WORDS = {
-        "ok", "okay", "fine", "yes", "yup", "no", "mhm", "hello", "hi", 
-        "can", "you", "about", "your", "more", "tell", "me", "the", "be", 
-        "what", "where", "how", "when", "why", "this", "that", "these", 
-        "those", "good", "bad", "thanks", "thank", "please", "help"
+        "a", "an", "the", "i", "m", "my", "me", "you", "your", "he", "she", "it", "we", "they",
+        "is", "am", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did",
+        "of", "to", "in", "and", "or", "but", "if", "for", "with", "at", "by", "from",
+        "what", "where", "how", "when", "why", "who", "which",
+        "this", "that", "these", "those", "here", "there",
+        "ok", "okay", "fine", "yes", "yup", "no", "mhm", "hello", "hi", "hey",
+        "can", "more", "tell", "good", "bad", "thanks", "thank", "please", "help",
+        "admission", "admissions", "course", "courses", "college", "fees",
+        "available", "program", "programs", "certificate", "diploma",
+        "applied", "last", "week", "month", "year", "want", "need", "info", "information",
+        "structure", "details", "process", "apply", "online", "campus",
+        "student", "asking", "query", "regarding", "saying", "speak", "know", "about",
+        "would", "like", "get", "brief", "fee", "cost", "price", "duration", "time", "date",
+        "batch", "next", "start", "location", "address", "branch", "office", "contact",
+        "number", "email", "phone", "call", "back", "human", "agent", "representative",
+        "support", "team", "gd", "college", "cila", "goodbye", "bye", "see", "later",
+        "morning", "afternoon", "evening", "night", "one", "two", "three", "four", "five",
+        "first", "second", "third", "all", "any", "some", "every", "each", "other",
+        "another", "new", "old", "still", "waiting", "listen", "hearing", "catch", "repeat",
+        "m", "s", "re", "ve", "ll", "d", "t", "can", "t", "isn", "wasn", "don", "didn",
+        "something", "anything", "nothing", "someone", "anyone", "everyone",
+        "sushmita", "now", "name", "doing", "gmail", "great", "sure", "maybe", "logic",
+        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage", "esthetics",
+        "robot", "going", "since", "empower", "empowers", "empowering", "financial",
+        "independence", "business", "marketing", "portfolio", "building", "interview",
+        "preparation", "gender", "genders", "skills", "mission", "vision", "values",
+        "career", "vocational", "technical", "gd college", "cila agent"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -127,52 +153,94 @@ class ResponsePolicyEngine:
         [GOVERNANCE] Bulletproof Failsafe English Detection (Expert Debugger Version).
         Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
         """
-        # 0. Authoritative STT Metadata Guard (Fixes "English Hallucinations" bypass)
-        if detected_lang and detected_lang != 'en':
-            return False
-            
-        import re
-        import logging
-        from langdetect import detect_langs
         policy_logger = logging.getLogger("Policy")
-        
+
         text = text.strip()
         if not text:
             return True # Ignore truly empty strings
+            
+        lower_text = text.lower()
+        words = re.findall(r'\b\w+\b', lower_text)
+        if not words:
+            return True
+            
+        common_words_found = [w for w in words if w in self.COMMON_ENGLISH_WORDS]
+        num_common = len(common_words_found)
+        density = num_common / len(words)
+        
+        # 1. Density Check: Strict thresholds for English-only enforcement.
+        # [REFINEMENT]: Even if keywords are present, we must calculate density.
+        # Example: "Mujhe Cosmetology join karna hai" = low density = FAIL.
+        is_very_short = len(words) <= 2
+        
+        # User feedback: "Strict for user input (0.60)"
+        threshold = 0.60
+        is_mixed_danger = not is_very_short and density < threshold
+        
+        if is_mixed_danger:
+            policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
+            return False
 
-        if len(text) < 4:
-            return True # Too short to reliably detect, give benefit of the doubt
+        if detected_lang and detected_lang != 'en':
+            # EXPERT OVERRIDE: langdetect is notoriously bad at short strings.
+            # If it's a very short sentence (1-2 words), we only block if it's 
+            # definitely NOT a common word and NOT purely alphabetical (names).
+            
+            # Trust density more for short samples.
+            if density >= 0.70:
+                policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to High Density ({density:.2f}): '{text}'")
+                return True
+                
+            if is_very_short:
+                # If it contains at least one common word ("is", "my", "hi")
+                if num_common >= 1:
+                    policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) for short English phrase: '{text}'")
+                    return True
+                
+                # NAME PROTECTION: If it's a single word and purely alphabetical, it's likely a name.
+                # Deepgram usually capitalizes it.
+                if len(words) == 1 and words[0].isalpha():
+                    policy_logger.info(f"[GOVERNANCE] Permitting single alphabetical word (potential name/affirmation): '{text}'")
+                    return True
 
-        # 1. ASCII/Latin Check (Catches Hindi/Bengali/Mandarin instantly)
-        # If less than 50% of the text is standard Latin characters, it's definitely foreign.
-        # Strips numbers and punctuation before checking ratio.
-        clean_text = re.sub(r'[^a-zA-Z\u00C0-\u017F]', '', text)
-        if not clean_text or len(re.findall(r'[a-zA-Z]', clean_text)) / len(clean_text) < 0.5:
+            policy_logger.warning(f"[GOVERNANCE] Blocked via STT Metadata ({detected_lang}) - Density: {density:.2f}: '{text}'")
+            return False
+
+        if len(text) < 3:
+            return True # Too short to reliably detect
+
+        # 1. ASCII Check
+        clean_text_alpha = re.sub(r'[^a-zA-Z]', '', text)
+        if not clean_text_alpha or len(re.findall(r'[a-zA-Z]', clean_text_alpha)) / len(clean_text_alpha) < 0.4:
             policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
             return False
 
-        # 2. Probabilistic Check (Catches Spanish, French, German, bilingual mixing)
-        # S4 Hardening Fix: Threshold lowered to 0.60 to block mixed/foreign lean.
-        # Dictionary bypass REMOVED to prevent "VIP pass" for mixed sentences.
+        # 2. Probabilistic Check
         try:
             detected_langs = detect_langs(text)
             policy_logger.debug(f"[GOVERNANCE] Langdetect Raw: {detected_langs}")
 
             if detected_langs:
-                top_lang = detected_langs[0]
+                top = detected_langs[0]
                 
-                # If the top language is NOT English, and we are 60% sure, STRIKE IT.
-                if top_lang.lang != 'en' and top_lang.prob > 0.60:
-                    policy_logger.warning(f"[GOVERNANCE] Mixed/Foreign language detected: {top_lang.lang} ({top_lang.prob:.2f}). Triggering Strike.")
-                    return False # This will trigger the refusal strike
-                    
-                # If the top language is English, but confidence is terrible, treat as garbage
-                if top_lang.lang == 'en' and top_lang.prob < 0.35:
-                    policy_logger.warning(f"[GOVERNANCE] English confidence too low ({top_lang.prob:.2f}). Treating as hallucinated garbage.")
-                    return False 
-                    
-                policy_logger.debug(f"[GOVERNANCE] PASSED (en={top_lang.prob:.2f}): '{text}'")
-                return True # Passes as valid English
+                if top.lang != 'en':
+                    # Only override if density is decent
+                    if density >= 0.75:
+                        policy_logger.info(f"[GOVERNANCE] Overriding {top.lang} detection ({top.prob:.2f}) due to Density ({density:.2f}).")
+                        return True
+                    elif top.prob > 0.40: # Less sensitive than 0.25
+                        policy_logger.warning(f"[GOVERNANCE] Non-English suspected: {top.lang} ({top.prob:.2f}). Density: {density:.2f}. Triggering Strike.")
+                        return False
+                
+                if top.lang == 'en':
+                    # Even if langdetect says 'en', if density is too low, it's mixed language
+                    if density < 0.60:
+                        policy_logger.warning(f"[GOVERNANCE] Blocked Hinglish/Mixed (en={top.prob:.2f}, density={density:.2f}): '{text}'")
+                        return False
+                    policy_logger.debug(f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'")
+                    return True
+
+            return density >= 0.80 # Default fallback
 
         except Exception as e:
             policy_logger.error(f"[GOVERNANCE] langdetect failed: {e}")
@@ -218,16 +286,27 @@ class ResponsePolicyEngine:
                     return False
 
                 # 4b. Langdetect check — catches Latin-script foreign output (Spanish, French, etc.)
-                # Guard: langdetect is unreliable on short chunks (e.g. "Hello Akanksha." = 2 words).
-                # Minimum 30 chars before running probabilistic detection.
-                # Short chunks are still protected by the ASCII ratio check above.
-                if len(response_text) >= 30:
+                # Guard: langdetect is unreliable on short chunks.
+                # Heuristic: Check common English density first as a safety net.
+                words = re.findall(r'\b\w+\b', lower_text)
+                common_words_found = [w for w in words if w in self.COMMON_ENGLISH_WORDS]
+                density = len(common_words_found) / len(words) if words else 0
+
+                # [REFINEMENT]: Bifurcated thresholds for AI vs User
+                # Output Guard (Internal Sentry): uses 0.45 for technical RAG data.
+                threshold = 0.45
+                
+                if len(response_text) >= 40:
                     detected = detect_langs(response_text)
                     if detected:
                         top = detected[0]
-                        if top.lang != 'en' and top.prob > 0.70:
-                            _logger.warning(f"[OUTPUT GOVERNANCE] LLM output in {top.lang} ({top.prob:.2f}) — blocking.")
-                            return False
+                        if top.lang != 'en' and top.prob > 0.95:
+                            # Only block if density is also low
+                            if density < threshold:
+                                _logger.warning(f"[OUTPUT GOVERNANCE] LLM output in {top.lang} ({top.prob:.2f}), density {density:.2f} < {threshold} — blocking.")
+                                return False
+                            else:
+                                _logger.info(f"[OUTPUT GOVERNANCE] Overriding {top.lang} detection ({top.prob:.2f}) for AI output due to English Density ({density:.2f}).")
 
             except Exception as e:
                 # If detection fails, allow output — a detection crash ≠ a violation.

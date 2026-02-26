@@ -46,11 +46,10 @@ class Transcriber(STTProvider):
         if self.encoding == "mulaw":
             params.append("detect_language=true") 
         else:
-            # Task 3: Architect Rule - For browser (linear16), detect_language is unsupported.
-            # We use 'en' as the default engine to prevent 400 Errors.
             params.append("language=en")
-
+        
         url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
+        logger.info(f"[DEEPGRAM] Full URL: {url.replace(self.api_key, 'REDACTED')}")
         headers = {
             "Authorization": f"Token {self.api_key}"
         }
@@ -58,45 +57,6 @@ class Transcriber(STTProvider):
         logger.info(f"[DEEPGRAM] Connecting: encoding={self.encoding} rate={self.sample_rate}")
         try:
             with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
-        except: pass
-
-        try:
-            self.ws = await websockets.connect(url, additional_headers=headers)
-            logger.info(f"[DEEPGRAM] Connected OK (encoding={self.encoding}, rate={self.sample_rate})")
-            try:
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"CONNECTED OK: encoding={self.encoding} sample_rate={self.sample_rate}\n")
-            except: pass
-
-            asyncio.create_task(self._listen())
-            return True
-        except Exception as e:
-            logger.error(f"[DEEPGRAM] Connection FAILED: {e}")
-            try:
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"CONNECTION FAILED: {e}\n")
-            except: pass
-            return False
-
-    async def _listen(self):
-        """Internal loop to process transcription results"""
-        try:
-            with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                f.write("DEBUG: Listen Loop Started\n")
-            
-            async for message in self.ws:
-                # Log raw message receipt
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"RAW MSG: {message}\n")
-
-                data = json.loads(message)
-                
-                # HEARTBEAT / METADATA CHECK
-                msg_type = data.get("type")
-                if msg_type == "Metadata":
-                    logger.debug(f"DG Metadata Received (ID: {data.get('request_id')})")
-                    continue
 
                 if "channel" in data:
                     alt = data["channel"]["alternatives"][0]

@@ -61,11 +61,18 @@ class KnowledgeBase(KnowledgeBaseEngine):
             )
             query_embedding = response['embedding']
 
-            # 2. Query Pinecone
+            # 2. Query Pinecone with Dynamic Metadata Filter (Story S4-1: Deterministic Fees)
+            search_filter = {}
+            # Heuristic: If query talks about fees, restrict to 'Fees' category.
+            if "fee" in query.lower() or "cost" in query.lower() or "price" in query.lower():
+                search_filter = {"category": "Fees"}
+                logger.debug(f"Applying Deterministic Fee Filter for query: '{query}'")
+
             results = self.index.query(
                 vector=query_embedding,
                 top_k=top_k,
-                include_metadata=True
+                include_metadata=True,
+                filter=search_filter if search_filter else None
             )
 
             # 3. The "Double-Filter" Loop
