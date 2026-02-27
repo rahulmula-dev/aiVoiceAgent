@@ -340,6 +340,34 @@ class Brain(LLMEngine):
             logger.info(log_str)
             # --------------------------------------------------
 
+            # ── RAG SCORE FLOOR (T2 fix: Phonetic Hallucination) ─────────────────────
+            # If Pinecone returns a score below 0.45 AND there is no CRM context to
+            # fall back on, the query is almost certainly hallucinated STT garbage
+            # (e.g. "shoe in the car na") or completely out-of-domain.
+            # Block here — before the LLM is called — to prevent hallucinated answers.
+            RAG_FLOOR = 0.45
+            if rag_score < RAG_FLOOR and not crm_hit:
+                logger.warning(
+                    f"[RAG GOVERNANCE] Low retrieval confidence ({rag_score:.2f} < {RAG_FLOOR}). "
+                    f"Input likely hallucinated/out-of-domain. Blocking LLM call."
+                )
+                if self.call_logger:
+                    self.call_logger.log_event(
+                        "brain", "decision_trace",
+                        meta={
+                            "intent": intent,
+                            "confidence_score": round(rag_score, 2),
+                            "chunks_used": [],
+                            "crm_hit": False,
+                            "governance_decision": "Blocked: RAG_SCORE_FLOOR",
+                            "refusal_flags": {"kb_miss": True, "rag_floor_triggered": True}
+                        },
+                        trace_id=trace_id
+                    )
+                yield (self.KB_MISS_SCRIPT, {"rag_score": rag_score, "has_grounding": False})
+                return
+            # ─────────────────────────────────────────────────────────────────────────
+
             # Metadata for Policy Engine
             sent_metadata = {
                 "rag_score": rag_score,

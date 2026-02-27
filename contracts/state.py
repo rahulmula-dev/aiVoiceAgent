@@ -31,16 +31,24 @@ class StateMachine:
             
             CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.TRANSCRIBING],
             
+<<<<<<< HEAD
             CallState.INTERRUPTED: [CallState.LISTENING, CallState.CALL_END, CallState.TRANSCRIBING, CallState.SPEAKING],
 
             CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED],
+=======
+            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION],
+>>>>>>> cb5a36609a196f40925b43fa71c63e2bd6300add
             
             CallState.TRANSCRIBING: [
                 CallState.INTENT_EVAL, 
                 CallState.LISTENING,
                 CallState.SPEAKING,
                 CallState.CALL_END,
+<<<<<<< HEAD
                 CallState.INTERRUPTED
+=======
+                CallState.ESCALATION
+>>>>>>> cb5a36609a196f40925b43fa71c63e2bd6300add
             ],
             
             CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING],
