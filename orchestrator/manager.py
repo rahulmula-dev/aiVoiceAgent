@@ -226,11 +226,11 @@ class VoiceOrchestrator:
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
                 # Fire a language strike ONLY when BOTH conditions are met:
                 #   1. At least 4 frames in this run (rules out a single noise spike)
-                #   2. Run has been active ≥ 5.0 seconds (rules out fast background noise bursts
+                #   2. Run has been active >= 12.0 seconds (rules out fast background noise bursts
                 #      and normal English thinking pauses which are always < 10s)
-                # 5s threshold is aggressive to catch non-English speakers quickly.
+                # 12s threshold ensures the 10s Silence Monitor fires first if it's just a quiet room.
                 # ─────────────────────────────────────────────────────────────────────────────
-                if self.consecutive_empty_frames >= 3 and non_english_duration >= 5.0:
+                if self.consecutive_empty_frames >= 3 and non_english_duration >= 12.0:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -436,19 +436,8 @@ class VoiceOrchestrator:
             
             self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
 
-<<<<<<< HEAD
-                if self.language_strike_count >= 3:
-                    logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
-                    self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
-                else:
-                    if self.response_task and not self.response_task.done():
-                        self.response_task.cancel()
-                    self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
-                return
-
-=======
             # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
-            if intent == "HARD_REFUSAL_LANGUAGE" and self.language_strike_count >= 3:
+            if intent in ["HARD_REFUSAL_LANGUAGE", "HARD_REFUSAL_LANGUAGE_BYPASS"] and self.language_strike_count >= 3:
                 logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
                 self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
                 return # SHORT-CIRCUIT: Do not proceed to barge-in or brain
@@ -456,8 +445,6 @@ class VoiceOrchestrator:
             # D. Strikes 1-2 and other refusals: Speak refusal, stay on call
             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
             return # SHORT-CIRCUIT
-                
->>>>>>> cb5a36609a196f40925b43fa71c63e2bd6300add
         # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
         if self.response_task and not self.response_task.done():
             # [S4-11 FIX]: Check both SPEAKING and INTERRUPTED states
@@ -1045,7 +1032,6 @@ class VoiceOrchestrator:
                                  "validation_pass": is_safe
                              }, trace_id=trace_id)
 
-<<<<<<< HEAD
                         if is_safe:
                             if not full_ai_text: # First sentence logic
                                 llm_latency = int((time.time() - llm_start_time) * 1000)
@@ -1067,7 +1053,7 @@ class VoiceOrchestrator:
                                 summary="Policy Violation",
                                 sentiment="QUALITY_FAILURE",
                                 call_logger=self.call_logger,
-                                call_id=self.session.crm_call_id or self.session.session_id,
+                                call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "quality_check"),
                                 title="Quality Assurance Failure"
                             ))
                             break
@@ -1097,41 +1083,6 @@ class VoiceOrchestrator:
                 # Ensure worker is dead
                 if not worker_task.done():
                     worker_task.cancel()
-                
-=======
-                    if is_safe:
-                        if not full_ai_text: # First sentence logic
-                            llm_latency = int((time.time() - llm_start_time) * 1000)
-                            if self.call_logger:
-                                self.call_logger.log_event("orchestrator", "llm_response_start", latency_ms=llm_latency, trace_id=trace_id)
-                        
-                        full_ai_text += sentence + " "
-                        await audio_queue.put(sentence)
-                    else:
-                        logger.warning(f"Response Validation Failed (English/Speculation): '{sentence}'")
-                        
-                        # FAILURE ACTION: English Refusal & Escalation (Policy Rule)
-                        self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
-                        failure_msg = PRDScripts.REFUSAL_LANGUAGE
-                        await audio_queue.put(failure_msg)
-                        full_ai_text = failure_msg
-                        
-                        self._create_task_with_log(self.crm.create_ticket(
-                            transcript=f"Blocked Response (Non-English/Speculative): {sentence}\nUser Query: {text}",
-                            summary="English-Only Policy/Speculation Violation",
-                            sentiment="QUALITY_FAILURE",
-                            call_logger=self.call_logger,
-                            call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "quality_check"),
-                            title="Quality Assurance Failure"
-                        ))
-                        
-                        # Stop the stream immediately
-                        break
-            
-            await audio_queue.put(None)
-            await worker_task
-            
->>>>>>> cb5a36609a196f40925b43fa71c63e2bd6300add
             logger.info(f"AI: {full_ai_text.strip()}")
             log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
