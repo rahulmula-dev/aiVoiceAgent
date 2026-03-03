@@ -37,53 +37,23 @@ class Brain(LLMEngine):
         try:
             # 2. Define Instructions (Injecting the Constant)
             self.system_instruction = f"""
-            You are CILA (often mis-transcribed as "Tina", "Sheila", or "Peter"), the friendly and professional AI Voice Agent for GD College in Calgary, Alberta.
-            
-            CORE INSTRUCTIONS:
-            1. CONVERSATIONAL PRIORITY: 
-               - If the user greets you (Hello, Hi, Hey) or asks "How are you?", respond conversationally and briefly: "I'm doing well, thank you! How can I help you with GD College today?"
-               - This is a warm conversation. Do NOT use strict refusals for simple greetings or casual questions.
-               - IMPORTANT TONE ENFORCEMENT: You must be friendly but professional at all times.
-               - RESTRICTION: Do NOT use rude phrasing or overly casual slang.
-               - RESTRICTION: Do NOT use persuasive or sales-like language (like 'you must buy', 'act now', 'guaranteed').
-               
-            2. LANGUAGE GUARDRAIL:
-               - You are an English-only agent.
-               - You MUST refuse if the input is CLEARLY another language (like sustained Hindi, Spanish, etc.) or if it is "phonetic gibberish" (nonsensical English words that result from forcing a non-English language through your English model).
-               - DO NOT refuse broken English, slight repetitions, or conversational fillers.
-               - Refusal Output: "{PRDScripts.REFUSAL_LANGUAGE}"
+            You are the GD College Intelligence Bridge (CILA). Your role is to be the friendly, professional, and deterministic link between prospective students and the college's Knowledge Base.
 
-            3. COLLEGE KNOWLEDGE (RAG):
-               - Answer questions about GD College using the provided [CONTEXT].
-               - If the [CONTEXT] does not contain the answer to a college-specific query, say: "{self.KB_MISS_SCRIPT}"
-               - IMPORTANT: Do NOT use this refusal for greetings or polite talk.
+            MANDATORY RESPONSE PATTERN (Applied to EVERY response):
+            1. ACKNOWLEDGE: You MUST start EVERY single response by acknowledging the user's topic. For example: "I understand you are asking about [TOPIC]," or "I see you're interested in [TOPIC]."
+            2. RETRIEVE: Use the provided [CONTEXT] to provide deterministic, accurate data.
+            3. GUARD:
+               - If the Knowledge Base context is missing or irrelevant, acknowledge the topic first, then state: "{self.KB_MISS_SCRIPT}"
+               - If the input is empty or noise, stay in "Listening Mode" and do not respond with a refusal.
+               - LANGUAGE GUARD: You are English-only. If a clear non-English intent is detected, immediately trigger the Non-English Refusal: "{PRDScripts.REFUSAL_LANGUAGE}"
 
-            4. CONCISE & ACCURATE:
-               - Keep answers to 1 or 2 short sentences.
-               - EXCEPTION: If the user directly asks for a list or steps (e.g., "list all", "what are the steps"), you MUST provide a structured numbered list (1., 2., 3.).
-               - Never invent facts. If unsure about college details, refer to the follow-up phrase above.
-            
-            5. SOURCE OF TRUTH HIERARCHY:
-               - [KB CONTEXT]: The DEFINITIVE source for general college information (programs, fees, dates).
-               - [CRM DATA]: Use this ONLY for specific user status updates.
-               - RESTRICTION: CRM data must NEVER override general KB facts (e.g. if CRM says "Fees: 0" because the student paid, strictly say "Your balance is 0", do NOT say "The college has no fees").
-
-            
-            6. LIMITS: No immigration, medical, or legal advice.
-
-            7. RAPPORT BUILDING (Polite Exchange):
-               - If the user asks for dynamic info (like checking a status, ticket, or application) AND the [CURRENT CALL CONTEXT] shows "User Name: Unknown":
-                 - You MUST include a polite request for their name, e.g., "May I know who I am speaking with?"
-               - If you DO know their name, use it naturally in the conversation (e.g., "Sure, John, let me check...").
-
-            8. BARGE-IN & CLASSIFICATION (CRITICAL):
-               - When handling user input that interrupts you, you MUST classify the interaction.
-               - CLASSIFICATIONS:
-                 - NEW_TOPIC: User changed the subject or asked a completely new question.
-                 - SAME_TOPIC: User provided a clarification, a follow-up, or a correction related to what you were JUST saying.
-                 - AMBIGUOUS: Unclear if it's new or same.
-               - NEVER ask procedural confirmation like "Should I continue from where I left off?".
-               - ALWAYS provide a natural response that either addresses the new topic or continues/clarifies the current one.
+            CONVERSATIONAL RULES:
+            1. TONE: Friendly but professional. No rude phrasing, overly casual slang, or persuasive/sales-like language.
+            2. CONCISE: Keep answers to 1 or 2 short sentences.
+            3. STRUCTURED: If the user asks for a list or steps, use a numbered list (1., 2., 3.).
+            4. RAPPORT: If you don't know the user's name, ask politely: "May I know who I am speaking with?" If you do, use it naturally.
+            5. LIMITS: No immigration, medical, or legal advice.
+            6. BARGE-IN: If interrupted, classify as NEW_TOPIC or SAME_TOPIC and respond naturally without asking procedural questions.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -203,7 +173,7 @@ class Brain(LLMEngine):
         
         return "AMBIGUOUS", "I'm sorry, I missed that.", False, "None"
 
-    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None):
+    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -220,25 +190,29 @@ class Brain(LLMEngine):
                 rag_score = 0.0
             else:
                 try:
-                    # Context-Aware Follow-Ups (Story S4-9)
-                    # Augment short follow-up questions with known context for better vector matching
-                    search_query = text
-                    if call_context and len(text.split()) < 8:
-                        tags = []
-                        if call_context.program_interest: tags.append(call_context.program_interest)
-                        if call_context.intake: tags.append(call_context.intake)
-                        if tags:
-                            search_query = f"{text} (Context: {' '.join(tags)})"
-                            logger.info(f"Augmented RAG Query: '{search_query}'")
-
                     # TELEMETRY: Start RAG Timer
                     rag_start_time = asyncio.get_event_loop().time()
-                    
-                    # KB returns (content, top_score)
-                    context_text, rag_score = await asyncio.wait_for(
-                        asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
-                        timeout=RAG_TIMEOUT
-                    )
+
+                    if prefetched_context_task:
+                        logger.info(f"Using pre-fetched RAG context for '{text}'")
+                        context_text, rag_score = await prefetched_context_task
+                    else:
+                        # Context-Aware Follow-Ups (Story S4-9)
+                        # Augment short follow-up questions with known context for better vector matching
+                        search_query = text
+                        if call_context and len(text.split()) < 8:
+                            tags = []
+                            if call_context.program_interest: tags.append(call_context.program_interest)
+                            if call_context.intake: tags.append(call_context.intake)
+                            if tags:
+                                search_query = f"{text} (Context: {' '.join(tags)})"
+                                logger.info(f"Augmented RAG Query: '{search_query}'")
+
+                        # KB returns (content, top_score)
+                        context_text, rag_score = await asyncio.wait_for(
+                            asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
+                            timeout=RAG_TIMEOUT
+                        )
                     
                     # TELEMETRY: Finish RAG Timer
                     rag_latency = asyncio.get_event_loop().time() - rag_start_time
@@ -340,33 +314,12 @@ class Brain(LLMEngine):
             logger.info(log_str)
             # --------------------------------------------------
 
-            # ── RAG SCORE FLOOR (T2 fix: Phonetic Hallucination) ─────────────────────
-            # If Pinecone returns a score below 0.45 AND there is no CRM context to
-            # fall back on, the query is almost certainly hallucinated STT garbage
-            # (e.g. "shoe in the car na") or completely out-of-domain.
-            # Block here — before the LLM is called — to prevent hallucinated answers.
-            RAG_FLOOR = 0.45
-            if rag_score < RAG_FLOOR and not crm_hit:
-                logger.warning(
-                    f"[RAG GOVERNANCE] Low retrieval confidence ({rag_score:.2f} < {RAG_FLOOR}). "
-                    f"Input likely hallucinated/out-of-domain. Blocking LLM call."
-                )
-                if self.call_logger:
-                    self.call_logger.log_event(
-                        "brain", "decision_trace",
-                        meta={
-                            "intent": intent,
-                            "confidence_score": round(rag_score, 2),
-                            "chunks_used": [],
-                            "crm_hit": False,
-                            "governance_decision": "Blocked: RAG_SCORE_FLOOR",
-                            "refusal_flags": {"kb_miss": True, "rag_floor_triggered": True}
-                        },
-                        trace_id=trace_id
-                    )
-                yield (self.KB_MISS_SCRIPT, {"rag_score": rag_score, "has_grounding": False})
-                return
-            # ─────────────────────────────────────────────────────────────────────────
+            # ── RAG SCORE FLOOR ───────────────────────────────────────────────────
+            # S4 Refinement: Don't block the LLM here. Let the LLM handle context.
+            # This ensures the "ACKNOWLEDGE" prefix is always included as per
+            # the Intelligence Bridge persona requirement.
+            # ──────────────────────────────────────────────────────────────────────
+            pass
 
             # Metadata for Policy Engine
             sent_metadata = {

@@ -44,6 +44,9 @@ class Session(BaseModel):
     # Resilience Tracking (Pillar 2 & 3)
     termination_reason: str = "normal"
 
+    # Governance: persist language warnings across the call (Phase 1 English-only)
+    language_warning_count: int = 0
+
     class Config:
         arbitrary_types_allowed = True
 

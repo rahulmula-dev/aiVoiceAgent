@@ -189,7 +189,10 @@
             try {
                 // 1. Initialize Audio Context (16kHz for STT compatibility)
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                log(`AudioContext initialized: ${audioContext.sampleRate}Hz`);
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                log(`AudioContext init: ${audioContext.sampleRate}Hz, State: ${audioContext.state}`);
 
                 // 2. Override browser 44.1/48k capture to 16k if possible, strictly mono
                 mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -210,6 +213,11 @@
                 ws.onopen = () => {
                     log("WebSocket Connected");
                     setStatus(true);
+
+                    if (audioContext && audioContext.state === 'suspended') {
+                        audioContext.resume();
+                        log(`AudioContext resumed in ws.onopen`);
+                    }
 
                     // 4. Send Twilio-mimic Start Event
                     const startMsg = {
@@ -237,7 +245,7 @@
                         // Clear buffer (Interruption)
                         log("⚠️ Interruption - Clearing Buffer");
                         activeSources.forEach(source => {
-                            try { source.stop(); } catch(e) {}
+                            try { source.stop(); } catch (e) { }
                         });
                         activeSources = [];
                         nextPlayTime = audioContext.currentTime;
@@ -320,7 +328,7 @@
                 nextPlayTime = audioContext.currentTime;
             }
             source.start(nextPlayTime);
-            
+
             // Track source to allow interruption
             activeSources.push(source);
             source.onended = () => {

@@ -137,6 +137,15 @@ class VoiceOrchestrator:
             
             # Reset silence timer on partials so the monitor doesn't trigger while user is talking
             self.last_interaction_time = time.time()
+
+            # STREAM BUFFERING: Pre-fetch RAG context for partial transcripts
+            if len(raw_text) > 15 and self.session:
+                if not hasattr(self.session, 'prefetched_context_task') or self.session.prefetched_context_task.done():
+                    logger.debug(f"[STREAM BUFFER] Starting proactive KB lookup for: '{raw_text}'")
+                    # Fire and forget KB search
+                    self.session.prefetched_context_task = asyncio.create_task(
+                        asyncio.to_thread(self.brain.kb.search, raw_text, self.call_logger, 3)
+                    )
             return # Only process complete sentences for LLM.
             
         # 2. Run the failsafe policy (EXACT logic per Debugger Plan)
@@ -149,14 +158,36 @@ class VoiceOrchestrator:
                 
                 # FORENSIC: Log the exact text that was blocked so we don't have invisible strikes
                 if self.call_logger:
-                    self.call_logger.log_event("stt", "user_transcript_final", 
-                                             latency_ms=int(stt_latency * 1000), 
-                                             meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE"}, 
-                                             trace_id=str(uuid.uuid4()))
-                                             
-                # INCREMENT PERMANENT STRIKE COUNTER HERE
-                self.language_strike_count += 1
+                    self.call_logger.log_event(
+                        "stt",
+                        "user_transcript_final",
+                        latency_ms=int(stt_latency * 1000),
+                        meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE_EARLY"},
+                    )
                 
+                # Increment strike counter and persist to session as warning_count
+                self.language_strike_count += 1
+                if self.session:
+                    current = getattr(self.session, "language_warning_count", 0)
+                    self.session.language_warning_count = current + 1
+                    try:
+                        self.session_manager.save_session(self.session)
+                    except Exception as e:
+                        logger.debug(f"Failed to persist language_warning_count: {e}")
+
+                # Create CRM ticket for this non-English instance
+                call_id = (self.session.crm_call_id or self.session.session_id) if self.session else "language_violation"
+                self._create_task_with_log(
+                    self.crm.create_ticket(
+                        transcript=f"[LANG_GOV] Non-English input blocked (early guard): '{raw_text}'",
+                        summary=f"Language Governance Violation (Strike {self.language_strike_count}/3 - Early Guard)",
+                        sentiment="SECURITY_ALERT",
+                        call_logger=self.call_logger,
+                        call_id=call_id,
+                        title=f"Language Policy Strike {self.language_strike_count}",
+                    )
+                )
+                                             
                 # TRIGGER 3-STRIKE REFUSAL AUDIO (Dynamic based on count)
                 trace_id = str(uuid.uuid4())
                 if self.language_strike_count == 1:
@@ -199,12 +230,6 @@ class VoiceOrchestrator:
                     logger.debug(f"[DEBOUNCE] Ignoring empty frame in state {current_call_state}")
                     return
 
-                # ── STATE GUARD: Only start counting AFTER user has spoken once ──────────────
-                # Before the user speaks, empty frames are just background/mic noise.
-                if not self.user_has_spoken:
-                    logger.debug("[DEBOUNCE] Ignoring empty frame before first speech")
-                    return
-
                 # ── DEBOUNCE FIX: Filter millisecond-interval STT burst artifacts ────────────
                 # Deepgram sometimes sends multiple empty frames in <50ms, which 
                 # incorrectly triggers strikes. We require 200ms between increments.
@@ -224,13 +249,12 @@ class VoiceOrchestrator:
                 logger.debug(f"[PHONEME] Empty frame #{self.consecutive_empty_frames}, run={non_english_duration:.1f}s")
                 
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
-                # Fire a language strike ONLY when BOTH conditions are met:
-                #   1. At least 4 frames in this run (rules out a single noise spike)
-                #   2. Run has been active >= 12.0 seconds (rules out fast background noise bursts
-                #      and normal English thinking pauses which are always < 10s)
-                # 12s threshold ensures the 10s Silence Monitor fires first if it's just a quiet room.
+                # Fire a language strike when:
+                #   1. At least 3 frames in this run (rules out a single noise spike)
+                #   2. Run has been active >= 6.0 seconds so it triggers BEFORE silence termination (10s)
+                #      and catches sustained non-English speech even at the start of the call.
                 # ─────────────────────────────────────────────────────────────────────────────
-                if self.consecutive_empty_frames >= 3 and non_english_duration >= 12.0:
+                if self.consecutive_empty_frames >= 3 and non_english_duration >= 6.0:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -243,6 +267,15 @@ class VoiceOrchestrator:
 
                         self.language_strike_count += 1
                         logger.warning(f"[GOVERNANCE] Unrecognized-language speech detected (empty+0.0 frames). Strike: {self.language_strike_count}/3")
+
+                        # Persist warning_count on the session (phoneme path)
+                        if self.session:
+                            current = getattr(self.session, "language_warning_count", 0)
+                            self.session.language_warning_count = current + 1
+                            try:
+                                self.session_manager.save_session(self.session)
+                            except Exception as e:
+                                logger.debug(f"Failed to persist language_warning_count: {e}")
                         
                         # LOGGING: Record in call logs
                         if self.call_logger and self.session:
@@ -319,14 +352,14 @@ class VoiceOrchestrator:
         else:
             # Non-empty transcript received.
             # ── HALLUCINATION PROTECTION ──────────────────────────────────────────
-            # If the confidence is low (< 0.75), we suspect it's a "forced English"
-            # hallucination of foreign speech (Deepgram forcing audio into English words).
-            # In this case, we do NOT reset the non-English run counter.
+            # If the confidence is low (< 0.80), we suspect it's a "forced English"
+            # hallucination of foreign speech. In this case, we do NOT reset the 
+            # non-English run counter.
             # ──────────────────────────────────────────────────────────────────────
-            if confidence < 0.75:
-                # ── EXTREME PROTECTION: Treat < 0.35 as a non-English phoneme ────────
+            if confidence < 0.80:
+                # ── EXTREME PROTECTION: Treat < 0.40 as a non-English phoneme ────────
                 # If it's truly garbled, it counts as an increment to the run.
-                if confidence < 0.35:
+                if confidence < 0.40:
                     self.consecutive_empty_frames += 1
                     logger.warning(f"[GOVERNANCE] Garbled text detected as non-English signal. Counter: {self.consecutive_empty_frames}")
                 else:
@@ -347,7 +380,7 @@ class VoiceOrchestrator:
         
         # LOW-QUALITY DETECTION: Catch mumbled/garbled non-English input
         # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
-        if confidence < 0.4:
+        if confidence < 0.8:
             logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
             
             # 🟢 S4 Hardening: Hard LLM Bypass
@@ -408,6 +441,28 @@ class VoiceOrchestrator:
             if intent == "HARD_REFUSAL_LANGUAGE":
                 self.language_strike_count += 1
                 logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
+
+                # Persist warning_count on the session for this caller
+                if self.session:
+                    current = getattr(self.session, "language_warning_count", 0)
+                    self.session.language_warning_count = current + 1
+                    try:
+                        self.session_manager.save_session(self.session)
+                    except Exception as e:
+                        logger.debug(f"Failed to persist language_warning_count: {e}")
+
+                # Create CRM ticket on every non-English violation
+                call_id = (self.session.crm_call_id or self.session.session_id) if self.session else trace_id
+                self._create_task_with_log(
+                    self.crm.create_ticket(
+                        transcript=f"[LANG_GOV] Non-English input blocked by PolicyEngine: '{text}'",
+                        summary=f"Language Governance Violation (Strike {self.language_strike_count}/3 - PolicyEngine)",
+                        sentiment="SECURITY_ALERT",
+                        call_logger=self.call_logger,
+                        call_id=call_id,
+                        title=f"Language Policy Strike {self.language_strike_count}",
+                    )
+                )
                 
                 if self.language_strike_count == 1:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
@@ -1006,7 +1061,23 @@ class VoiceOrchestrator:
                     # Use persistent context
                     active_context = self.session.call_context if self.session else None
                     
-                    async for sentence, metadata in self.brain.generate_stream(text, self.session.conversation_history, caller_number=caller_num, intent=intent, trace_id=trace_id, call_context=active_context):
+                    # Use pre-fetched context if available
+                    prefetched_task = getattr(self.session, 'prefetched_context_task', None)
+                    if prefetched_task:
+                        logger.debug(f"[STREAM BUFFER] Passing pre-fetched context for turn: {text[:20]}...")
+
+                    async for sentence, metadata in self.brain.generate_stream(
+                        text, 
+                        self.session.conversation_history, 
+                        caller_number=caller_num, 
+                        intent=intent, 
+                        trace_id=trace_id, 
+                        call_context=active_context,
+                        prefetched_context_task=prefetched_task
+                    ):
+                        # Invalidate after first usage in this turn
+                        if hasattr(self.session, 'prefetched_context_task'):
+                            self.session.prefetched_context_task = None
                         # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
                         if turn_start_time:
                             current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time

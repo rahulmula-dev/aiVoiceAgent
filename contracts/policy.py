@@ -222,11 +222,13 @@ class ResponsePolicyEngine:
             policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
             return False
 
-        # 3. Probabilistic Check (Catches Spanish, French, German)
+        # 3. Probabilistic Check (Catches Spanish, French, German, Hinglish, etc.)
         # Avoid running statistical detection on 1-2 words as it generates massive false positives
         if len(words) < 3:
             policy_logger.debug(f"[GOVERNANCE] Bypass Langdetect (Too few words: {len(words)}): '{text}'")
-            return True
+            # For very short inputs, rely purely on density + ASCII checks above.
+            return density >= 0.80
+
         try:
             detected_langs = detect_langs(text)
             policy_logger.debug(f"[GOVERNANCE] Langdetect Raw: {detected_langs}")
@@ -234,24 +236,28 @@ class ResponsePolicyEngine:
             if detected_langs:
                 top = detected_langs[0]
                 
-                if top.lang != 'en':
-                    # Only override if density is decent
-                    if density >= 0.75:
-                        policy_logger.info(f"[GOVERNANCE] Overriding {top.lang} detection ({top.prob:.2f}) due to Density ({density:.2f}).")
-                        return True
-                    elif top.prob > 0.40: # Less sensitive than 0.25
-                        policy_logger.warning(f"[GOVERNANCE] Non-English suspected: {top.lang} ({top.prob:.2f}). Density: {density:.2f}. Triggering Strike.")
-                        return False
+                # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
+                if top.lang != 'en' and top.prob >= 0.40:
+                    policy_logger.warning(
+                        f"[GOVERNANCE] Non-English detected by langdetect: {top.lang} ({top.prob:.2f}), "
+                        f"density={density:.2f}. Blocking by design (Phase 1 English-only). Text='{text}'"
+                    )
+                    return False
                 
                 if top.lang == 'en':
-                    # Even if langdetect says 'en', if density is too low, it's mixed language
-                    if density < 0.60:
-                        policy_logger.warning(f"[GOVERNANCE] Blocked Hinglish/Mixed (en={top.prob:.2f}, density={density:.2f}): '{text}'")
+                    # Even if langdetect says 'en', if density is too low, treat as mixed/hinglish and block.
+                    if density < 0.70:
+                        policy_logger.warning(
+                            f"[GOVERNANCE] Blocked Mixed/Hinglish (en={top.prob:.2f}, density={density:.2f}): '{text}'"
+                        )
                         return False
-                    policy_logger.debug(f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'")
+                    policy_logger.debug(
+                        f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'"
+                    )
                     return True
 
-            return density >= 0.80 # Default fallback
+            # Default fallback: require very high English density
+            return density >= 0.85
 
         except Exception as e:
             policy_logger.error(f"[GOVERNANCE] langdetect failed: {e}")
@@ -297,27 +303,22 @@ class ResponsePolicyEngine:
                     return False
 
                 # 4b. Langdetect check — catches Latin-script foreign output (Spanish, French, etc.)
-                # Guard: langdetect is unreliable on short chunks.
-                # Heuristic: Check common English density first as a safety net.
+                # Guard: langdetect is unreliable on very short chunks; still, in Phase 1 we want
+                # to be aggressive and block anything confidently non-English.
                 words = re.findall(r'\b\w+\b', lower_text)
                 common_words_found = [w for w in words if w in self.COMMON_ENGLISH_WORDS]
                 density = len(common_words_found) / len(words) if words else 0
 
-                # [REFINEMENT]: Bifurcated thresholds for AI vs User
-                # Output Guard (Internal Sentry): uses 0.45 for technical RAG data.
-                threshold = 0.45
-                
-                if len(response_text) >= 40:
+                if len(response_text) >= 20:
                     detected = detect_langs(response_text)
                     if detected:
                         top = detected[0]
-                        if top.lang != 'en' and top.prob > 0.95:
-                            # Only block if density is also low
-                            if density < threshold:
-                                _logger.warning(f"[OUTPUT GOVERNANCE] LLM output in {top.lang} ({top.prob:.2f}), density {density:.2f} < {threshold} — blocking.")
-                                return False
-                            else:
-                                _logger.info(f"[OUTPUT GOVERNANCE] Overriding {top.lang} detection ({top.prob:.2f}) for AI output due to English Density ({density:.2f}).")
+                        if top.lang != 'en' and top.prob >= 0.40:
+                            _logger.warning(
+                                f"[OUTPUT GOVERNANCE] Blocking non-English model output {top.lang} "
+                                f"({top.prob:.2f}), density={density:.2f}. Text='{response_text[:80]}...'"
+                            )
+                            return False
 
             except Exception as e:
                 # If detection fails, allow output — a detection crash ≠ a violation.

@@ -40,7 +40,7 @@ class Transcriber(STTProvider):
             f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
-            "endpointing=300",
+            "endpointing=1000",
             "replace=GED:GD",
             "replace=male:Nail",
             "replace=Male:Nail",

@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, Callable, Any
+from typing import AsyncGenerator, Callable, Any, Optional
 from orchestrator.interfaces import STTProvider, TTSProvider
 
 class MockSTT(STTProvider):
@@ -18,9 +18,12 @@ class MockSTT(STTProvider):
         pass
 
 class MockTTS(TTSProvider):
-    async def speak(self, text: str) -> AsyncGenerator[bytes, None]:
+    async def speak(self, text: str, call_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
         # Return the text as bytes
         yield text.encode('utf-8')
+
+    def stop_current_speech(self, call_id: str) -> str:
+        return "Speech stopped"
 
     async def close(self):
         pass
