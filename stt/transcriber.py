@@ -51,12 +51,9 @@ class Transcriber(STTProvider):
             "replace=Male:Nail",
         ]
 
-        if self.encoding == "mulaw":
-            params.append("detect_language=true") 
-        else:
-            # Task 3: Architect Rule - For browser (linear16), detect_language is unsupported.
-            # We use 'en' as the default engine to prevent 400 Errors.
-            params.append("language=en")
+        # Task 3: Architect Rule - detect_language is unsupported for streaming (causes HTTP 400)
+        # We use 'en' as the default engine to prevent 400 Errors.
+        params.append("language=en")
 
         url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
         headers = {

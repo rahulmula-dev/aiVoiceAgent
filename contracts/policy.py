@@ -150,7 +150,9 @@ class ResponsePolicyEngine:
         "robot", "going", "since", "empower", "empowers", "empowering", "financial",
         "independence", "business", "marketing", "portfolio", "building", "interview",
         "preparation", "gender", "genders", "skills", "mission", "vision", "values",
-        "career", "vocational", "technical", "gd college", "cila agent"
+        "career", "vocational", "technical", "gd college", "cila agent",
+        "continue", "restart", "give", "list", "kill", "people", "common", "india", 
+        "us", "africa", "america", "visa", "status", "so", "yeah"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:

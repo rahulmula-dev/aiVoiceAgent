@@ -736,6 +736,22 @@ class VoiceOrchestrator:
         """
         self.websocket = websocket
         
+        # 0.5. CONCURRENCY SAFETY GATE (S4-7)
+        from telephony.concurrency import get_active_call_count, MAX_INBOUND_CALLS
+        if get_active_call_count() > MAX_INBOUND_CALLS:
+            logger.critical("[SAFETY GATE] Concurrent active calls exceeded hard cap inside pipeline. Rejection triggered.")
+            self.state.transition_to(CallState.ESCALATION)
+            try:
+                goodbye_text = "All our agents are currently busy. A staff member will call you back shortly."
+                async for chunk in self.synthesizer.speak(goodbye_text):
+                    await self._send_response_chunk(chunk)
+                await asyncio.sleep(4) 
+            except Exception as e:
+                logger.error(f"Failed to play capacity-failure audio: {e}")
+            
+            await websocket.close(code=1008, reason="Over Capacity")
+            return
+
         # 0. INTAKE GUARDRAIL (Kill Switch)
         if not self.config.is_intake_enabled:
             logger.critical(f"Connection Rejected: INTAKE_DISABLED is active (env={self.config.env})")
@@ -818,7 +834,10 @@ class VoiceOrchestrator:
             if self.websocket:
                 caller_num = self.websocket.query_params.get("from", "unknown")
             
-            async with self.session_manager.session_scope(sid, call_sid, caller_number=caller_num) as session:
+            # CRITICAL FIX: Align session_manager ID with call_logger ID for forensic logging of structured_turns
+            canonical_session_id = self.call_logger.call_id if self.call_logger else sid
+            
+            async with self.session_manager.session_scope(canonical_session_id, call_sid, caller_number=caller_num) as session:
                 self.session = session
                 # Reset wrap-up tracking for this new session
                 self.wrapup_triggered = False
@@ -828,7 +847,7 @@ class VoiceOrchestrator:
                 except Exception:
                     self.session_start_wall_time = time.time()
                 self.state.transition_to(CallState.CALL_INIT)
-                logger.info(f"Telephony Stream Started: {self.session.session_id}")
+                logger.info(f"Telephony Stream Started: {self.session.session_id} (Stream SID: {self.sid})")
                 
                 # Start Recording with provider-specifc settings
                 encoding = getattr(self.transcriber, 'encoding', 'mulaw')

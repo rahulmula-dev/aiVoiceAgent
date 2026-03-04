@@ -31,6 +31,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def startup_event():
     """Start-time background workers."""
     default_session_manager.start_collector()
+    
+    # S4-7 Additions: Reset active concurrency tracking on startup
+    from telephony.concurrency import reset_active_calls
+    reset_active_calls()
 
 @app.get("/")
 async def root():
@@ -193,10 +197,12 @@ async def get_live_context_data():
     live_sessions = {}
     for sid, session in default_session_manager.sessions.items():
         live_sessions[sid] = session.call_context.dict()
+        
+    from telephony.concurrency import get_active_call_count
     
     return {
         "status": "LIVE_RAM_CACHE",
-        "active_calls_count": len(live_sessions),
+        "active_calls_count": get_active_call_count(),
         "sessions": live_sessions
     }
 
@@ -217,6 +223,35 @@ async def handle_incoming_call(request: Request):
     
     logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
     
+    from telephony.concurrency import get_active_call_count, increment_active_calls, MAX_INBOUND_CALLS
+    active_calls = get_active_call_count()
+    if active_calls >= MAX_INBOUND_CALLS:
+        logging.getLogger("Server").warning(f"[Concurrency] SUPER MAX REACHED! Active calls: {active_calls}/{MAX_INBOUND_CALLS}. Rejecting SID: {call_sid}")
+        
+        # Log to CRM asynchronously to avoid blocking
+        import asyncio
+        from crm.client import CRMClient
+        crm_client = CRMClient()
+        
+        import datetime
+        timestamp = datetime.datetime.now().isoformat()
+        summary = f"Caller number: {from_number}, reason = OVER_CAPACITY, timestamp: {timestamp}"
+        
+        # Fire and forget ticket creation
+        asyncio.create_task(crm_client.create_ticket(
+            transcript="Call rejected upfront due to 30-call concurrency limit.",
+            summary=summary,
+            sentiment="Negative",
+            call_id=call_sid,
+            title="OVER_CAPACITY | Voice Agent"
+        ))
+        
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>All our agents are currently busy. A staff member will call you back shortly.</Say><Hangup/></Response>'
+        return Response(content=twiml, media_type="application/xml")
+
+    new_count = increment_active_calls()
+    logging.getLogger("Server").info(f"[Concurrency] Call connected. Active calls: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
+
     # Determine public ngrok URL (from environment variable)
     public_url = os.getenv("NGROK_URL")
     if public_url:
@@ -224,8 +259,30 @@ async def handle_incoming_call(request: Request):
     else:
         host = request.headers.get("host")
 
+    # Pass statusCallback on the stream/stream wrapper isn't natively standard for Stream cleanup, 
+    # instead we will monitor standard Twilio Call Status Webhook callbacks for the Number itself.
     twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
     return Response(content=twiml, media_type="application/xml")
+
+@app.post("/api/call-status")
+async def handle_call_status(request: Request):
+    """
+    Twilio StatusCallback endpoint to catch completed/failed/busy/no-answer calls
+    and accurately decrement the active call counter.
+    """
+    try:
+        form_data = await request.form()
+        status = form_data.get("CallStatus")
+        call_sid = form_data.get("CallSid", "UnknownSID")
+        
+        if status in ["completed", "failed", "busy", "no-answer", "canceled"]:
+            from telephony.concurrency import decrement_active_calls, MAX_INBOUND_CALLS
+            new_count = decrement_active_calls()
+            logging.getLogger("Server").info(f"[Concurrency] Call ended ({status}). Decremented active calls to: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
+    except Exception as e:
+        logging.getLogger("Server").error(f"Failed to process call-status: {e}")
+        
+    return Response()
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
@@ -241,7 +298,8 @@ async def handle_media_stream(websocket: WebSocket):
     # Try to extract query params (best effort)
     query_params = websocket.query_params
     call_sid = query_params.get("sid", "unknown_call")
-    from_number = query_params.get("from", "Unknown")
+    # T5 Fix: Handle the Dev-Phone simulator explicitly which fails to un-escape &amp; in XML Streams
+    from_number = query_params.get("from") or query_params.get("amp;from", "Unknown")
 
     # Initialize Logger - PILLAR 3 will now create the Ghost File on disk immediately
     call_logger = CallLogger(call_id=session_id, caller_number=from_number)
