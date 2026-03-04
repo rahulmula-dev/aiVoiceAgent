@@ -77,6 +77,10 @@ class VoiceOrchestrator:
         self.silence_stage = 0  # 0: Normal, 1: Warned once, 2: Warned twice
         self.last_interaction_time = time.time()
 
+        # Session Duration / Wrap-up (Pilot-Ready)
+        self.wrapup_triggered = False
+        self.session_start_wall_time = None
+
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
 
@@ -114,6 +118,20 @@ class VoiceOrchestrator:
         if re.search(r'([\n\s][\-\*\•]\s)', text): return True
         
         return False
+
+    def _on_stt_listener_error(self, err: Exception):
+        """Called when the Deepgram _listen loop crashes. Creates a CRM ticket."""
+        if not self.crm:
+            return
+        call_id = (self.session.crm_call_id or self.session.session_id) if self.session else getattr(self, 'sid', 'unknown')
+        self._create_task_with_log(self.crm.create_ticket(
+            transcript=f"[SYSTEM_EVENT] STT Listener (Deepgram WebSocket) failed: {err}",
+            summary="System Alert: STT Listener Failure",
+            sentiment="Negative",
+            call_logger=self.call_logger,
+            call_id=call_id,
+            title="System Alert: STT Listener Failure"
+        ))
 
     async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
         """
@@ -470,6 +488,18 @@ class VoiceOrchestrator:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
                 else: # Strike 3+
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
+            elif intent == "ESCALATION_REQUIRED":
+                # High-sentiment / angry caller path: trigger escalation script and high-priority CRM ticket
+                refusal_text = PRDScripts.ESCALATION
+                if self.session:
+                    self._create_task_with_log(self.crm.create_ticket(
+                        transcript=text,
+                        summary="High Sentiment Alert: Angry Caller",
+                        sentiment="Negative",
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or self.session.session_id,
+                        title="High Sentiment Alert: Angry Caller"
+                    ))
             else:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
@@ -513,6 +543,17 @@ class VoiceOrchestrator:
                 # Checkpoint: Save logs immediately to prevent data loss
                 self.call_logger.save_log(status="in-progress")
                 self.call_logger.log_event("orchestrator", "user_interruption", meta={"is_speaking": is_speaking})
+
+            # CRM Interaction Note for every barge-in / interruption
+            if self.session:
+                self._create_task_with_log(self.crm.create_ticket(
+                    transcript=f"[Interaction Note] User interruption while AI was {'speaking' if is_speaking else 'processing'}.\nLast user text: '{text}'",
+                    summary="Interaction Note: User Interruption (Barge-in)",
+                    sentiment="Neutral",
+                    call_logger=self.call_logger,
+                    call_id=self.session.crm_call_id or self.session.session_id,
+                    title="Interaction Note: Barge-in"
+                ))
             
             self.response_task.cancel()
             if is_speaking:
@@ -706,6 +747,7 @@ class VoiceOrchestrator:
         
         # Set the callback and connect
         self.transcriber.set_callback(self._on_transcript)
+        self.transcriber.set_listener_error_callback(self._on_stt_listener_error)
         connected = await self.transcriber.connect()
         
         if not connected:
@@ -778,6 +820,13 @@ class VoiceOrchestrator:
             
             async with self.session_manager.session_scope(sid, call_sid, caller_number=caller_num) as session:
                 self.session = session
+                # Reset wrap-up tracking for this new session
+                self.wrapup_triggered = False
+                # Prefer canonical session start_time if available, else wall clock now
+                try:
+                    self.session_start_wall_time = self.session.start_time.timestamp()
+                except Exception:
+                    self.session_start_wall_time = time.time()
                 self.state.transition_to(CallState.CALL_INIT)
                 logger.info(f"Telephony Stream Started: {self.session.session_id}")
                 
@@ -880,6 +929,12 @@ class VoiceOrchestrator:
         
         async with self.session_manager.session_scope(self.sid, call_sid, caller_number="web_chat") as session:
             self.session = session
+            # Reset wrap-up tracking for text-mode sessions as well
+            self.wrapup_triggered = False
+            try:
+                self.session_start_wall_time = self.session.start_time.timestamp()
+            except Exception:
+                self.session_start_wall_time = time.time()
             self.state.transition_to(CallState.CALL_INIT)
             
             # LOG CALL TO CRM (Text Mode)
@@ -1285,6 +1340,10 @@ class VoiceOrchestrator:
 
         sid = self.session.session_id if self.session else "unknown"
         logger.info(f"Cleanup started for session {sid}.")
+
+        # Reset wrap-up tracking so the orchestrator is clean for the next session
+        self.wrapup_triggered = False
+        self.session_start_wall_time = None
         
         # STATE: Call End
         try:
@@ -1435,7 +1494,54 @@ class VoiceOrchestrator:
                     self.last_interaction_time = time.time()
                     continue
 
-                # 2. Check Silence Duration
+                # 2. Session Duration / Wrap-up Guard
+                elapsed = None
+                if self.session_start_wall_time is not None:
+                    elapsed = time.time() - self.session_start_wall_time
+                elif self.session and getattr(self.session, "start_time", None):
+                    try:
+                        elapsed = time.time() - self.session.start_time.timestamp()
+                    except Exception:
+                        elapsed = None
+
+                # Trigger wrap-up notification at 4.5 minutes (270s)
+                if elapsed is not None and elapsed >= 270.0 and not self.wrapup_triggered:
+                    logger.info(f"Wrap-up prompt triggered at {elapsed:.1f}s.")
+                    self.wrapup_triggered = True
+                    if self.session:
+                        try:
+                            # Create a lightweight CRM ticket for wrap-up
+                            await self.crm.create_ticket(
+                                transcript="[System]: Session approaching 5-minute limit. Wrap-up prompt played.",
+                                summary="Session Wrap-up Triggered",
+                                sentiment="Neutral",
+                                call_logger=self.call_logger,
+                                call_id=self.session.crm_call_id or self.session.session_id,
+                                title="Session Wrap-up Triggered"
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to create Session Wrap-up CRM ticket: {e}")
+
+                    # Speak wrap-up script to caller
+                    try:
+                        await self.speak_refusal(PRDScripts.WRAP_UP)
+                    except Exception as e:
+                        logger.error(f"Error speaking WRAP_UP prompt: {e}")
+
+                # Hard stop at 5 minutes
+                if elapsed is not None and elapsed >= 300.0:
+                    logger.warning(f"Session duration limit reached ({elapsed:.1f}s). Initiating wrap-up termination.")
+                    if self.session:
+                        self.session.termination_reason = "wrapup_timeout"
+                    # Transition to CALL_END and cleanup
+                    try:
+                        self.state.transition_to(CallState.CALL_END)
+                    except Exception:
+                        pass
+                    await self.cleanup()
+                    break
+
+                # 3. Check Silence Duration
                 gap = time.time() - self.last_interaction_time
                 
                 # Verify we haven't just reset (race condition check)

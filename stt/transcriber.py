@@ -25,9 +25,14 @@ class Transcriber(STTProvider):
         self.sample_rate = sample_rate
         self.ws = None
         self._keep_alive_task = None
+        self._listener_error_callback = None
 
     def set_callback(self, callback):
         self.on_transcript_callback = callback
+
+    def set_listener_error_callback(self, callback):
+        """Optional callback when the Deepgram _listen loop crashes. Callback receives (exception)."""
+        self._listener_error_callback = callback
 
     async def connect(self):
         """
@@ -148,6 +153,13 @@ class Transcriber(STTProvider):
 
         except Exception as e:
             logger.error(f"ERROR - Deepgram Listener Exception: {e}")
+            if self._listener_error_callback:
+                try:
+                    cb = self._listener_error_callback(e)
+                    if asyncio.iscoroutine(cb):
+                        asyncio.create_task(cb)
+                except Exception as cb_err:
+                    logger.error(f"STT listener error callback failed: {cb_err}")
 
     async def send_audio(self, audio_chunk):
         """Sends raw bytes up to Deepgram with enhanced diagnostics"""

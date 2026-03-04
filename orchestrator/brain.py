@@ -223,6 +223,39 @@ class Brain(LLMEngine):
                     context_text = "No specific documents found due to timeout."
                     rag_score = 0.0
                     rag_latency = RAG_TIMEOUT
+
+                    # CRM Artifact: System Alert for Knowledge Base Timeout
+                    if self.crm_client and call_context:
+                        try:
+                            await self.crm_client.create_ticket(
+                                transcript=f"[SYSTEM_EVENT] RAG timeout after {RAG_TIMEOUT}s for query: {text}",
+                                summary="System Alert: Knowledge Base Timeout",
+                                sentiment="Negative",
+                                call_logger=self.call_logger,
+                                call_id=call_context.session_id,
+                                title="System Alert: Knowledge Base Timeout"
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to create KB Timeout CRM ticket: {e}")
+                except Exception as e:
+                    logger.error(f"RAG Search failed with error: {e}")
+                    context_text = "No specific documents found due to an internal knowledge base error."
+                    rag_score = 0.0
+                    rag_latency = RAG_TIMEOUT
+
+                    # CRM Artifact: System Alert for Knowledge Base Failure
+                    if self.crm_client and call_context:
+                        try:
+                            await self.crm_client.create_ticket(
+                                transcript=f"[SYSTEM_EVENT] Knowledge Base failure for query: {text}\nError: {e}",
+                                summary="System Alert: Knowledge Base Failure",
+                                sentiment="Negative",
+                                call_logger=self.call_logger,
+                                call_id=call_context.session_id,
+                                title="System Alert: Knowledge Base Failure"
+                            )
+                        except Exception as ce:
+                            logger.error(f"Failed to create KB Failure CRM ticket: {ce}")
             
             # Grounding: Only true if text exists AND score is decent (> 0.58)
             # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise

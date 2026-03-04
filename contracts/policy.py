@@ -46,6 +46,8 @@ class PRDScripts:
 
     # Interruption
     INTERRUPTION = "Should I continue from where I left off?"
+    # Session Wrap-up
+    WRAP_UP = "We have about 30 seconds left for this session. Is there anything else important you’d like to cover before we wrap up?"
 
 class ResponsePolicyEngine:
     """
@@ -90,7 +92,25 @@ class ResponsePolicyEngine:
         "i guess", "could be around", "probably"  # "could be" alone too broad
     ]
 
-    # --- 4. TONE & PERSONALITY (Governance Validation - PRD S4-5) ---
+    # --- 4. ANGER / HIGH-SENTIMENT DETECTION (Escalation Guard) ---
+    ANGER_KEYWORDS = [
+        "unacceptable",
+        "this is unacceptable",
+        "complaint",
+        "file a complaint",
+        "frustrated",
+        "angry",
+        "very angry",
+        "upset",
+        "disappointed",
+        "escalate",
+        "want to speak to a manager",
+        "speak to a manager",
+        "manager",
+        "supervisor"
+    ]
+
+    # --- 5. TONE & PERSONALITY (Governance Validation - PRD S4-5) ---
     RUDE_KEYWORDS = [
         "stupid", "idiot", "dumb", "shut up", "crazy", "moron", "fool"
     ]
@@ -101,7 +121,7 @@ class ResponsePolicyEngine:
         "must enroll", "sign up immediately"
     ]
 
-    # --- 5. LANGUAGE DETECTION (Story S1-4) ---
+    # --- 6. LANGUAGE DETECTION (Story S1-4) ---
     COMMON_ENGLISH_WORDS = {
         "a", "an", "the", "i", "m", "my", "me", "you", "your", "he", "she", "it", "we", "they",
         "is", "am", "are", "was", "were", "be", "been", "being",
@@ -167,7 +187,24 @@ class ResponsePolicyEngine:
             return True # Ignore truly empty strings
             
         lower_text = text.lower()
+
+        # SPECIAL CASE: Name-introduction phrases should never trigger language strikes.
+        # Examples: "Hi, my name is Akansha.", "My name is John.", "This is Maria."
+        introduction_phrases = [
+            "my name is ",
+            "hi my name is ",
+            "hello my name is ",
+            "this is ",
+            "i am ",
+        ]
+        if any(lower_text.startswith(p) for p in introduction_phrases):
+            return True
         words = re.findall(r'\b\w+\b', lower_text)
+
+        # SPECIAL CASE: Single-word utterances that are purely alphabetical (likely names like "Leila")
+        # should not be treated as non-English for governance purposes.
+        if len(words) == 1 and words[0].isalpha():
+            return True
         if not words:
             return True
             
@@ -238,6 +275,14 @@ class ResponsePolicyEngine:
                 
                 # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
                 if top.lang != 'en' and top.prob >= 0.40:
+                    # langdetect is extremely unreliable on short, high-density English sentences
+                    # (especially introductions containing proper names). If density is high, treat as English.
+                    if density >= 0.80:
+                        policy_logger.info(
+                            f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) due to High English Density "
+                            f"({density:.2f}). Text='{text}'"
+                        )
+                        return True
                     policy_logger.warning(
                         f"[GOVERNANCE] Non-English detected by langdetect: {top.lang} ({top.prob:.2f}), "
                         f"density={density:.2f}. Blocking by design (Phase 1 English-only). Text='{text}'"
@@ -245,12 +290,8 @@ class ResponsePolicyEngine:
                     return False
                 
                 if top.lang == 'en':
-                    # Even if langdetect says 'en', if density is too low, treat as mixed/hinglish and block.
-                    if density < 0.70:
-                        policy_logger.warning(
-                            f"[GOVERNANCE] Blocked Mixed/Hinglish (en={top.prob:.2f}, density={density:.2f}): '{text}'"
-                        )
-                        return False
+                    # When langdetect says English, accept the input as English.
+                    # We already applied a density guard earlier for clearly mixed sentences.
                     policy_logger.debug(
                         f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'"
                     )
@@ -366,6 +407,11 @@ class ResponsePolicyEngine:
                 # Use smart boundary check for keys like 'pr', 'visa'
                 if self._contains_word(lower, k):
                     return f"HARD_REFUSAL_{category.upper()}"
+
+        # 3. High-Sentiment / Angry Caller Detection
+        for keyword in self.ANGER_KEYWORDS:
+            if keyword in lower:
+                return "ESCALATION_REQUIRED"
                     
         return "PROCEED"
 
