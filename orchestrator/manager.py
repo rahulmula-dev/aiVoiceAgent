@@ -148,10 +148,15 @@ class VoiceOrchestrator:
             # S4-11: Immediate Audio Stop on Interruption (Partial Transcript)
             if self.response_task and not self.response_task.done():
                 if self.state.get_state() == CallState.SPEAKING:
-                    logger.info(f">>> IMMEDIATE STOP: Partial transcript received: '{raw_text}'")
-                    self.synthesizer.stop_current_speech(self.sid)
-                    self._create_task_with_log(self._send_clear_message())
-                    self.state.transition_to(CallState.INTERRUPTED)
+                    # S4-NoiseGuard: Ignore noise/echo/single-word artifacts from interrupting
+                    word_count = len(raw_text.split())
+                    if (word_count < 2 and len(raw_text) < 6) or confidence < 0.4:
+                        logger.debug(f"[BARGE-IN DEBOUNCE] Ignoring noise: '{raw_text}' (conf={confidence:.2f})")
+                    else:
+                        logger.info(f">>> IMMEDIATE STOP: Partial transcript received: '{raw_text}' (conf={confidence:.2f})")
+                        self.synthesizer.stop_current_speech(self.sid)
+                        self._create_task_with_log(self._send_clear_message())
+                        self.state.transition_to(CallState.INTERRUPTED)
             
             # Reset silence timer on partials so the monitor doesn't trigger while user is talking
             self.last_interaction_time = time.time()

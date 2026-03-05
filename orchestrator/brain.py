@@ -4,6 +4,7 @@ import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted  # Add this import
 import logging
 import asyncio
+from typing import List, Dict, Any, Optional
 from retrieval.vector_store import KnowledgeBase  # New RAG module
 from dotenv import load_dotenv
 
@@ -88,6 +89,19 @@ class Brain(LLMEngine):
         """
         return []
 
+    def _fix_history_roles(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Gemini 2.5 Flash requires history to strictly start with 'user'.
+        If it starts with 'model' (greeting), prepend a dummy user message.
+        """
+        if not history:
+            return history
+            
+        if history[0].get("role") != "user":
+            logger.debug("[FIX] Prepended dummy user message to conversation history.")
+            return [{"role": "user", "parts": ["[Call started]"]}] + history
+        return history
+
     async def generate_with_classification(self, session, caller_input: str, trace_id: str = None):
         """
         Special method for barge-in handling. 
@@ -119,10 +133,17 @@ class Brain(LLMEngine):
             try:
                 # We reuse the history but append the special prompt
                 history = list(session.conversation_history)
+                # Ensure history starts with 'user' role
+                history = self._fix_history_roles(history)
+                
                 # Important: history is list of {"role": "user", "parts": [...]}
                 history.append({"role": "user", "parts": [prompt]})
                 
-                response = await self.model.generate_content_async(contents=history)
+                # Added timeout to prevent system hang on API issues
+                response = await asyncio.wait_for(
+                    self.model.generate_content_async(contents=history), 
+                    timeout=LLM_TIMEOUT
+                )
                 text = response.text.strip()
                 
                 # Cleanup potential markdown code blocks
@@ -159,12 +180,19 @@ class Brain(LLMEngine):
                         Return ONLY the final response text.
                         """
                         history = list(session.conversation_history)
+                        history = self._fix_history_roles(history)
                         history.append({"role": "user", "parts": [rag_prompt]})
-                        response = await self.model.generate_content_async(contents=history)
+                        response = await asyncio.wait_for(
+                            self.model.generate_content_async(contents=history),
+                            timeout=LLM_TIMEOUT
+                        )
                         response_text = response.text.strip()
                 
                 return classification, response_text, is_multi_step, topic
                 
+            except asyncio.TimeoutError:
+                logger.error(f"Brain barge-in classification timed out (Attempt {attempt+1})")
+                continue
             except Exception as e:
                 logger.warning(f"Failed to parse JSON brain response (Attempt {attempt+1}): {e}")
                 if attempt == max_retries - 1:
@@ -394,6 +422,7 @@ class Brain(LLMEngine):
             """
             
             # 3. APPEND USER MSG TO HISTORY (Internal)
+            history = self._fix_history_roles(history)
             history.append({"role": "user", "parts": [rag_prompt]})
 
             # 4. STREAM GENERATE (with graceful quota handling)
