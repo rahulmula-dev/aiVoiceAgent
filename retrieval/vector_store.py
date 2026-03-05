@@ -1,5 +1,4 @@
 import os
-import time
 import logging
 import concurrent.futures
 from pinecone import Pinecone
@@ -99,7 +98,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 last_error = e
                 logger.warning(f"[RAG] Search attempt {attempt}/{MAX_ATTEMPTS} failed: {e}")
                 if attempt < MAX_ATTEMPTS:
-                    time.sleep(0.05)  # 50ms back-off before retry
+                    pass  # No sleep: search() runs in a sync thread, retry is immediate
                 else:
                     logger.error(f"[RAG] All {MAX_ATTEMPTS} search attempts failed. Last error: {last_error}")
                     return "", 0.0
