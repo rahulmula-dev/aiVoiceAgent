@@ -104,10 +104,14 @@ class Brain(LLMEngine):
 
     async def generate_with_classification(self, session, caller_input: str, trace_id: str = None):
         """
-        Special method for barge-in handling. 
+        Special method for barge-in handling (CRITICAL-P2-05). 
+        Optimized for ultra-low latency: bypasses RAG and enforces 1.5s hard ceiling.
         Returns (classification, response, is_multi_step, topic)
         """
         import json
+        
+        # 🟢 PINNED TIMEOUT FOR BARGE-IN (Sub-second target, 1.5s absolute ceiling)
+        BARGE_IN_TIMEOUT = 1.5
         
         # Build a prompt for classification + response
         prompt = f"""
@@ -127,79 +131,39 @@ class Brain(LLMEngine):
         }}
         """
         
-        # Use full generate_content for JSON consistency
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                # We reuse the history but append the special prompt
-                history = list(session.conversation_history)
-                # Ensure history starts with 'user' role
-                history = self._fix_history_roles(history)
-                
-                # Important: history is list of {"role": "user", "parts": [...]}
-                history.append({"role": "user", "parts": [prompt]})
-                
-                # Added timeout to prevent system hang on API issues
-                response = await asyncio.wait_for(
-                    self.model.generate_content_async(contents=history), 
-                    timeout=LLM_TIMEOUT
-                )
-                text = response.text.strip()
-                
-                # Cleanup potential markdown code blocks
-                if text.startswith("```json"):
-                    text = text.replace("```json", "", 1).replace("```", "", 1).strip()
-                elif text.startswith("```"):
-                     text = text.replace("```", "", 1).replace("```", "", 1).strip()
+        # PRD §5: Zero-Retry Enforcement (max_retries = 1 attempt total)
+        try:
+            # We reuse the history but append the special prompt
+            history = list(session.conversation_history)
+            history = self._fix_history_roles(history)
+            history.append({"role": "user", "parts": [prompt]})
+            
+            # 🟢 HARD TIMEOUT: Fast fail to prevent "clobbering"
+            response = await asyncio.wait_for(
+                self.model.generate_content_async(contents=history), 
+                timeout=BARGE_IN_TIMEOUT
+            )
+            text = response.text.strip()
+            
+            # Cleanup potential markdown code blocks
+            if text.startswith("```json"):
+                text = text.replace("```json", "", 1).replace("```", "", 1).strip()
+            elif text.startswith("```"):
+                 text = text.replace("```", "", 1).replace("```", "", 1).strip()
 
-                data = json.loads(text)
+            data = json.loads(text)
+            
+            return (
+                data.get("classification", "AMBIGUOUS"),
+                data.get("response", "I'm listening, please go ahead."),
+                data.get("is_multi_step", False),
+                data.get("topic", "General")
+            )
                 
-                classification = data.get("classification", "AMBIGUOUS")
-                response_text = data.get("response", "")
-                is_multi_step = data.get("is_multi_step", False)
-                topic = data.get("topic", "General")
-                
-                # S4-11 Phase 5: Retrieval Control
-                if classification == "NEW_TOPIC":
-                    logger.info(f"Barge-in identified as NEW_TOPIC ({topic}). Running RAG...")
-                    context_text, rag_score = await asyncio.wait_for(
-                        asyncio.to_thread(self.kb.search, caller_input, self.call_logger, 3, trace_id),
-                        timeout=RAG_TIMEOUT
-                    )
-                    
-                    if rag_score > 0.58:
-                        # Re-generate response with RAG context for better accuracy
-                        rag_prompt = f"""
-                        [KB CONTEXT]
-                        {context_text}
-
-                        USER INPUT (New Topic): {caller_input}
-
-                        Update your previous response to be accurate based on the context above.
-                        Keep it conversational and brief.
-                        Return ONLY the final response text.
-                        """
-                        history = list(session.conversation_history)
-                        history = self._fix_history_roles(history)
-                        history.append({"role": "user", "parts": [rag_prompt]})
-                        response = await asyncio.wait_for(
-                            self.model.generate_content_async(contents=history),
-                            timeout=LLM_TIMEOUT
-                        )
-                        response_text = response.text.strip()
-                
-                return classification, response_text, is_multi_step, topic
-                
-            except asyncio.TimeoutError:
-                logger.error(f"Brain barge-in classification timed out (Attempt {attempt+1})")
-                continue
-            except Exception as e:
-                logger.warning(f"Failed to parse JSON brain response (Attempt {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    # Final fallback
-                    return "AMBIGUOUS", "I'm sorry, I missed that. Could you repeat it?", False, "None"
-        
-        return "AMBIGUOUS", "I'm sorry, I missed that.", False, "None"
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"Barge-in classification failed or timed out ({BARGE_IN_TIMEOUT}s): {e}")
+            # 🟢 GRACEFUL FALLBACK (Safe Default)
+            return "AMBIGUOUS", "I'm listening, please go ahead.", False, "Barge-in"
 
     async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None):
         """
