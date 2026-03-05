@@ -735,12 +735,16 @@ class VoiceOrchestrator:
             except Exception as e:
                 logger.error(f"Failed to send clear message: {e}")
 
-    async def handle_audio_stream(self, websocket):
+    async def handle_audio_stream(self, websocket, mode: str = "audio", call_id: str = None, caller_id: str = None):
         """
         Main Loop: Coordinates the flow from Twilio (WebSocket) through STT, Brain, and TTS.
         """
         self.websocket = websocket
         
+        # 0. EXPLICITLY CAPTURE EARLY METADATA FOR FALLBACK CLEANUP
+        self._early_sid = call_id or websocket.query_params.get("CallSid", "unknown")
+        self._early_caller = caller_id or websocket.query_params.get("from", "unknown")
+
         # 0.5. CONCURRENCY SAFETY GATE (S4-7)
         from telephony.concurrency import get_active_call_count, MAX_INBOUND_CALLS
         if get_active_call_count() > MAX_INBOUND_CALLS:
@@ -755,6 +759,7 @@ class VoiceOrchestrator:
                 logger.error(f"Failed to play capacity-failure audio: {e}")
             
             await websocket.close(code=1008, reason="Over Capacity")
+            await self.cleanup()
             return
 
         # 0. INTAKE GUARDRAIL (Kill Switch)
@@ -762,6 +767,7 @@ class VoiceOrchestrator:
             logger.critical(f"Connection Rejected: INTAKE_DISABLED is active (env={self.config.env})")
             # Close with Policy Violation code (1008)
             await websocket.close(code=1008, reason="Intake Disabled")
+            await self.cleanup()
             return
 
         self.mode = "audio"
@@ -831,6 +837,8 @@ class VoiceOrchestrator:
                     break
 
             if not sid:
+                logger.warning("WebSocket disconnected before Twilio start event. Triggering cleanup for early-exit CRM ticket.")
+                await self.cleanup()
                 return
 
             # 🟢 ENTER SESSION CONTEXT (Pillar 3)
@@ -1362,7 +1370,7 @@ class VoiceOrchestrator:
             return
         self._cleanup_done = True
 
-        sid = self.session.session_id if self.session else "unknown"
+        sid = self.session.session_id if self.session else getattr(self, "_early_sid", "unknown")
         logger.info(f"Cleanup started for session {sid}.")
 
         # Reset wrap-up tracking so the orchestrator is clean for the next session
@@ -1400,28 +1408,55 @@ class VoiceOrchestrator:
                 
             logger.debug("Cleanup: Closing Synthesizer")
             await self.synthesizer.close()
-            
-            if self.session and self.session.conversation_history:
-                logger.debug("Cleanup: Logging full session to CRM")
-                history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
-                
-                # Pillar 3: Safety Net - Check for system failure
-                reason = self.session.termination_reason
-                priority = "normal"
-                if reason == "system_failure":
-                    priority = "high"
-                    logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
+            # LAYERED FALLBACK: Null-Safe Ticket Data (DLQ-wrapped for exception safety)
+            try:
+                if self.session and self.session.conversation_history:
+                    logger.debug("Cleanup: Logging full session to CRM")
+                    history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
+                    
+                    # Pillar 3: Safety Net - Check for system failure
+                    reason = self.session.termination_reason
+                    if reason == "system_failure":
+                        logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
 
-                await self.crm.create_ticket(
-                    transcript=history_text,
-                    summary=f"Call Log: {reason} (Session: {sid})",
-                    sentiment="Positive", # Default to positive for successful logs
-                    call_logger=self.call_logger,
-                    call_id=self.session.crm_call_id or sid,
-                    title=f"Completed Session Log ({reason})",
-                    structured_turns=self.session.structured_turns
-                )
-                
+                    await self.crm.create_ticket(
+                        transcript=history_text,
+                        summary=f"Call Log: {reason} (Session: {sid})",
+                        sentiment="Positive", # Default to positive for successful logs
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or sid,
+                        title=f"Completed Session Log ({reason})",
+                        structured_turns=self.session.structured_turns
+                    )
+                elif self.session:
+                    logger.debug("Cleanup: Logging early exit (no audio) to CRM")
+                    reason = getattr(self.session, "termination_reason", "abandoned_setup")
+                    await self.crm.create_ticket(
+                        transcript="[System]: Call ended before user provided audio or during setup.",
+                        summary="Completed — No Callback Needed.",
+                        sentiment="Neutral",
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or sid,
+                        title="Abandoned Setup/No Audio",
+                        structured_turns=self.session.structured_turns
+                    )
+                else:
+                    logger.debug("Cleanup: Logging system error (no session) to CRM")
+                    await self.crm.create_ticket(
+                        transcript="[System]: Connection failed before session could be initialized.",
+                        summary="System Error - Early Connection Failure",
+                        sentiment="Negative",
+                        call_logger=self.call_logger,
+                        call_id=sid,
+                        title="System_Error",
+                        structured_turns=None
+                    )
+            except Exception as crm_ex:
+                # [DLQ] CRM is unavailable. Log to stderr so the ticket is not silently lost.
+                import sys
+                print(f"[DLQ] CRITICAL: CRM create_ticket failed during cleanup for {sid}: {crm_ex}", file=sys.stderr)
+                logger.error(f"[DLQ] CRM ticket failed for session {sid}: {crm_ex}", exc_info=True)
+
             if self.recorder:
                 logger.info(">>> CLEANUP: Saving Recording...")
                 self.recorder.close()

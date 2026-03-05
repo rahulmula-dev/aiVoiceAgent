@@ -48,6 +48,24 @@ class SessionManager:
                 
                 for sid in to_delete:
                     logger.warning(f"ZOMBIE COLLECTION: Pruning hanging session {sid}")
+                    session = self.sessions.get(sid)
+                    # PATH E FIX: Create a CRM ticket for every zombie session pruned
+                    try:
+                        from crm.client import CRMClient
+                        crm = CRMClient()
+                        history_text = "[System]: Session pruned by zombie collector — no graceful exit detected."
+                        if session and session.conversation_history:
+                            history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in session.conversation_history])
+                        asyncio.create_task(crm.create_ticket(
+                            transcript=history_text,
+                            summary=f"Zombie Session Pruned: {sid}",
+                            sentiment="Negative",
+                            call_id=sid,
+                            title="Zombie_Session_Pruned",
+                            structured_turns=getattr(session, 'structured_turns', None)
+                        ))
+                    except Exception as crm_e:
+                        logger.error(f"[DLQ] Failed to create zombie CRM ticket for {sid}: {crm_e}")
                     self.end_session(sid)
             except Exception as e:
                 logger.error(f"Error in Zombie Collector: {e}")
