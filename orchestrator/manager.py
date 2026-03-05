@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 from orchestrator.brain import Brain
 from orchestrator.interfaces import STTProvider, TTSProvider
+from tts.synthesizer import TTSException
 from crm.client import CRMClient
 from contracts.policy import ResponsePolicyEngine, PRDScripts
 from contracts.schemas import CallContext
@@ -1065,23 +1066,30 @@ class VoiceOrchestrator:
                         tts_start_time = time.time()
                         first_chunk_received = False
                         
-                        async for chunk in self.synthesizer.speak(sentence, call_id=self.sid):
-                            # DEFENSIVE: If task was cancelled during synthesis, stop immediately
-                            try:
-                                await asyncio.sleep(0) # Yield to let cancellation happen
-                            except asyncio.CancelledError:
-                                logger.debug("TTS stream interrupted by task cancellation.")
-                                raise
-    
-                            if not first_chunk_received:
-                                first_chunk_received = True
-                                tts_latency = int((time.time() - tts_start_time) * 1000)
-                                if self.call_logger:
-                                    self.call_logger.log_event("tts", "audio_stream_start", 
-                                                               latency_ms=tts_latency, 
-                                                               meta={"text": sentence},
-                                                               trace_id=trace_id)
-                            await self._send_response_chunk(chunk)
+                        try:
+                            async for chunk in self.synthesizer.speak(sentence, call_id=self.sid):
+                                # DEFENSIVE: If task was cancelled during synthesis, stop immediately
+                                try:
+                                    await asyncio.sleep(0) # Yield to let cancellation happen
+                                except asyncio.CancelledError:
+                                    logger.debug("TTS stream interrupted by task cancellation.")
+                                    raise
+        
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    tts_latency = int((time.time() - tts_start_time) * 1000)
+                                    if self.call_logger:
+                                        self.call_logger.log_event("tts", "audio_stream_start", 
+                                                                   latency_ms=tts_latency, 
+                                                                   meta={"text": sentence},
+                                                                   trace_id=trace_id)
+                                await self._send_response_chunk(chunk)
+                        except TTSException as e:
+                            logger.error(f"TTS Synthesis Failed: {e}. Triggering fallback audio.")
+                            # PRD §7: No-Silence Guarantee. Trigger local fallback.
+                            if hasattr(self.synthesizer, 'play_fallback_audio'):
+                                await self.synthesizer.play_fallback_audio(self.websocket)
+                            
                         audio_queue.task_done()
                     
                     # Calculate estimated playback duration (approx 10 chars per sec for natural TTS)
