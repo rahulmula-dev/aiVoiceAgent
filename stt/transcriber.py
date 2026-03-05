@@ -38,6 +38,7 @@ class Transcriber(STTProvider):
         """
         Connects to Deepgram using raw websockets for maximum stability.
         Optimized for WiFi jitter and telephony audio (8kHz mulaw).
+        PRD §5: 1 retry within ≤500ms per attempt.
         """
         params = [
             "model=nova-2",        # nova-2: best multilingual support
@@ -66,23 +67,37 @@ class Transcriber(STTProvider):
                 f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
         except: pass
 
-        try:
-            self.ws = await websockets.connect(url, additional_headers=headers)
-            logger.info(f"[DEEPGRAM] Connected OK (encoding={self.encoding}, rate={self.sample_rate})")
-            try:
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"CONNECTED OK: encoding={self.encoding} sample_rate={self.sample_rate}\n")
-            except: pass
+        # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each
+        MAX_ATTEMPTS = 2
+        ATTEMPT_TIMEOUT = 0.5  # 500ms
+        last_error = None
 
-            asyncio.create_task(self._listen())
-            return True
-        except Exception as e:
-            logger.error(f"[DEEPGRAM] Connection FAILED: {e}")
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"CONNECTION FAILED: {e}\n")
-            except: pass
-            return False
+                self.ws = await asyncio.wait_for(
+                    websockets.connect(url, additional_headers=headers),
+                    timeout=ATTEMPT_TIMEOUT
+                )
+                logger.info(f"[DEEPGRAM] Connected OK (attempt {attempt}, encoding={self.encoding}, rate={self.sample_rate})")
+                try:
+                    with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
+                        f.write(f"CONNECTED OK (attempt {attempt}): encoding={self.encoding} sample_rate={self.sample_rate}\n")
+                except: pass
+
+                asyncio.create_task(self._listen())
+                return True
+            except (asyncio.TimeoutError, Exception) as e:
+                last_error = e
+                logger.warning(f"[DEEPGRAM] Connection attempt {attempt}/{MAX_ATTEMPTS} FAILED: {e}")
+                try:
+                    with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
+                        f.write(f"CONNECT ATTEMPT {attempt} FAILED: {e}\n")
+                except: pass
+                if attempt < MAX_ATTEMPTS:
+                    await asyncio.sleep(0.05)  # 50ms back-off before retry
+
+        logger.error(f"[DEEPGRAM] All {MAX_ATTEMPTS} connection attempts failed. Last error: {last_error}")
+        return False
 
     async def _listen(self):
         """Internal loop to process transcription results"""
