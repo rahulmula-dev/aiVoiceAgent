@@ -9,7 +9,6 @@ from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
 from orchestrator.factory import create_default_orchestrator, create_custom_orchestrator
 from orchestrator.mocks import MockSTT, MockTTS
-from orchestrator.factory import create_default_orchestrator
 from orchestrator.session_manager import default_session_manager
 from stt.transcriber import Transcriber
 from tts.synthesizer import Synthesizer
@@ -247,7 +246,7 @@ async def handle_incoming_call(request: Request):
             title="OVER_CAPACITY | Voice Agent"
         ))
         
-        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>All our agents are currently busy. A staff member will call you back shortly.</Say><Hangup/></Response>'
+        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>All our lines are busy at the moment, but I will arrange a callback.</Say><Hangup/></Response>'
         return Response(content=twiml, media_type="application/xml")
 
     logging.getLogger("Server").info(f"[Concurrency] Call connected. Active calls: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")

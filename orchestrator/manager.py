@@ -628,14 +628,39 @@ class VoiceOrchestrator:
             prev_turn["agent_response_status"] = "interrupted"
             prev_turn["agent_partial_response"] = partial_text
         
-        # STEP B — Classify + Respond (Call Brain)
+        # STEP B — Inject RAG Context for PRD Compliance
+        logger.info(f"Barge-in detected. Running quick RAG to ground response...")
+        context_text = ""
+        try:
+            rag_result, rag_score, rag_topic = await asyncio.wait_for(
+                asyncio.to_thread(self.brain.kb.search, caller_input, self.call_logger, 3, trace_id),
+                timeout=3.0
+            )
+            
+            invalid_contexts = [
+                "No specific documents found.",
+                "No specific documents found due to timeout.",
+                "No specific documents found due to an internal knowledge base error.",
+                "LOW_CONFIDENCE_FALLBACK",
+                "BLOCKED_BY_SAFETY_GUARDRAIL",
+                "RAG Disabled by manual override."
+            ]
+            
+            if rag_result and rag_result not in invalid_contexts:
+                context_text = rag_result
+                logger.info(f"RAG context found for barge-in (Score: {rag_score:.2f}).")
+        except Exception as e:
+            logger.warning(f"RAG failed during barge-in: {e}")
+
+        # STEP C — Classify + Respond (Call Brain)
         classification, response, is_multi_step, topic = await self.brain.generate_with_classification(
             session=self.session,
             caller_input=caller_input,
+            context_text=context_text,
             trace_id=trace_id
         )
-        
-        # STEP C — Update Interrupted Turn
+
+        # STEP D — Update Interrupted Turn
         if classification == "NEW_TOPIC" and prev_turn:
             prev_turn["agent_response_status"] = "abandoned"
             
@@ -757,7 +782,7 @@ class VoiceOrchestrator:
             logger.critical("[SAFETY GATE] Concurrent active calls exceeded hard cap inside pipeline. Rejection triggered.")
             self.state.transition_to(CallState.ESCALATION)
             try:
-                goodbye_text = "All our agents are currently busy. A staff member will call you back shortly."
+                goodbye_text = "All our lines are busy at the moment, but I will arrange a callback."
                 async for chunk in self.synthesizer.speak(goodbye_text):
                     await self._send_response_chunk(chunk)
                 await asyncio.sleep(4) 
@@ -881,12 +906,14 @@ class VoiceOrchestrator:
                 # Start Silence Monitor (Story S4-2)
                 self.silence_task = asyncio.create_task(self._monitor_silence())
 
-                # LOG CALL TO CRM (New)
+                # In PRD, caller_type should dynamically track based on conversation intent.
+                # However, at Call Start, we have no intent yet. 
+                # We start as "unknown_lead", and will update dynamically later based on text.
                 try:
                     crm_id = await self.crm.log_call(
                         call_id=self.session.session_id,
                         caller_phone=self.session.caller_number,
-                        caller_type="new_student", # Default for now, could be dynamic
+                        caller_type="unknown_lead",
                         summary="Incoming Call from Voice Agent",
                         transcript="[Call Started]", 
                         sentiment="Neutral"
@@ -1032,7 +1059,7 @@ class VoiceOrchestrator:
                 turn = {
                     "turn_id": new_id,
                     "caller_input": text,
-                    "topic": "General", 
+                    "topic": intent, 
                     "agent_response_status": "completed",
                     "agent_partial_response": None,
                     "barge_in_classification": None,
@@ -1195,15 +1222,43 @@ class VoiceOrchestrator:
                         
                         is_safe = self.policy.validate_response(context, sentence)
                         
+                        # Dynamically update the turn's topic from RAG metadata
+                        kb_topic = metadata.get("topic")
+                        if kb_topic and kb_topic != "General":
+                            if self.session and self.session.structured_turns:
+                                current_turn = self.session.structured_turns[-1]
+                                if current_turn.get("topic") in [intent, "General", "unknown"]:
+                                    current_turn["topic"] = kb_topic
+
                         if self.call_logger:
                              self.call_logger.log_event("brain", "chunk_generated", meta={
                                  "text": sentence, 
                                  "rag_score": metadata.get("rag_score", 0),
                                  "grounding": metadata.get("has_grounding", False),
+                                 "topic": kb_topic,
                                  "validation_pass": is_safe
                              }, trace_id=trace_id)
 
                         if is_safe:
+                            # ── PRD §1: Map Caller Type from Intent classification ──
+                            if intent and intent != "unknown" and "_chat" not in getattr(self.session, "caller_type", ""):
+                                intent_type_map = {
+                                    "JOB_QUERY": "job_seeker",
+                                    "VENDOR_PAYMENT": "vendor",
+                                    "TRANSCRIPT_REQUEST": "alumni",
+                                    "FEES": "existing_student",
+                                    "PROCEED": "new_student"
+                                }
+                                # Map it, fallback to context/RAG topic if intent misses
+                                new_type = intent_type_map.get(intent)
+                                if not new_type and kb_topic:
+                                    kb_mapped = intent_type_map.get(kb_topic.upper())
+                                    if kb_mapped: new_type = kb_mapped
+                                    
+                                if new_type:
+                                    self.session.caller_type = new_type
+                            # ────────────────────────────────────────────────────────
+
                             if not full_ai_text: # First sentence logic
                                 llm_latency = int((time.time() - llm_start_time) * 1000)
                                 if self.call_logger:
@@ -1432,9 +1487,10 @@ class VoiceOrchestrator:
                     if reason == "system_failure":
                         logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
 
+                    ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript=history_text,
-                        summary=f"Call Log: {reason} (Session: {sid})",
+                        summary=f"Call Log: {reason} (Session: {sid}) | Type: {ct}",
                         sentiment="Positive", # Default to positive for successful logs
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
@@ -1444,9 +1500,10 @@ class VoiceOrchestrator:
                 elif self.session:
                     logger.debug("Cleanup: Logging early exit (no audio) to CRM")
                     reason = getattr(self.session, "termination_reason", "abandoned_setup")
+                    ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript="[System]: Call ended before user provided audio or during setup.",
-                        summary="Completed — No Callback Needed.",
+                        summary=f"Completed — No Callback Needed. Type: {ct}",
                         sentiment="Neutral",
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,

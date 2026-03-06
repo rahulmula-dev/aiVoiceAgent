@@ -23,6 +23,7 @@ class Session(BaseModel):
     call_id: str
     crm_call_id: Optional[str] = None
     caller_number: str = "unknown"
+    caller_type: str = "unknown_lead"
     start_time: datetime = Field(default_factory=datetime.now)
     end_time: Optional[datetime] = None
     last_accessed: datetime = Field(default_factory=datetime.now)

@@ -102,31 +102,35 @@ class Brain(LLMEngine):
             return [{"role": "user", "parts": ["[Call started]"]}] + history
         return history
 
-    async def generate_with_classification(self, session, caller_input: str, trace_id: str = None):
+    async def generate_with_classification(self, session, caller_input: str, context_text: str = None, trace_id: str = None):
         """
         Special method for barge-in handling (CRITICAL-P2-05). 
-        Optimized for ultra-low latency: bypasses RAG and enforces 1.5s hard ceiling.
-        Returns (classification, response, is_multi_step, topic)
+        Returns (classification, response, is_multi_step, topic).
+        Uses optional RAG context to ground responses.
         """
         import json
         
         # 🟢 PINNED TIMEOUT FOR BARGE-IN (Sub-second target, 1.5s absolute ceiling)
         BARGE_IN_TIMEOUT = 1.5
         
+        context_block = f"\n[KNOWLEDGE BASE CONTEXT]\n{context_text}\nUse this context to accurately answer if relevant." if context_text else ""
+
         # Build a prompt for classification + response
         prompt = f"""
         USER INPUT (Barge-in): {caller_input}
+        {context_block}
 
         RULES:
         - For NEW_TOPIC: Respond directly to the new topic with zero reference to your previous interrupted response.
         - For SAME_TOPIC: Naturally incorporate the clarification into your response as a continuation.
         - For AMBIGUOUS: Respond to the most likely interpretation without asking for clarification.
+        - ALWAYS prioritize the [KNOWLEDGE BASE CONTEXT] for your answers if it is provided.
 
         You must respond in VALID JSON format ONLY:
         {{
           "classification": "NEW_TOPIC" | "SAME_TOPIC" | "AMBIGUOUS",
           "topic": "Brief topic name",
-          "response": "Your natural response here",
+          "response": "Your natural grounded response here",
           "is_multi_step": true | false
         }}
         """
@@ -187,7 +191,7 @@ class Brain(LLMEngine):
 
                     if prefetched_context_task:
                         logger.info(f"Using pre-fetched RAG context for '{text}'")
-                        context_text, rag_score = await prefetched_context_task
+                        context_text, rag_score, rag_topic = await prefetched_context_task
                     else:
                         # Context-Aware Follow-Ups (Story S4-9)
                         # Augment short follow-up questions with known context for better vector matching
@@ -200,8 +204,8 @@ class Brain(LLMEngine):
                                 search_query = f"{text} (Context: {' '.join(tags)})"
                                 logger.info(f"Augmented RAG Query: '{search_query}'")
 
-                        # KB returns (content, top_score)
-                        context_text, rag_score = await asyncio.wait_for(
+                        # KB returns (content, top_score, category)
+                        context_text, rag_score, rag_topic = await asyncio.wait_for(
                             asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
                             timeout=RAG_TIMEOUT
                         )
@@ -214,6 +218,7 @@ class Brain(LLMEngine):
                     logger.error(f"RAG Search timed out after {RAG_TIMEOUT}s")
                     context_text = "No specific documents found due to timeout."
                     rag_score = 0.0
+                    rag_topic = "General"
                     rag_latency = RAG_TIMEOUT
 
                     # CRM Artifact: System Alert for Knowledge Base Timeout
@@ -233,6 +238,7 @@ class Brain(LLMEngine):
                     logger.error(f"RAG Search failed with error: {e}")
                     context_text = "No specific documents found due to an internal knowledge base error."
                     rag_score = 0.0
+                    rag_topic = "General"
                     rag_latency = RAG_TIMEOUT
 
                     # CRM Artifact: System Alert for Knowledge Base Failure
@@ -249,10 +255,17 @@ class Brain(LLMEngine):
                         except Exception as ce:
                             logger.error(f"Failed to create KB Failure CRM ticket: {ce}")
             
-            # Grounding: Only true if text exists AND score is decent (> 0.58)
-            # Pinecone cosine similarity: 1.0 = exact, 0.7 = related, <0.6 = noise
-            # Syncing with KnowledgeBase DEFAULT_THRESHOLD (0.58)
-            has_grounding = bool(context_text and context_text != "No specific documents found." and rag_score > 0.58)
+            # Grounding is determined by whether KnowledgeBase returned valid chunks.
+            # KnowledgeBase now handles its own config-driven confidence gates.
+            invalid_contexts = [
+                "No specific documents found.",
+                "No specific documents found due to timeout.",
+                "No specific documents found due to an internal knowledge base error.",
+                "LOW_CONFIDENCE_FALLBACK",
+                "BLOCKED_BY_SAFETY_GUARDRAIL",
+                "RAG Disabled by manual override."
+            ]
+            has_grounding = bool(context_text and context_text not in invalid_contexts)
             
             # Logging accuracy fix: 'kb_hit' means GOOD hit, not just ANY hit
             
@@ -260,6 +273,7 @@ class Brain(LLMEngine):
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
+                rag_topic = "General"
             
             logger.info(f"RAG Context for '{text}' (Score: {rag_score:.2f}): {context_text[:200]}...")
 
@@ -365,7 +379,8 @@ class Brain(LLMEngine):
             # Metadata for Policy Engine
             sent_metadata = {
                 "rag_score": rag_score,
-                "has_grounding": has_grounding
+                "has_grounding": has_grounding,
+                "topic": rag_topic
             }
 
             # S4-9: Context Injection
@@ -556,22 +571,7 @@ if __name__ == "__main__":
                 return {"status": "In Progress (Mock)"}
             return None
 
-    async def test():
-        # Inject Mock CRM
-        b = Brain(crm_client=MockCRM())
-        
-        print("\nTesting greeting (Brain only)...")
-        res1 = await b.generate_response("Hello!")
-        print(f"AI: {res1}")
-        
-        print("\nTesting retrieval (KB)...")
-        res2 = await b.generate_response("What are the college programs?")
-        print(f"AI: {res2}")
-        
-        print("\nTesting CRM Enforcement...")
-        res3 = await b.generate_response("Check status for ticket MOCK-12345")
-        print(f"AI: {res3}")
-    
+
     async def test():
         # Inject Mock CRM
         b = Brain(crm_client=MockCRM())

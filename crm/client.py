@@ -49,7 +49,14 @@ class CRMClient(CRMEngine):
         
         # CONFIG: S3 DLQ Path (Canada Region - PRD Section 5)
         import boto3
-        self.s3_client = boto3.client('s3', region_name='ca-central-1')
+        aws_kwargs = {'region_name': 'ca-central-1'}
+        if not os.getenv("AWS_ACCESS_KEY_ID"):
+            # Boto3 attempts to fetch from IMDS (169.254.169.254) if keys are missing.
+            # This synchronous HTTP request blocks the asyncio event loop for several seconds causing timeouts
+            aws_kwargs['aws_access_key_id'] = 'dummy_key_to_bypass_imds'
+            aws_kwargs['aws_secret_access_key'] = 'dummy_secret_to_bypass_imds'
+            
+        self.s3_client = boto3.client('s3', **aws_kwargs)
         # AWS explicitly requires hyphens, translating from PRD's 'crm_failover_queue'
         self.s3_bucket = "crm-failover-queue"
 
@@ -236,19 +243,7 @@ class CRMClient(CRMEngine):
         except Exception as e:
             logger.critical(f"[CRM] CRITICAL: Failed to write to S3 DLQ! Data loss imminent. {e}")
 
-    async def schedule_callback(self, phone_number: str):
-        # NOTE: Dummy CRM 'callbacks' endpoint needs ticket_id. 
-        # This simple signature in the interface (phone_number only) might need expansion.,
-        # or we create a dummy ticket first.
-        # For now, we'll log it but warn about missing ticket_id context if not available.
-        # But this method is usually called from contexts where we might not have a ticket yet.
-        # Let's check the schema: POST /callbacks -> ticket_id, requested_phone, reason, preferred_time
-        
-        # We will create a provisional ticket for the callback
-        logger.info(f"[CRM] Callback requested for {phone_number}")
-        # In a real implementation, we would need to orchestrate: create call -> create ticket -> create callback
-        # For this dummy client, if we lack context, we might skip or use placeholders.
-        return True
+
 
     async def get_ticket_status(self, ticket_id: str):
         # GET /tickets

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cila-ai-agent-service
+  namespace: gd-college
+  labels:
+    app: cila-ai-agent
+spec:
+  selector:
+    app: cila-ai-agent
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP

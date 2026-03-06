@@ -3,7 +3,7 @@ import httpx
 import logging as std_logging
 import asyncio
 from dotenv import load_dotenv
-from orchestrator.interfaces import TTSProvider
+from contracts.interfaces import TTSEngine
 
 load_dotenv()
 

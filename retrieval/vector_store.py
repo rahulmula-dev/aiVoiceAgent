@@ -12,18 +12,45 @@ load_dotenv()
 
 from contracts.interfaces import KnowledgeBaseEngine
 
-# --- CONFIGURATION (Sync with loader.py) ---
-DEFAULT_THRESHOLD = 0.58
-CATEGORY_THRESHOLDS = {
-    "HARD_REFUSAL_LEGAL": 0.75,
-    "HARD_REFUSAL_IMMIGRATION": 0.75,
-    "HARD_REFUSAL_HARASSMENT": 0.80
-}
+import json
 
-def get_threshold(category):
-    if not category:
-        return DEFAULT_THRESHOLD
-    return CATEGORY_THRESHOLDS.get(category, DEFAULT_THRESHOLD)
+# --- CONFIGURATION (Sync with loader.py) ---
+def _load_thresholds():
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "rag_thresholds.json")
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load rag_thresholds.json: {e}")
+        return {}
+
+_THRESHOLDS_CACHE = _load_thresholds()
+
+def get_default_threshold():
+    return _THRESHOLDS_CACHE.get("DEFAULT_THRESHOLD", 0.58)
+
+def get_threshold(hard_refusal_category, general_category=None):
+    """
+    Returns the appropriate config-driven confidence threshold from the JSON configuration.
+    Prioritizes hard refusal category overrides over general category overrides.
+    """
+    hard_refusals = _THRESHOLDS_CACHE.get("HARD_REFUSAL_CATEGORIES", {})
+    if hard_refusal_category and hard_refusal_category in hard_refusals:
+        return hard_refusals[hard_refusal_category]
+
+    op_cats = _THRESHOLDS_CACHE.get("OPERATIONAL_CATEGORIES", {})
+    if general_category:
+        cat_lower = general_category.lower()
+        if "program" in cat_lower or "academic" in cat_lower:
+            return op_cats.get("PROGRAM_STRUCTURE", 0.58)
+        if "fee" in cat_lower or "financial" in cat_lower:
+            return op_cats.get("FEE_DETAILS", 0.60)
+        if "eligibility" in cat_lower or "general info" in cat_lower:
+            return op_cats.get("ELIGIBILITY", 0.62)
+        if "admission" in cat_lower or "deadline" in cat_lower:
+            return op_cats.get("DEADLINES", 0.65)
+
+    return get_default_threshold()
 
 class KnowledgeBase(KnowledgeBaseEngine):
     def __init__(self):
@@ -51,11 +78,11 @@ class KnowledgeBase(KnowledgeBaseEngine):
         Returns: (context_text, top_confidence_score)
         """
         if not self.index:
-            return "", 0.0
+            return "", 0.0, "General"
 
         # PRD §5 RETRY LOOP: 2 attempts, ≤300ms each
         MAX_ATTEMPTS = 2
-        ATTEMPT_TIMEOUT = 0.3  # 300ms
+        ATTEMPT_TIMEOUT = 0.8  # 800ms account for network latency
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -101,7 +128,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     pass  # No sleep: search() runs in a sync thread, retry is immediate
                 else:
                     logger.error(f"[RAG] All {MAX_ATTEMPTS} search attempts failed. Last error: {last_error}")
-                    return "", 0.0
+                    return "", 0.0, "General"
 
         # 3. The "Double-Filter" Loop
         valid_chunks = []
@@ -113,12 +140,13 @@ class KnowledgeBase(KnowledgeBaseEngine):
             metadata = match.get('metadata', {})
             text = metadata.get('text', '')
             is_sensitive = metadata.get('is_sensitive_topic', False)
-            category = metadata.get('hard_refusal_category', "")
+            hard_refusal_category = metadata.get('hard_refusal_category', "")
+            general_category = metadata.get('category', "")
 
             # GATE 1: Safety (Refined to avoid collateral over-blocking)
             if is_sensitive:
                 if score >= 0.70:
-                    refusal_cat = category or "GENERAL_POLICY_VIOLATION"
+                    refusal_cat = hard_refusal_category or "GENERAL_POLICY_VIOLATION"
                     logger.warning(f"RAG-BLOCK: High-confidence sensitive content detected (Score: {score:.2f})")
                     if call_logger:
                         call_logger.log_event("retrieval", "rag_search_blocked", 
@@ -130,7 +158,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     continue
 
             # GATE 2: Confidence
-            threshold = get_threshold(category)
+            threshold = get_threshold(hard_refusal_category, general_category)
             if score < threshold:
                 logger.debug(f"RAG-DROP: Score {score:.2f} < Threshold {threshold}")
                 continue
@@ -144,11 +172,11 @@ class KnowledgeBase(KnowledgeBaseEngine):
         if scores:
             top_score = max(scores)
             
-            # Extract Top Match Metadata for Tracing (Sprint 2 Requirement)
             top_match = next((m for m in matches if m.get('score') == top_score), {})
             top_meta = top_match.get('metadata', {})
             kb_version = top_meta.get('kb_version_id', 'unknown')
             top_chunk_id = top_meta.get('chunk_id', 'unknown')
+            rag_topic = top_meta.get('category', 'General')
 
             logger.info(f"RAG Search: Found {len(valid_chunks)} verified chunks (Top Score: {top_score:.2f})")
             
@@ -167,6 +195,6 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 call_logger.log_event("retrieval", "rag_search_complete",
                                      meta={"matches": 0, "top_score": 0},
                                      trace_id=trace_id)
-            return "LOW_CONFIDENCE_FALLBACK", 0.0
+            return "LOW_CONFIDENCE_FALLBACK", 0.0, "General"
 
-        return "\n\n".join(valid_chunks), top_score
+        return "\n\n".join(valid_chunks), top_score, rag_topic

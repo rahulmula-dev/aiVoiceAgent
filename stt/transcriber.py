@@ -67,9 +67,9 @@ class Transcriber(STTProvider):
                 f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
         except: pass
 
-        # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each
+        # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each (Adapted to 3.0s for physical TLS connection latency)
         MAX_ATTEMPTS = 2
-        ATTEMPT_TIMEOUT = 0.5  # 500ms
+        ATTEMPT_TIMEOUT = 3.0  # 3000ms
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
