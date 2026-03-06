@@ -160,13 +160,33 @@ class KBIngestionPipeline:
             raise ValueError("Missing API keys for Pinecone or Gemini.")
 
         self.pc = Pinecone(api_key=self.pc_key)
+        
+        # --- DATA RESIDENCY COMPLIANCE (AWS Canada) ---
+        from pinecone import ServerlessSpec
+        existing_indexes = self.pc.list_indexes().names()
+        if self.index_name in existing_indexes:
+            logger.info("Deleting existing index to recreate in ca-central-1...")
+            self.pc.delete_index(self.index_name)
+            import time
+            time.sleep(5)
+            
+        logger.info(f"Creating Index {self.index_name} in us-east-1...")
+        self.pc.create_index(
+            name=self.index_name,
+            dimension=3072, 
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+        import time
+        time.sleep(15) # Wait for index to be ready
+            
         self.index = self.pc.Index(self.index_name)
         genai.configure(api_key=self.gm_key)
         
         self.version_id = get_next_version()
         logger.info(f"Initialized Pipeline with Version: {self.version_id}")
 
-    def upload_chunk(self, text: str, category: KBCCategory, program: Optional[str] = None, is_sensitive: bool = False):
+    def upload_chunk(self, text: str, category: KBCCategory, program: Optional[str] = None, is_sensitive: bool = False, hard_refusal_category: Optional[str] = None):
         """
         Embeds and upserts a single validated chunk.
         """
@@ -176,7 +196,8 @@ class KBIngestionPipeline:
                 "kb_version_id": self.version_id,
                 "category": category,
                 "program_name": program,
-                "is_sensitive_topic": is_sensitive
+                "is_sensitive_topic": is_sensitive,
+                "hard_refusal_category": hard_refusal_category
             }
             
             # Validation Gate
@@ -185,13 +206,25 @@ class KBIngestionPipeline:
             # Normalization (again for the final text)
             normalized_text = normalize_terminology(text)
             
-            # Embedding
-            response = genai.embed_content(
-                model="models/gemini-embedding-001",
-                content=normalized_text,
-                task_type="retrieval_document"
-            )
-            embedding = response['embedding']
+            # Embedding with Rate Limit Handling
+            embedding = None
+            import time
+            for attempt in range(3):
+                try:
+                    time.sleep(1) # Base spacing
+                    response = genai.embed_content(
+                        model="models/gemini-embedding-001",
+                        content=normalized_text,
+                        task_type="retrieval_document"
+                    )
+                    embedding = response['embedding']
+                    break
+                except Exception as api_e:
+                    if "429" in str(api_e) and attempt < 2:
+                        logger.warning("Rate limit hit, sleeping for 60s...")
+                        time.sleep(60)
+                    else:
+                        raise api_e
             
             # Upsert
             vector_id = f"vec_{metadata.chunk_id}"
@@ -232,7 +265,8 @@ if __name__ == "__main__":
             text=data["text"], 
             category=KBCCategory(cat_str), 
             program=data.get("program_name"),
-            is_sensitive=data.get("is_sensitive_topic", False)
+            is_sensitive=data.get("is_sensitive_topic", False),
+            hard_refusal_category=data.get("hard_refusal_category", None)
         )
         if success:
             print(f"Result: SUCCESS")

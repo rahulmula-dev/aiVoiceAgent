@@ -340,11 +340,27 @@ class Brain(LLMEngine):
             # --------------------------------------------------
 
             # ── RAG SCORE FLOOR ───────────────────────────────────────────────────
-            # S4 Refinement: Don't block the LLM here. Let the LLM handle context.
-            # This ensures the "ACKNOWLEDGE" prefix is always included as per
-            # the Intelligence Bridge persona requirement.
+            # S4 Refinement Fix: Hard gate to prevent hallucination.
+            # DO NOT pass to LLM if grounding and CRM are both missed.
+            if not has_grounding and not crm_hit:
+                # 1. Create the CRM callback ticket
+                if self.crm_client and call_context:
+                    try:
+                        await self.crm_client.create_ticket(
+                            transcript=f"User Query: {text}\nStatus: Knowledge Base Miss (Score: {rag_score})",
+                            summary="Callback Required: KB Miss",
+                            sentiment="Neutral",
+                            call_logger=self.call_logger,
+                            call_id=call_context.session_id,
+                            title="Callback Required: Unanswered User Query"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to create callback ticket for KB miss: {e}")
+
+                # 2. Deterministically yield the refusal and bypass the LLM entirely
+                yield (self.KB_MISS_SCRIPT, {"error": "kb_miss", "has_grounding": has_grounding, "rag_score": rag_score})
+                return
             # ──────────────────────────────────────────────────────────────────────
-            pass
 
             # Metadata for Policy Engine
             sent_metadata = {

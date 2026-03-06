@@ -47,8 +47,11 @@ class CRMClient(CRMEngine):
         # IDEMPOTENCY: Local cache of processed call_ids to prevent duplicates
         self.processed_calls = {} # Map call_id -> ticket_id
         
-        # CONFIG: DLQ Path
-        self.dlq_path = os.path.join(os.getcwd(), "logs", "crm_dlq.json")
+        # CONFIG: S3 DLQ Path (Canada Region - PRD Section 5)
+        import boto3
+        self.s3_client = boto3.client('s3', region_name='ca-central-1')
+        # AWS explicitly requires hyphens, translating from PRD's 'crm_failover_queue'
+        self.s3_bucket = "crm-failover-queue"
 
     @retry(
         stop=stop_after_attempt(3),
@@ -213,19 +216,25 @@ class CRMClient(CRMEngine):
             raise CRMConnectionError(f"Network Error: {e}")
 
     def _save_to_dlq(self, payload, error_msg):
+        import uuid
+        entry_id = str(uuid.uuid4())
         entry = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "ticket_id": entry_id,
+            "created_at": datetime.datetime.now().isoformat(),
             "payload": payload,
             "error": error_msg,
-            "status": "failed"
+            "status": "Pending CRM Sync",
+            "retry_count": 0
         }
         try:
-            os.makedirs(os.path.dirname(self.dlq_path), exist_ok=True)
-            with open(self.dlq_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-            logger.info(f"[CRM] Payload saved to DLQ: {self.dlq_path}")
+            self.s3_client.put_object(
+                Bucket=self.s3_bucket,
+                Key=f"dlq_tickets/{entry_id}.json",
+                Body=json.dumps(entry)
+            )
+            logger.info(f"[CRM] Payload saved to S3 DLQ (ca-central-1): {entry_id}")
         except Exception as e:
-            logger.critical(f"[CRM] CRITICAL: Failed to write to DLQ! Data loss imminent. {e}")
+            logger.critical(f"[CRM] CRITICAL: Failed to write to S3 DLQ! Data loss imminent. {e}")
 
     async def schedule_callback(self, phone_number: str):
         # NOTE: Dummy CRM 'callbacks' endpoint needs ticket_id. 

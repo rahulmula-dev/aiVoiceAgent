@@ -44,8 +44,6 @@ class PRDScripts:
     SILENCE_2 = "I haven't heard from you for a while. I will have to end the call soon if you don't respond."
     SILENCE_TERMINATION = "Disconnecting due to silence. Goodbye."
 
-    # Interruption
-    INTERRUPTION = "Should I continue from where I left off?"
     # Session Wrap-up
     WRAP_UP = "We have about 30 seconds left for this session. Is there anything else important you’d like to cover before we wrap up?"
 
