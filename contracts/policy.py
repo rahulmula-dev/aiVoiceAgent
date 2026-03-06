@@ -45,7 +45,8 @@ class PRDScripts:
     SILENCE_TERMINATION = "Disconnecting due to silence. Goodbye."
 
     # Session Wrap-up
-    WRAP_UP = "We have about 30 seconds left for this session. Is there anything else important you’d like to cover before we wrap up?"
+    WRAP_UP = "Before we wrap up, is there anything else I can help with?"
+    WRAP_UP_TERMINATION = "Our maximum session time has been reached. Thank you for calling GD College. Goodbye."
 
 class ResponsePolicyEngine:
     """

@@ -59,6 +59,40 @@ def increment_active_calls() -> int:
         _local_counter += 1
         return _local_counter
 
+def increment_if_under_cap(max_cap: int) -> tuple[bool, int]:
+    """
+    Atomically checks if the counter is under the capacity limit and increments it.
+    Solves the TOCTOU (Time-Of-Check to Time-Of-Use) race condition.
+    Returns: (is_accepted, new_count)
+    """
+    global _local_counter
+    
+    # Local fallback logic (uses GIL for atomic-like behavior in single process)
+    if not redis_client:
+        if _local_counter >= max_cap:
+            return False, _local_counter
+        _local_counter += 1
+        return True, _local_counter
+        
+    try:
+        # Atomic INCR first
+        current = redis_client.incr(COUNTER_KEY)
+        redis_client.expire(COUNTER_KEY, TTL_SECONDS)
+        
+        # If we exceeded the cap, immediately DECR and reject
+        if current > max_cap:
+            redis_client.decr(COUNTER_KEY)
+            return False, current - 1
+            
+        return True, current
+    except Exception as e:
+        logger.error(f"Redis increment_if_under_cap error: {e}")
+        # Fallback to local
+        if _local_counter >= max_cap:
+            return False, _local_counter
+        _local_counter += 1
+        return True, _local_counter
+
 def decrement_active_calls() -> int:
     global _local_counter
     if not redis_client:

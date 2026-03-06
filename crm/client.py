@@ -5,7 +5,7 @@ import os
 import datetime
 import httpx
 from typing import Optional, Dict
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 
 # Configure logger
 logger = logging.getLogger("crm")
@@ -55,7 +55,7 @@ class CRMClient(CRMEngine):
 
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        wait=wait_fixed(0.25),
         retry=retry_if_exception_type(CRMConnectionError),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )
@@ -186,7 +186,7 @@ class CRMClient(CRMEngine):
     # RETRY CONFIGURATION
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        wait=wait_fixed(0.25),
         retry=retry_if_exception_type(CRMConnectionError),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )

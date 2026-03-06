@@ -223,10 +223,11 @@ async def handle_incoming_call(request: Request):
     
     logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
     
-    from telephony.concurrency import get_active_call_count, increment_active_calls, MAX_INBOUND_CALLS
-    active_calls = get_active_call_count()
-    if active_calls >= MAX_INBOUND_CALLS:
-        logging.getLogger("Server").warning(f"[Concurrency] SUPER MAX REACHED! Active calls: {active_calls}/{MAX_INBOUND_CALLS}. Rejecting SID: {call_sid}")
+    from telephony.concurrency import increment_if_under_cap, MAX_INBOUND_CALLS
+    is_accepted, new_count = increment_if_under_cap(MAX_INBOUND_CALLS)
+    
+    if not is_accepted:
+        logging.getLogger("Server").warning(f"[Concurrency] SUPER MAX REACHED! Active calls: {new_count}/{MAX_INBOUND_CALLS}. Rejecting SID: {call_sid}")
         
         # Log to CRM asynchronously to avoid blocking
         import asyncio
@@ -249,7 +250,6 @@ async def handle_incoming_call(request: Request):
         twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>All our agents are currently busy. A staff member will call you back shortly.</Say><Hangup/></Response>'
         return Response(content=twiml, media_type="application/xml")
 
-    new_count = increment_active_calls()
     logging.getLogger("Server").info(f"[Concurrency] Call connected. Active calls: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
 
     # Determine public ngrok URL (from environment variable)

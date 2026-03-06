@@ -164,12 +164,17 @@ class VoiceOrchestrator:
 
             # STREAM BUFFERING: Pre-fetch RAG context for partial transcripts
             if len(raw_text) > 15 and self.session:
-                if not hasattr(self.session, 'prefetched_context_task') or self.session.prefetched_context_task.done():
-                    logger.debug(f"[STREAM BUFFER] Starting proactive KB lookup for: '{raw_text}'")
-                    # Fire and forget KB search
-                    self.session.prefetched_context_task = asyncio.create_task(
-                        asyncio.to_thread(self.brain.kb.search, raw_text, self.call_logger, 3)
-                    )
+                # 🛡️ SECURITY GATE: Prevent policy-violating partial transcripts from hitting external Vector DB
+                intent = self.policy.classify_intent(raw_text, detected_lang=detected_lang)
+                if intent == "PROCEED":
+                    if not hasattr(self.session, 'prefetched_context_task') or self.session.prefetched_context_task.done():
+                        logger.debug(f"[STREAM BUFFER] Starting proactive KB lookup for: '{raw_text}'")
+                        # Fire and forget KB search
+                        self.session.prefetched_context_task = asyncio.create_task(
+                            asyncio.to_thread(self.brain.kb.search, raw_text, self.call_logger, 3)
+                        )
+                else:
+                    logger.debug(f"[STREAM BUFFER] Blocked proactive KB lookup due to policy: {intent} ('{raw_text}')")
             return # Only process complete sentences for LLM.
             
         # 2. Run the failsafe policy (EXACT logic per Debugger Plan)
@@ -1571,15 +1576,15 @@ class VoiceOrchestrator:
                     except Exception:
                         elapsed = None
 
-                # Trigger wrap-up notification at 4.5 minutes (270s)
-                if elapsed is not None and elapsed >= 270.0 and not self.wrapup_triggered:
+                # Trigger wrap-up notification at 5.0 minutes (300s)
+                if elapsed is not None and elapsed >= 300.0 and not self.wrapup_triggered:
                     logger.info(f"Wrap-up prompt triggered at {elapsed:.1f}s.")
                     self.wrapup_triggered = True
                     if self.session:
                         try:
                             # Create a lightweight CRM ticket for wrap-up
                             await self.crm.create_ticket(
-                                transcript="[System]: Session approaching 5-minute limit. Wrap-up prompt played.",
+                                transcript="[System]: Session approaching 6-minute limit. Wrap-up prompt played.",
                                 summary="Session Wrap-up Triggered",
                                 sentiment="Neutral",
                                 call_logger=self.call_logger,
@@ -1595,11 +1600,18 @@ class VoiceOrchestrator:
                     except Exception as e:
                         logger.error(f"Error speaking WRAP_UP prompt: {e}")
 
-                # Hard stop at 5 minutes
-                if elapsed is not None and elapsed >= 300.0:
+                # Hard stop at 6 minutes
+                if elapsed is not None and elapsed >= 360.0:
                     logger.warning(f"Session duration limit reached ({elapsed:.1f}s). Initiating wrap-up termination.")
                     if self.session:
                         self.session.termination_reason = "wrapup_timeout"
+                    
+                    # Speak termination script first
+                    try:
+                        await self.speak_refusal(PRDScripts.WRAP_UP_TERMINATION)
+                    except Exception as e:
+                        logger.error(f"Error speaking WRAP_UP_TERMINATION prompt: {e}")
+                        
                     # Transition to CALL_END and cleanup
                     try:
                         self.state.transition_to(CallState.CALL_END)
