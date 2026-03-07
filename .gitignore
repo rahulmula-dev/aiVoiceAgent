@@ -9,6 +9,7 @@ logs/
 deepgram_debug.txt
 ngrok_log.txt
 conversation_log.txt
+server_*.txt
 
 # Python
 __pycache__/
