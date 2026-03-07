@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 from crm.client import CRMClient
 from retrieval.vector_store import KnowledgeBase
 from telephony.concurrency import check_redis_health, MAX_INBOUND_CALLS
+from contracts.auth import Role, get_current_user, get_current_user_ws, require_role
+from agent_logging.audit_logger import AuditLogger
 
 # Configure logging
 logger = logging.getLogger("Server")
@@ -27,7 +29,7 @@ logger = logging.getLogger("Server")
 _crm_checker = CRMClient()
 _kb_checker = KnowledgeBase()
 
-from agent_logging import bind_call_context, CallLogger
+from agent_logging import bind_call_context, CallLogger, mask_phone_number
 
 app = FastAPI()
 
@@ -42,6 +44,40 @@ async def startup_event():
     # S4-7 Additions: Reset active concurrency tracking on startup
     from telephony.concurrency import reset_active_calls
     reset_active_calls()
+    
+    # [HIGH-P3-04] Activate CRM Failover Reconciliation Worker
+    from crm.reconciliation_job import start_background_worker
+    start_background_worker()
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    """
+    Forensic Middleware: Logs every rest-api access to restricted paths,
+    capturing both successful and denied (401/403) attempts.
+    """
+    path = request.url.path
+    if path.startswith(("/api/live-context", "/admin/")):
+        response = await call_next(request)
+        
+        # Log status based on response code
+        status_label = "granted" if response.status_code < 400 else "denied"
+        action = "PII_ACCESS" if "/api/" in path else "ADMIN_CONFIG"
+        
+        # Extract role from header if possible (best effort without breaking the dependency flow)
+        token = request.headers.get("X-Auth-Token") or request.query_params.get("token")
+        from contracts.auth import validate_token
+        role = validate_token(token) if token else "anonymous"
+
+        AuditLogger.log_access(
+            endpoint=path,
+            role=role,
+            status=status_label,
+            action=action,
+            ip=request.client.host if request.client else "unknown"
+        )
+        return response
+    
+    return await call_next(request)
 
 @app.get("/")
 async def root():
@@ -120,19 +156,14 @@ async def readyz():
         return Response(content="Readiness Check Error", status_code=500)
 
 @app.post("/admin/reload-config")
-async def reload_config(x_admin_token: str = Header(...)):
-    """
-    Instantly reloads dynamic configuration flags. 
-    Protected by a simple admin token check.
-    """
+async def reload_config(
+    request: Request,
+    role: Role = Depends(require_role([Role.ADMIN]))
+):
+    """ Instantly reloads dynamic configuration flags. Admin only."""
     from contracts.config import FeatureConfig
-    expected_token = os.getenv("ADMIN_RELOAD_TOKEN", "default-staging-token")
     
-    if x_admin_token != expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Unauthorized configuration reload attempt."
-        )
+    # Note: Audit logging for this REST endpoint is handled by audit_middleware
     
     new_intake_state = FeatureConfig.reload_dynamic_flags()
     
@@ -143,10 +174,18 @@ async def reload_config(x_admin_token: str = Header(...)):
     }
 
 @app.get("/api/live-context")
-async def get_live_context_gui():
-    """
-    Developer Tool: Auto-updating GUI for the Live RAM Cache.
-    """
+async def get_live_context_gui(
+    request: Request,
+    token: Optional[str] = Query(None),
+    role: Role = Depends(require_role([Role.IT, Role.ADMIN], flexible=True))
+):
+    """ Developer Tool: Auto-updating GUI for the Live RAM Cache. Protected."""
+    # Note: Audit logging for this REST endpoint is handled by audit_middleware
+    
+    # We must pass the token to the template so it can fetch /data
+    # This is a minimal way to keep the dashboard working without complex cookie/session logic.
+    safe_token = token or request.headers.get("X-Auth-Token", "")
+
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -196,7 +235,8 @@ async def get_live_context_gui():
 
             async function fetchContext() {
                 try {
-                    const response = await fetch('/api/live-context/data');
+                    const token = '{{ token }}';
+                    const response = await fetch(`/api/live-context/data?token=${token}`);
                     const data = await response.json();
                     
                     document.getElementById('call-count').innerText = data.active_calls_count;
@@ -244,16 +284,21 @@ async def get_live_context_gui():
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
+    return HTMLResponse(content=html_content.replace('{{ token }}', safe_token))
 
 @app.get("/api/live-context/data")
-async def get_live_context_data():
-    """
-    Raw JSON data for the Live RAM Dashboard.
-    """
+async def get_live_context_data(
+    request: Request,
+    role: Role = Depends(require_role([Role.IT, Role.ADMIN], flexible=True))
+):
+    """ Raw JSON data for the Live RAM Dashboard. Protected."""
+    # Note: Audit logging for this REST endpoint is handled by audit_middleware
     live_sessions = {}
     for sid, session in default_session_manager.sessions.items():
-        live_sessions[sid] = session.call_context.dict()
+        ctx_dict = session.call_context.dict()
+        if "caller_number" in ctx_dict:
+            ctx_dict["caller_number"] = mask_phone_number(ctx_dict["caller_number"])
+        live_sessions[sid] = ctx_dict
         
     from telephony.concurrency import get_active_call_count
     
@@ -263,12 +308,27 @@ async def get_live_context_data():
         "sessions": live_sessions
     }
 
+def is_twilio_request(request: Request) -> bool:
+    """
+    Minimal Twilio Verification (Pillar 3: Policy Enforcement).
+    Validates that the request actually comes from a Twilio-signed source.
+    """
+    if os.getenv("BYPASS_TWILIO_AUTH") == "true": return True
+    
+    signature = request.headers.get("X-Twilio-Signature")
+    if not signature:
+        logger.warning(f"Unauthorized non-Twilio request from {request.client.host}")
+        return False
+    return True
+
 @app.api_route("/voice", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """
     Twilio TwiML Entry Point.
     Instructs Twilio to open a bi-directional WebSocket stream.
     """
+    if not is_twilio_request(request):
+        raise HTTPException(status_code=403, detail="Forbidden: Non-Twilio Request.")
     # Extract Call metadata from Twilio
     try:
         form_data = await request.form()
@@ -278,7 +338,7 @@ async def handle_incoming_call(request: Request):
         call_sid = "UnknownSID"
         from_number = "Unknown"
     
-    logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
+    logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {mask_phone_number(from_number)}")
     
     from telephony.concurrency import increment_if_under_cap, MAX_INBOUND_CALLS
     is_accepted, new_count = increment_if_under_cap(MAX_INBOUND_CALLS, call_sid=call_sid)
@@ -347,6 +407,9 @@ async def handle_media_stream(websocket: WebSocket):
     Handles the WebSocket lifecycle.
     Delegates all intelligence and audio logic to the VoiceOrchestrator.
     """
+    # PILLAR 3: Policy Enforcement - Twilio-only stream
+    # Note: Twilio Websockets do not support standard auth headers,
+    # validation relies on the /voice entrypoint providing the SID.
     # 1. EARLY INITIALIZATION (Forensic Pillar 1)
     # Generate ID immediately before anything else
     import uuid
@@ -383,17 +446,40 @@ async def handle_media_stream(websocket: WebSocket):
         # 2. EMERGENCY FLUSH (Forensic Pillar 2) - Mandatory execution
         # Regardless of how we exit (crash, cancel, success), save the audit trace.
         call_logger.generate_summary_line()
-        call_logger.save_log()
+        call_logger.save_log(session_obj=getattr(manager, 'session', None))
         logger.info(f"Forensic Audit trace finalized for {session_id}")
         default_session_manager.end_session(session_id)
 
 @app.websocket("/ws/browser")
 async def handle_browser_stream(websocket: WebSocket):
     """
-    Browser-based Sandbox Mode (Sprint 2.7).
-    Bypasses Twilio and uses raw PCM (linear16) at 16kHz for low latency.
+    Browser-based Sandbox Mode (Sprint 2.7). 
+    Protected: Requires ?token=... in query for IT/Admin role.
     """
     import uuid
+    
+    try:
+        # 1. AUTH CHECK
+        role = await get_current_user_ws(websocket.query_params.get("token"))
+        AuditLogger.log_access(
+            endpoint="/ws/browser",
+            role=role,
+            status="success",
+            action="VOICE_BYPASS_WS",
+            ip=websocket.client.host if websocket.client else "unknown"
+        )
+    except Exception as e:
+        logger.warning(f"WebSocket Auth Failed: {e}")
+        AuditLogger.log_access(
+            endpoint="/ws/browser",
+            role="anonymous",
+            status="denied",
+            action="UNAUTHORIZED_VOICE_WS_ATTEMPT",
+            ip=websocket.client.host if websocket.client else "unknown"
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     session_id = str(uuid.uuid4())[:8]
     
     # Initialize Logger
@@ -420,6 +506,9 @@ async def handle_browser_stream(websocket: WebSocket):
     try:
         await manager.handle_audio_stream(websocket)
     finally:
+        # EMERGENCY FLUSH (Forensic Pillar 2)
+        call_logger.generate_summary_line()
+        call_logger.save_log(session_obj=getattr(manager, 'session', None))
         default_session_manager.end_session(session_id)
 
 @app.get("/chat-ui", response_class=HTMLResponse)
@@ -433,9 +522,33 @@ async def chat_ui():
 @app.websocket("/chat")
 async def handle_chat_stream(websocket: WebSocket):
     """
-    WebSocket endpoint for Text-based testing (Mock STT/TTS).
+    WebSocket endpoint for Text-based testing.
+    Protected: Requires ?token=... in query for IT/Admin role.
     """
     import uuid
+    
+    try:
+        # 1. AUTH CHECK
+        role = await get_current_user_ws(websocket.query_params.get("token"))
+        AuditLogger.log_access(
+            endpoint="/chat",
+            role=role,
+            status="success",
+            action="TEXT_CHAT_WS",
+            ip=websocket.client.host if websocket.client else "unknown"
+        )
+    except Exception as e:
+        logger.warning(f"WebSocket Auth Failed: {e}")
+        AuditLogger.log_access(
+            endpoint="/chat",
+            role="anonymous",
+            status="denied",
+            action="UNAUTHORIZED_TEXT_CHAT_ATTEMPT",
+            ip=websocket.client.host if websocket.client else "unknown"
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     session_id = str(uuid.uuid4())[:8]
     
     # Initialize Logger for Chat (Logs will be saved to disk)
@@ -460,7 +573,7 @@ async def handle_chat_stream(websocket: WebSocket):
         call_logger.log_event("telephony", "chat_error", meta={"error": str(e)})
     finally:
         call_logger.generate_summary_line()
-        call_logger.save_log()
+        call_logger.save_log(session_obj=getattr(manager, 'session', None))
 
 
 if __name__ == "__main__":

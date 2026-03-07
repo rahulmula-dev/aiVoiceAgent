@@ -102,7 +102,8 @@ class SessionManager:
         if not session:
             session = Session(session_id=session_id, call_id=call_id, caller_number=caller_number)
             self.save_session(session)
-            logger.info(f"Session created: {session_id} (Call: {call_id}, From: {caller_number}) [Redis: {self.use_redis}]")
+            from agent_logging import mask_phone_number
+            logger.info(f"Session created: {session_id} (Call: {call_id}, From: {mask_phone_number(caller_number)}) [Redis: {self.use_redis}]")
         return session
 
     def get_session(self, session_id: str) -> Optional[Session]:

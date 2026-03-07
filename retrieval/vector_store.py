@@ -87,10 +87,10 @@ class KnowledgeBase(KnowledgeBaseEngine):
     def search(self, query, call_logger=None, top_k=3, trace_id=None):
         """
         Search with strict Safety (Task 2.2) and Confidence (Task 2.3) gates.
-        Returns: (context_text, top_confidence_score)
+        Returns: (context_text, top_confidence_score, topic, kb_version, chunk_ids)
         """
         if not self.index:
-            return "", 0.0, "General"
+            return "", 0.0, "General", "unknown", []
 
         # PRD §5 RETRY LOOP: 2 attempts, ≤300ms each
         MAX_ATTEMPTS = 2
@@ -140,11 +140,13 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     pass  # No sleep: search() runs in a sync thread, retry is immediate
                 else:
                     logger.error(f"[RAG] All {MAX_ATTEMPTS} search attempts failed. Last error: {last_error}")
-                    return "", 0.0, "General"
+                    return "", 0.0, "General", "unknown", []
 
         # 3. The "Double-Filter" Loop
         valid_chunks = []
         scores = []
+        chunk_ids = []
+        kb_versions = set()
         matches = results.get('matches', [])
 
         for match in matches:
@@ -178,9 +180,16 @@ class KnowledgeBase(KnowledgeBaseEngine):
             if text:
                 valid_chunks.append(text)
                 scores.append(score)
+                chunk_ids.append(metadata.get('chunk_id', 'unknown'))
+                if "kb_version_id" in metadata:
+                    kb_versions.add(metadata.get('kb_version_id'))
 
         # 4. Final Logs & Return
         top_score = 0.0
+        final_kb_version = "unknown"
+        if kb_versions:
+            final_kb_version = list(kb_versions)[0] # Take first version found in chunks
+            
         if scores:
             top_score = max(scores)
             
@@ -207,6 +216,6 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 call_logger.log_event("retrieval", "rag_search_complete",
                                      meta={"matches": 0, "top_score": 0},
                                      trace_id=trace_id)
-            return "LOW_CONFIDENCE_FALLBACK", 0.0, "General"
+            return "LOW_CONFIDENCE_FALLBACK", 0.0, "General", "unknown", []
 
-        return "\n\n".join(valid_chunks), top_score, rag_topic
+        return "\n\n".join(valid_chunks), top_score, rag_topic, final_kb_version, chunk_ids

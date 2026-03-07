@@ -4,6 +4,7 @@ import json
 import os
 import datetime
 import httpx
+import re
 from typing import Optional, Dict
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 
@@ -114,7 +115,9 @@ class CRMClient(CRMEngine):
                 raise CRMConnectionError(f"Server Error {response.status_code}")
             
             if response.status_code not in [200, 201]:
-                logger.error(f"[CRM] Failed to log call: {response.text}")
+                # PILLAR 3: Redact PII from API error responses (MEDIUM-P3-02)
+                err_text = re.sub(r'\+?\d{7,15}', '[REDACTED]', response.text)
+                logger.error(f"[CRM] Failed to log call: {err_text}")
                 return None
                 
             data = response.json()
@@ -129,7 +132,7 @@ class CRMClient(CRMEngine):
         except httpx.RequestError as e:
             raise CRMConnectionError(f"Connection Failed: {e}")
 
-    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None):
+    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None, session_obj=None):
         """
         Creates a ticket in LeadSquared for the interaction.
         Arguments:
@@ -137,6 +140,7 @@ class CRMClient(CRMEngine):
                            OR the session ID if the CRM accepts external IDs.
                            (Based on "CALL_ID_HERE", it's likely the CRM internal ID).
             structured_turns (list, optional): S4-11 metadata.
+            session_obj (Session, optional): Full session context for enrichment.
         """
         # 1. IDEMPOTENCY CHECK
         idempotency_key = f"{call_id}:{summary}" if call_id else None
@@ -177,10 +181,15 @@ class CRMClient(CRMEngine):
         }
         
         try:
-            # 2. ATTEMPT CREATION WITH RETRY LOGIC
-            ticket_id = await self._send_request_safe("tickets", ticket_data)
+            # 2. ATTEMPT CREATION WITH RETRY LOGIC (Pillar 2: Reliability)
+            # Use call_id as a natural idempotency key candidate for the CRM
+            ticket_id = await self._send_request_safe(
+                endpoint="tickets", 
+                data=ticket_data, 
+                idempotency_key=idempotency_key
+            )
             
-            # Success: Cache the ID
+            # Success: Cache the ID (RAM-only, reconciler uses DLQ id for persistence)
             if idempotency_key:
                 self.processed_calls[idempotency_key] = ticket_id
                 
@@ -200,6 +209,7 @@ class CRMClient(CRMEngine):
         except Exception as e:
             # 3. DEAD LETTER QUEUE (Persistence)
             logger.error(f"[CRM] All retries failed. saving to DLQ. Error: {e}")
+            # The entry_id (UUID) in the DLQ will become the PERMANENT idempotency key for this ticket
             self._save_to_dlq(ticket_data, str(e))
             return {"status": "queued", "ticket_id": "DLQ-SAVED", "message": "Saved to Dead Letter Queue"}
 
@@ -210,21 +220,28 @@ class CRMClient(CRMEngine):
         retry=retry_if_exception_type(CRMConnectionError),
         before_sleep=before_sleep_log(logger, logging.WARNING)
     )
-    async def _send_request_safe(self, endpoint, data):
+    async def _send_request_safe(self, endpoint, data, idempotency_key: str = None):
         """
         Internal method that performs the actual API call.
+        PRD: Requires X-Idempotency-Key support to prevent duplicate tickets.
         """
         url = f"{self.base_url}/{endpoint}"
         
+        headers = dict(self.headers)
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
+        
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(url, headers=self.headers, json=data, timeout=5.0)
+                response = await client.post(url, headers=headers, json=data, timeout=5.0)
                 
             if response.status_code >= 500:
                 raise CRMConnectionError(f"Server Error {response.status_code}")
                 
             if response.status_code not in [200, 201]:
-                error_msg = f"API Error {response.status_code}: {response.text}"
+                # PILLAR 3: Redact PII from API error responses (MEDIUM-P3-02)
+                err_text = re.sub(r'\+?\d{7,15}', '[REDACTED]', response.text)
+                error_msg = f"API Error {response.status_code}: {err_text}"
                 logger.error(error_msg)
                 raise CRMConnectionError(error_msg)
                 
@@ -236,8 +253,15 @@ class CRMClient(CRMEngine):
             raise CRMConnectionError(f"Network Error: {e}")
 
     def _save_to_dlq(self, payload, error_msg):
+        """
+        PRD Section 5: Robust Failover Queue.
+        1. PERSIST LOCALLY: Prevents data loss on pod restart/S3 failure.
+        2. UPLOAD TO S3: ca-central-1 (Durable long-term recovery).
+        """
         import uuid
         entry_id = str(uuid.uuid4())
+        
+        # Consistent status marker required by PRD
         entry = {
             "ticket_id": entry_id,
             "created_at": datetime.datetime.now().isoformat(),
@@ -246,15 +270,40 @@ class CRMClient(CRMEngine):
             "status": "Pending CRM Sync",
             "retry_count": 0
         }
+        
+        # 1. LOCAL PERSISTENCE FIRST (Pillar 2: Reliability)
+        # NOTE: For true crash-resilience in K8s, logs/ must be a PersistentVolume.
+        # If logs/ is ephemeral, data is lost on pod restart.
+        dlq_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "crm_dlq")
+        os.makedirs(dlq_dir, exist_ok=True)
+        local_file = os.path.join(dlq_dir, f"{entry_id}.json")
+        
+        try:
+            with open(local_file, "w", encoding="utf-8") as f:
+                json.dump(entry, f, indent=2)
+            logger.info(f"[CRM] DLQ entry saved locally: {local_file}")
+        except Exception as e:
+            # If even local disk fails, we have a major infra issue, but we still try S3
+            logger.critical(f"[CRM] FATAL: Failed to write to local DLQ disk! {e}")
+
+        # 2. ATTEMPT S3 UPLOAD (ca-central-1)
         try:
             self.s3_client.put_object(
                 Bucket=self.s3_bucket,
                 Key=f"dlq_tickets/{entry_id}.json",
                 Body=json.dumps(entry)
             )
-            logger.info(f"[CRM] Payload saved to S3 DLQ (ca-central-1): {entry_id}")
+            logger.info(f"[CRM] Payload synced to S3 DLQ: {entry_id}")
+            
+            # If S3 succeeds, we can safely remove the local "buffer" file
+            # as it is now durable in the ca-central-1 cloud.
+            if os.path.exists(local_file):
+                os.remove(local_file)
+                
         except Exception as e:
-            logger.critical(f"[CRM] CRITICAL: Failed to write to S3 DLQ! Data loss imminent. {e}")
+            # If S3 fails, we do NOT delete the local file. 
+            # The background reconciler will find it later.
+            logger.error(f"[CRM] S3 DLQ Upload Failed. Entry remains stored at {local_file}. Error: {e}")
 
 
 

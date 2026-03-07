@@ -8,6 +8,8 @@ from typing import List, Dict, Any
 # Configure a basic logger for internal CallLogger errors
 logger = std_logging.getLogger("CallLogger")
 
+from .voice_logger import mask_phone_number
+
 class CallLogger:
     """
     Captures the entire lifecycle of a call in a structured JSON format.
@@ -22,19 +24,23 @@ class CallLogger:
         self.reason = "unknown"  # Termination reason: user_hangup, error, timeout, agent_ended
         self.events: List[Dict[str, Any]] = []
         self._summary_written = False  # Guard: ensure summary is only written once
+        self._final_log_written = False  # IMMUTABILITY GUARD
+        
+        # Log directory and files
+        self.log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.events_file = os.path.join(self.log_dir, f"call_{self.call_id}.events.jsonl")
         
         # Log initialization
         self.log_event("orchestrator", "call_logger_initialized", 
                        meta={"agent_version": self.agent_version})
         
-        # PILLAR 3: Ghost File Rule - Ensure disk allocation immediately
-        self.save_log(status="initialized")
+        # PILLAR 3: Ghost File Rule - Removed mid-call/initialization writes for Audit Integrity
+        # save_log(status="initialized") is now removed to preserve immutability.
 
     def _anonymize_number(self, number: str) -> str:
-        """Helper to mask the middle of a phone number for privacy."""
-        if len(number) < 8:
-            return number
-        return number[:3] + "***" + number[-2:]
+        """Helper to mask the phone number using centralized logic (MEDIUM-P3-02)."""
+        return mask_phone_number(number)
 
     def log_event(self, event_type: str, event_name: str, latency_ms: int = None, meta: Dict[str, Any] = None, trace_id: str = None):
         """
@@ -58,6 +64,13 @@ class CallLogger:
             event_entry.update(meta)
         
         self.events.append(event_entry)
+
+        # PRD [HIGH-P3-02]: Append-only event stream for crash resilience
+        try:
+            with open(self.events_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event_entry) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to append to event stream {self.events_file}: {e}")
 
     def _calculate_percentiles(self, latencies: List[int], percentiles: List[float] = None) -> Dict[str, int]:
         """
@@ -167,11 +180,23 @@ class CallLogger:
         except Exception as e:
             logger.error(f"Failed to generate summary line for {self.call_id}: {e}")
 
-    def save_log(self, status: str = "completed"):
+    def save_log(self, status: str = "completed", session_obj: Any = None):
         """
         Writes the final JSON log to the logs/ directory.
+        Compiles all PRD-required top-level metadata.
+        Uses Atomic Write & Final Seal pattern (IMMUTABILITY).
         """
+        if self._final_log_written:
+            logger.debug(f"Final log already sealed for {self.call_id}. Skipping.")
+            return
+
+        # Only seal if status is 'completed' or 'error' (terminal states)
+        if status not in ["completed", "error"]:
+            logger.debug(f"Save suppressed: Immutability requirement prohibits mid-call writes (status: {status})")
+            return
+
         try:
+            self._final_log_written = True
             self.status = status
             
             end_time = datetime.now()
@@ -181,34 +206,98 @@ class CallLogger:
             events_snapshot = list(self.events)
             
             structured_turns = []
-            try:
-                from orchestrator.session_manager import default_session_manager
-                session = default_session_manager.get_session(self.call_id)
-                if session and hasattr(session, 'structured_turns'):
-                    # Convert to dict if they are Pydantic objects, but they are just simple dicts in the implementation
-                    structured_turns = session.structured_turns
-            except Exception as sm_err:
-                logger.debug(f"Could not retrieve structured_turns for log: {sm_err}")
+            if session_obj and hasattr(session_obj, 'structured_turns'):
+                structured_turns = session_obj.structured_turns
             
+            # --- PRD METADATA SATIATION (Forensic Fix) ---
+            kb_version_id = "unknown"
+            chunk_ids = []
+            sentiment = "Neutral"
+            termination_reason = self.reason
+            confidence_scores = []
+            
+            if session_obj:
+                if hasattr(session_obj, 'call_context'):
+                    kb_version_id = session_obj.call_context.kb_version_id or "unknown"
+                    chunk_ids = getattr(session_obj.call_context, 'chunk_ids_used', [])
+                
+                sentiment = getattr(session_obj, 'sentiment_label', "Neutral")
+                termination_reason = getattr(session_obj, 'termination_reason', self.reason)
+                
+                # PRD HIGH-P3-01: Prioritize crash-proof session state for confidence history
+                confidence_scores = getattr(session_obj, 'confidence_scores', [])
+                
+                # FALLBACK LOGIC: If session data is missing or unknown, scrape the events array
+                if not kb_version_id or kb_version_id == "unknown":
+                    v_ids = [e.get("kb_version_id") for e in events_snapshot 
+                            if e.get("type") == "retrieval" and e.get("kb_version_id") and e.get("kb_version_id") != "unknown"]
+                    if v_ids: 
+                        kb_version_id = v_ids[0]
+
+                if not chunk_ids:
+                    chunk_ids = []
+                    for e in events_snapshot:
+                        if e.get("type") == "retrieval":
+                            cid = e.get("top_chunk_id")
+                            if cid and cid not in chunk_ids:
+                                chunk_ids.append(cid)
+
+                if not confidence_scores:
+                    confidence_scores = [e.get("confidence_score") for e in events_snapshot 
+                                        if e.get("type") == "brain" and "confidence_score" in e]
+
+            # Latency Metrics Summary
+            def get_lat_stats(e_type, e_name):
+                lats = [e["latency_ms"] for e in events_snapshot 
+                        if e.get("type") == e_type and e.get("event") == e_name and "latency_ms" in e]
+                return self._calculate_percentiles(lats)
+
             log_data = {
                 "call_id": self.call_id,
+                "kb_version_id": kb_version_id,
+                "chunk_ids": chunk_ids,
+                "confidence_scores": confidence_scores,
+                "sentiment_label": sentiment,
+                "termination_reason": termination_reason,
+                "latency_metrics": {
+                    "llm": get_lat_stats("orchestrator", "llm_response_start"),
+                    "stt": get_lat_stats("stt", "user_transcript_final"),
+                    "rag": get_lat_stats("retrieval", "rag_search_latency"),
+                    "tts": get_lat_stats("tts", "audio_stream_start")
+                },
+                "caller_number": self.caller_number,
                 "start_time": self.start_time.isoformat(),
                 "end_time": end_time.isoformat(),
                 "duration_seconds": duration,
-                "caller_number": self.caller_number,
                 "status": self.status,
                 "structured_turns": structured_turns,
                 "events": events_snapshot
             }
             
-            # Write to logs/call_{id}.json
-            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
-            os.makedirs(log_dir, exist_ok=True)
-            log_file = os.path.join(log_dir, f"call_{self.call_id}.json")
-            
-            with open(log_file, "w", encoding="utf-8") as f:
+            # File path for the final sealed log
+            log_file = os.path.join(self.log_dir, f"call_{self.call_id}.json")
+
+            # Atomic Write Pattern: Write to temp, then rename
+            temp_file = log_file + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(log_data, f, indent=2)
             
-            logger.info(f"Call log saved: {log_file}")
+            # Atomic rename (Post-hoc seal)
+            if os.path.exists(log_file):
+                os.remove(log_file) # Should not exist due to single-write rule
+            os.rename(temp_file, log_file)
+            
+            logger.info(f"Call log sealed and saved: {log_file}")
+
+            # Optional: Remove the event stream if the final log is successfully sealed
+            try:
+                if os.path.exists(self.events_file):
+                    os.remove(self.events_file)
+            except Exception as clean_err:
+                 logger.debug(f"Could not remove event stream: {clean_err}")
+
+        except Exception as e:
+            self._final_log_written = False # Reset flag if write fails so we can retry during cleanup
+            logger.error(f"Failed to save call log for {self.call_id}: {e}")
         except Exception as e:
             logger.error(f"Failed to save call log for {self.call_id}: {e}")

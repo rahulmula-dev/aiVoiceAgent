@@ -131,7 +131,8 @@ class VoiceOrchestrator:
             sentiment="Negative",
             call_logger=self.call_logger,
             call_id=call_id,
-            title="System Alert: STT Listener Failure"
+            title="System Alert: STT Listener Failure",
+            session_obj=self.session
         ))
 
     async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
@@ -214,6 +215,7 @@ class VoiceOrchestrator:
                         call_logger=self.call_logger,
                         call_id=call_id,
                         title=f"Language Policy Strike {self.language_strike_count}",
+                        session_obj=self.session
                     )
                 )
                                              
@@ -330,7 +332,8 @@ class VoiceOrchestrator:
                             sentiment="SECURITY_ALERT",
                             call_logger=self.call_logger,
                             call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "system_gen"),
-                            title=f"Policy: Language Barrier Strike {self.language_strike_count}"
+                            title=f"Policy: Language Barrier Strike {self.language_strike_count}",
+                            session_obj=self.session
                         ))
                         
                         self.last_refusal_time = current_time
@@ -492,6 +495,7 @@ class VoiceOrchestrator:
                         call_logger=self.call_logger,
                         call_id=call_id,
                         title=f"Language Policy Strike {self.language_strike_count}",
+                        session_obj=self.session
                     )
                 )
                 
@@ -505,13 +509,15 @@ class VoiceOrchestrator:
                 # High-sentiment / angry caller path: trigger escalation script and high-priority CRM ticket
                 refusal_text = PRDScripts.ESCALATION
                 if self.session:
+                    self.session.sentiment_label = "Negative"
                     self._create_task_with_log(self.crm.create_ticket(
                         transcript=text,
                         summary="High Sentiment Alert: Angry Caller",
                         sentiment="Negative",
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or self.session.session_id,
-                        title="High Sentiment Alert: Angry Caller"
+                        title="High Sentiment Alert: Angry Caller",
+                        session_obj=self.session
                     ))
             else:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
@@ -524,7 +530,8 @@ class VoiceOrchestrator:
                     sentiment="SECURITY_ALERT" if "SENSITIVE" in intent else "Neutral",
                     call_logger=self.call_logger,
                     call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
-                    title=f"Policy Refusal: {intent}"
+                    title=f"Policy Refusal: {intent}",
+                    session_obj=self.session
                 ))
 
             # 🟢 S4 Hardening: Hard LLM Bypass (Policy Violation)
@@ -553,8 +560,7 @@ class VoiceOrchestrator:
             logger.debug(f">>> BARGE-IN DETECTED: state={current_state}, speaking={is_speaking}")
             
             if self.call_logger:
-                # Checkpoint: Save logs immediately to prevent data loss
-                self.call_logger.save_log(status="in-progress")
+                # [HIGH-P3-02]: Removed mid-call save_log to preserve immutability. Event stream handles crash resilience.
                 self.call_logger.log_event("orchestrator", "user_interruption", meta={"is_speaking": is_speaking})
 
             # CRM Interaction Note for every barge-in / interruption
@@ -565,7 +571,8 @@ class VoiceOrchestrator:
                     sentiment="Neutral",
                     call_logger=self.call_logger,
                     call_id=self.session.crm_call_id or self.session.session_id,
-                    title="Interaction Note: Barge-in"
+                    title="Interaction Note: Barge-in",
+                    session_obj=self.session
                 ))
             
             self.response_task.cancel()
@@ -634,7 +641,7 @@ class VoiceOrchestrator:
         logger.info(f"Barge-in detected. Running quick RAG to ground response...")
         context_text = ""
         try:
-            rag_result, rag_score, rag_topic = await asyncio.wait_for(
+            rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
                 asyncio.to_thread(self.brain.kb.search, caller_input, self.call_logger, 3, trace_id),
                 timeout=3.0
             )
@@ -655,12 +662,23 @@ class VoiceOrchestrator:
             logger.warning(f"RAG failed during barge-in: {e}")
 
         # STEP C — Classify + Respond (Call Brain)
-        classification, response, is_multi_step, topic = await self.brain.generate_with_classification(
+        classification, response, is_multi_step, topic, kb_v_brain, c_ids_brain = await self.brain.generate_with_classification(
             session=self.session,
             caller_input=caller_input,
             context_text=context_text,
             trace_id=trace_id
         )
+        
+        # Aggregate any metadata from barge-in classification too
+        if self.session:
+            if kb_v and kb_v != "unknown" and not self.session.call_context.kb_version_id:
+                self.session.call_context.kb_version_id = kb_v
+            if c_ids:
+                for cid in c_ids:
+                    if cid and cid != "unknown" and cid not in self.session.call_context.chunk_ids_used:
+                        self.session.call_context.chunk_ids_used.append(cid)
+            if rag_score > 0:
+                self.session.confidence_scores.append(rag_score)
 
         # STEP D — Update Interrupted Turn
         if classification == "NEW_TOPIC" and prev_turn:
@@ -790,15 +808,17 @@ class VoiceOrchestrator:
 
             # 2. Record CRM ticket asynchronously (Pillar 3 Forensic Pillar)
             from datetime import datetime
+            from agent_logging import mask_phone_number
             timestamp = datetime.now().isoformat()
-            summary = f"Caller number: {self._early_caller}, reason = OVER_CAPACITY, timestamp: {timestamp}"
+            summary = f"Caller number: {mask_phone_number(self._early_caller)}, reason = OVER_CAPACITY, timestamp: {timestamp}"
             
             self._create_task_with_log(self.crm.create_ticket(
                 transcript="Call rejected inside WebSocket pipeline due to hard 30-call concurrency limit.",
                 summary=summary,
                 sentiment="Negative",
                 call_id=self._early_sid,
-                title="OVER_CAPACITY | Voice Agent Safety Gate"
+                title="OVER_CAPACITY | Voice Agent Safety Gate",
+                session_obj=getattr(self, 'session', None)
             ))
 
             # 3. Handle state transition and fallback audio
@@ -1238,6 +1258,18 @@ class VoiceOrchestrator:
                         prefetched_context_task=prefetched_task,
                         degraded_mode=self._latency_alert_emitted
                     ):
+                        if sentence and isinstance(sentence, tuple):
+                             # Handle refusal error payload (text, meta)
+                             sentence, error_meta = sentence
+                             if "error" in error_meta:
+                                 logger.debug(f"[LOG] Refusal reason: {error_meta.get('error')}")
+
+                        # Update session metrics from RAG search (tracked via events)
+                        if self.session and metadata:
+                             rag_score = metadata.get("rag_score", 0.0)
+                             if rag_score > 0:
+                                 # Cumulative score list for forensic analysis (crash-protection)
+                                 self.session.confidence_scores.append(rag_score)
                         # Invalidate after first usage in this turn
                         if hasattr(self.session, 'prefetched_context_task'):
                             self.session.prefetched_context_task = None
@@ -1259,12 +1291,8 @@ class VoiceOrchestrator:
                         self.session.touch()
                         self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                         
-                        context = CallContext(
-                            session_id=self.session.session_id,
-                            caller_number=caller_num,
-                            start_time=self.session.start_time.timestamp()
-                        )
-                        
+                        # Perform safety check (Response Policy) before streaming
+                        context = self.session.call_context
                         is_safe = self.policy.validate_response(context, sentence)
                         
                         # Dynamically update the turn's topic from RAG metadata
@@ -1325,7 +1353,8 @@ class VoiceOrchestrator:
                                 sentiment="QUALITY_FAILURE",
                                 call_logger=self.call_logger,
                                 call_id=self.session.crm_call_id or self.session.session_id if self.session else (trace_id or "quality_check"),
-                                title="Quality Assurance Failure"
+                                title="Quality Assurance Failure",
+                                session_obj=self.session
                             ))
                             break
                 
@@ -1369,7 +1398,8 @@ class VoiceOrchestrator:
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
             if self.call_logger:
-                self.call_logger.save_log(status="in-progress")
+                # [HIGH-P3-02]: Mid-call writes removed. Event stream (JSONL) is the per-turn source of truth.
+                pass
             
             # CRM Background Task
             if not is_greeting:
@@ -1378,6 +1408,8 @@ class VoiceOrchestrator:
                 if Brain.is_kb_refusal(full_ai_text):
                     ticket_sentiment = "ESCALATION"
                     ticket_summary = f"KB Miss - Escalation Required: {text}"
+                    if self.session:
+                        self.session.sentiment_label = "Negative" # Escalate sentiment on KB miss
 
                 self._create_task_with_log(self.crm.create_ticket(
                     transcript=text,
@@ -1385,7 +1417,8 @@ class VoiceOrchestrator:
                     sentiment=ticket_sentiment,
                     call_logger=self.call_logger,
                     call_id=self.session.crm_call_id or self.session.session_id if self.session else "unknown_context",
-                    title=f"Support Request: {ticket_sentiment}"
+                    title=f"Support Request: {ticket_sentiment}",
+                    session_obj=self.session
                 ))
             
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
@@ -1550,7 +1583,8 @@ class VoiceOrchestrator:
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
                         title=f"Completed Session Log ({reason})",
-                        structured_turns=self.session.structured_turns
+                        structured_turns=self.session.structured_turns,
+                        session_obj=self.session
                     )
                 elif self.session:
                     logger.debug("Cleanup: Logging early exit (no audio) to CRM")
@@ -1563,7 +1597,8 @@ class VoiceOrchestrator:
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
                         title="Abandoned Setup/No Audio",
-                        structured_turns=self.session.structured_turns
+                        structured_turns=self.session.structured_turns,
+                        session_obj=self.session
                     )
                 else:
                     logger.debug("Cleanup: Logging system error (no session) to CRM")
@@ -1574,7 +1609,8 @@ class VoiceOrchestrator:
                         call_logger=self.call_logger,
                         call_id=sid,
                         title="System_Error",
-                        structured_turns=None
+                        structured_turns=None,
+                        session_obj=self.session
                     )
             except Exception as crm_ex:
                 # [DLQ] CRM is unavailable. Log to stderr so the ticket is not silently lost.
@@ -1594,7 +1630,7 @@ class VoiceOrchestrator:
                 if self.session and self.session.termination_reason:
                     termination_reason = self.session.termination_reason
                 self.call_logger.generate_summary_line(status="completed", reason=termination_reason)
-                self.call_logger.save_log(status="completed")
+                self.call_logger.save_log(status="completed", session_obj=self.session)
                 
             # 3. End and remove session from manager (Pillar 2)
             if self.session:

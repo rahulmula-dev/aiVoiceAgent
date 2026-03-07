@@ -88,15 +88,46 @@ def setup_global_logging():
 # Initialize global logging automatically when this module is imported
 setup_global_logging()
 
+def mask_phone_number(number: str) -> str:
+    """
+    Standardizes phonemask across the system (MEDIUM-P3-02).
+    Keeps the country code prefix and the last 4 digits.
+    Example: +14035551234 -> +1******1234
+    Example: +447912345678 -> +44******5678
+    """
+    if not number or number in ["N/A", "Unknown", "unknown"]:
+        return number
+    
+    # Strip non-digit characters for length calculation (except '+')
+    digits_only = "".join(c for c in number if c.isdigit())
+    if len(digits_only) <= 4:
+        return "****"
+    
+    # E.164 logic: prefix is typically everything beyond the last 10 digits
+    # (assuming a 10-digit national number structure for most regions)
+    prefix_len = max(1, len(digits_only) - 10)
+    
+    prefix = ""
+    if number.startswith("+"):
+        prefix = "+" + digits_only[:prefix_len]
+        suffix = digits_only[-4:]
+    else:
+        prefix = digits_only[:prefix_len]
+        suffix = digits_only[-4:]
+        
+    return f"{prefix}******{suffix}"
+
 def bind_call_context(sid, phone):
     """
     Binds the Call SID and Phone Number to the current async context.
     Call this at the start of every Twilio WebSocket handshake.
     """
+    # PILLAR 3: Anonymize globally (MEDIUM-P3-02)
+    masked_phone = mask_phone_number(phone)
     ctx_call_sid.set(sid)
-    ctx_phone_number.set(phone)
-    # This info log will now automatically show the SID and Phone!
-    logging.getLogger("AuditLogging").info(f"Context bound for new call.")
+    ctx_phone_number.set(masked_phone)
+    # This info log will now automatically show the SID and Masked Phone!
+    logging.getLogger("AuditLogging").info(f"Context bound for new call (SID: {sid}).")
 
 def log_conversation_turn(session_id, role, text):
     """

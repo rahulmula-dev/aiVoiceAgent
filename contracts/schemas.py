@@ -51,6 +51,7 @@ class CallContext(BaseModel):
     study_mode: Optional[str] = None
     campus: Optional[str] = None
     retrieved_chunks_snapshot: List[str] = Field(default_factory=list)
+    chunk_ids_used: List[str] = Field(default_factory=list, description="IDs of all pieces of KB knowledge used in this call")
 
 class EscalationEvent(BaseModel):
     """

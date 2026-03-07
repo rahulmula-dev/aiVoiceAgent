@@ -111,7 +111,7 @@ class Brain(LLMEngine):
     async def generate_with_classification(self, session, caller_input: str, context_text: str = None, trace_id: str = None):
         """
         Special method for barge-in handling (CRITICAL-P2-05). 
-        Returns (classification, response, is_multi_step, topic).
+        Returns (classification, response, is_multi_step, topic, kb_version, chunk_ids).
         Uses optional RAG context to ground responses.
         """
         import json
@@ -167,13 +167,15 @@ class Brain(LLMEngine):
                 data.get("classification", "AMBIGUOUS"),
                 data.get("response", "I'm listening, please go ahead."),
                 data.get("is_multi_step", False),
-                data.get("topic", "General")
+                data.get("topic", "General"),
+                "unknown",
+                []
             )
                 
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"Barge-in classification failed or timed out ({BARGE_IN_TIMEOUT}s): {e}")
             # 🟢 GRACEFUL FALLBACK (Safe Default)
-            return "AMBIGUOUS", "I'm listening, please go ahead.", False, "Barge-in"
+            return "AMBIGUOUS", "I'm listening, please go ahead.", False, "Barge-in", "unknown", []
 
     async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None, degraded_mode=False):
         """
@@ -197,7 +199,7 @@ class Brain(LLMEngine):
 
                     if prefetched_context_task:
                         logger.info(f"Using pre-fetched RAG context for '{text}'")
-                        context_text, rag_score, rag_topic = await prefetched_context_task
+                        context_text, rag_score, rag_topic, kb_v, c_ids = await prefetched_context_task
                     else:
                         # Context-Aware Follow-Ups (Story S4-9)
                         # Augment short follow-up questions with known context for better vector matching
@@ -210,8 +212,8 @@ class Brain(LLMEngine):
                                 search_query = f"{text} (Context: {' '.join(tags)})"
                                 logger.info(f"Augmented RAG Query: '{search_query}'")
 
-                        # KB returns (content, top_score, category)
-                        context_text, rag_score, rag_topic = await asyncio.wait_for(
+                        # KB returns (content, top_score, category, kb_version, chunk_ids)
+                        context_text, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
                             asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
                             timeout=RAG_TIMEOUT
                         )
@@ -225,6 +227,8 @@ class Brain(LLMEngine):
                     context_text = "No specific documents found due to timeout."
                     rag_score = 0.0
                     rag_topic = "General"
+                    kb_v = "unknown"
+                    c_ids = []
                     rag_latency = RAG_TIMEOUT
 
                     # CRM Artifact: System Alert for Knowledge Base Timeout
@@ -245,6 +249,8 @@ class Brain(LLMEngine):
                     context_text = "No specific documents found due to an internal knowledge base error."
                     rag_score = 0.0
                     rag_topic = "General"
+                    kb_v = "unknown"
+                    c_ids = []
                     rag_latency = RAG_TIMEOUT
 
                     # CRM Artifact: System Alert for Knowledge Base Failure
@@ -275,11 +281,21 @@ class Brain(LLMEngine):
             
             # Logging accuracy fix: 'kb_hit' means GOOD hit, not just ANY hit
             
-            if not context_text:
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
                 rag_topic = "General"
+                kb_v = "unknown"
+                c_ids = []
+            
+            # --- AGGREGATE METADATA FOR CALL LOG ---
+            if call_context:
+                if not call_context.kb_version_id and kb_v and kb_v != "unknown":
+                    call_context.kb_version_id = kb_v
+                # Add unique chunk IDs to the overall session list
+                for cid in c_ids:
+                    if cid and cid != "unknown" and cid not in call_context.chunk_ids_used:
+                        call_context.chunk_ids_used.append(cid)
             
             logger.info(f"RAG Context for '{text}' (Score: {rag_score:.2f}): {context_text[:200]}...")
 

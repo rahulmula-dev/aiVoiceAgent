@@ -44,6 +44,8 @@ class Session(BaseModel):
 
     # Resilience Tracking (Pillar 2 & 3)
     termination_reason: str = "normal"
+    sentiment_label: str = "Neutral"
+    confidence_scores: List[float] = []
 
     # Governance: persist language warnings across the call (Phase 1 English-only)
     language_warning_count: int = 0
