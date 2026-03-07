@@ -64,6 +64,21 @@ class FeatureConfig:
         return val
 
     @property
+    def primary_model(self) -> str:
+        return os.getenv("PRIMARY_LLM_MODEL", "gemini-2.5-flash")
+
+    @property
+    def fast_model(self) -> str:
+        return os.getenv("FAST_LLM_MODEL", "gemini-1.5-flash-8b")
+
+    @property
+    def is_degradation_mode(self) -> bool:
+        """
+        If True, the system operates in 'Fast Response' mode, switching to lightweight models.
+        """
+        return os.getenv("OV_DEGRADATION_MODE", "false").lower() == "true"
+
+    @property
     def override_retrieval(self) -> bool:
         """
         If True, disables RAG retrieval (Brain acts as pure LLM).

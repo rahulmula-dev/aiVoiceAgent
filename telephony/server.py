@@ -12,12 +12,20 @@ from orchestrator.mocks import MockSTT, MockTTS
 from orchestrator.session_manager import default_session_manager
 from stt.transcriber import Transcriber
 from tts.synthesizer import Synthesizer
+from contracts.policy import PRDScripts
 from dotenv import load_dotenv
 
-load_dotenv()
+# Health Check Dependencies
+from crm.client import CRMClient
+from retrieval.vector_store import KnowledgeBase
+from telephony.concurrency import check_redis_health, MAX_INBOUND_CALLS
 
 # Configure logging
 logger = logging.getLogger("Server")
+
+# Initialize global health checkers
+_crm_checker = CRMClient()
+_kb_checker = KnowledgeBase()
 
 from agent_logging import bind_call_context, CallLogger
 
@@ -50,16 +58,66 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     """
-    Readiness Probe.
-    Checks if critical dependencies (CRM, Transcriber config) are ready.
+    Readiness Probe (K8s/Load Balancer 10-call baseline verification).
+    Performs real-time health checks on all critical dependencies.
+    PRD: CRM failure is NON-CRITICAL (S3 DLQ handles failover).
     """
-    # MOCK DEPENDENCY CHECK (Expand this as needed)
-    # 1. Check CRM API Reachability (Simulated)
-    # 2. Check Deepgram API Key presence
-    if not os.getenv("DEEPGRAM_API_KEY"):
-        return Response(content="Missing DEEPGRAM_API_KEY", status_code=503)
+    import asyncio
+    
+    # Run all health checks in parallel with a 2.0s timeout (Pillar 2: Latency)
+    try:
+        # Wrap everything in a hard timeout to prevent /readyz from hanging
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                _crm_checker.check_health(),
+                _kb_checker.check_health(),
+                asyncio.to_thread(check_redis_health),
+                return_exceptions=True
+            ),
+            timeout=2.0
+        )
         
-    return {"status": "ready", "services": {"crm": "mock_connected", "stt": "configured"}}
+        crm_ok = results[0] if not isinstance(results[0], Exception) else False
+        kb_ok = results[1] if not isinstance(results[1], Exception) else False
+        redis_ok = results[2] if not isinstance(results[2], Exception) else False
+        stt_ok = bool(os.getenv("DEEPGRAM_API_KEY"))
+        
+        status_map = {
+            "crm": "connected" if crm_ok else "degraded (DLQ active)",
+            "retrieval": "ready" if kb_ok else "failed",
+            "redis": "connected" if redis_ok else "disconnected",
+            "stt": "configured" if stt_ok else "missing_key"
+        }
+        
+        # PARTIAL DEGRADATION POLICY:
+        # Redis, STT, and KB are required for a baseline "High Quality" call.
+        # CRM is optional because we have robust S3-based DLQ failover.
+        is_ready = all([kb_ok, redis_ok, stt_ok])
+        
+        if not is_ready:
+            logger.warning(f"[HEALTH] Readiness probe failed (CRITICAL): {status_map}")
+            return Response(
+                content=f"Service Unhealthy: {status_map}", 
+                status_code=503,
+                media_type="application/json"
+            )
+            
+        if not crm_ok:
+            logger.warning(f"[HEALTH] Running in DEGRADED mode (CRM unavailable): {status_map}")
+
+        return {
+            "status": "ready" if is_ready else "unhealthy",
+            "mode": "production" if crm_ok else "degraded (logging via DLQ)",
+            "timestamp": datetime.now().isoformat(),
+            "services": status_map
+        }
+        
+    except asyncio.TimeoutError:
+        logger.error("[HEALTH] Readiness probe TIMEOUT after 2.0s")
+        return Response(content="Readiness Check Timeout", status_code=504)
+    except Exception as e:
+        logger.error(f"[HEALTH] Critical failure during readiness check: {e}")
+        return Response(content="Readiness Check Error", status_code=500)
 
 @app.post("/admin/reload-config")
 async def reload_config(x_admin_token: str = Header(...)):
@@ -223,7 +281,7 @@ async def handle_incoming_call(request: Request):
     logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {from_number}")
     
     from telephony.concurrency import increment_if_under_cap, MAX_INBOUND_CALLS
-    is_accepted, new_count = increment_if_under_cap(MAX_INBOUND_CALLS)
+    is_accepted, new_count = increment_if_under_cap(MAX_INBOUND_CALLS, call_sid=call_sid)
     
     if not is_accepted:
         logging.getLogger("Server").warning(f"[Concurrency] SUPER MAX REACHED! Active calls: {new_count}/{MAX_INBOUND_CALLS}. Rejecting SID: {call_sid}")
@@ -246,7 +304,7 @@ async def handle_incoming_call(request: Request):
             title="OVER_CAPACITY | Voice Agent"
         ))
         
-        twiml = '<?xml version="1.0" encoding="UTF-8"?><Response><Say>All our lines are busy at the moment, but I will arrange a callback.</Say><Hangup/></Response>'
+        twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="Polly.Joanna">{PRDScripts.APOLOGY_CAPACITY}</Say><Hangup/></Response>'
         return Response(content=twiml, media_type="application/xml")
 
     logging.getLogger("Server").info(f"[Concurrency] Call connected. Active calls: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
@@ -276,7 +334,7 @@ async def handle_call_status(request: Request):
         
         if status in ["completed", "failed", "busy", "no-answer", "canceled"]:
             from telephony.concurrency import decrement_active_calls, MAX_INBOUND_CALLS
-            new_count = decrement_active_calls()
+            new_count = decrement_active_calls(call_sid=call_sid)
             logging.getLogger("Server").info(f"[Concurrency] Call ended ({status}). Decremented active calls to: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
     except Exception as e:
         logging.getLogger("Server").error(f"Failed to process call-status: {e}")

@@ -22,7 +22,7 @@ async def simulate_direct_webhook(client: httpx.AsyncClient, index: int):
     
     try:
         response = await client.post(LOCAL_WEBHOOK_URL, data=data, timeout=30.0)
-        if "All our agents are currently busy" in response.text:
+        if "All our lines are busy at the moment, but I will arrange a callback." in response.text:
             return "REJECTED", f"🛑 [Call {index:02d}] Server REJECTED capacity (Sent Busy Signal)"
         else:
             return "ACCEPTED", f"🟢 [Call {index:02d}] Server ACCEPTED caller! (Sent Connect Stream)"

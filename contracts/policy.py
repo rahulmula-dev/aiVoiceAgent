@@ -28,7 +28,7 @@ class PRDScripts:
     # Apologies
     APOLOGY_CLARIFICATION = "I didn't quite catch that. Could you please repeat?"
     APOLOGY_OVERLOADED = "I am currently overloaded with requests. Please try again in a few seconds."
-    APOLOGY_CAPACITY = "I am currently at capacity, please try again later."
+    APOLOGY_CAPACITY = "All our lines are busy at the moment, but I will arrange a callback."
     APOLOGY_FATAL = "I am having technical trouble. Please wait while reconnecting or try calling back later. Goodbye."
     APOLOGY_INTERNAL_ERROR = "I am having a moment of silence. Please try again later."
     APOLOGY_STRUCTURAL_UPDATE = "I am currently undergoing a structural update. Check back in a few minutes!"

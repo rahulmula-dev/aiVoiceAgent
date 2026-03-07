@@ -67,15 +67,15 @@ class Transcriber(STTProvider):
                 f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
         except: pass
 
-        # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each (Adapted to 3.0s for physical TLS connection latency)
+        # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each
         MAX_ATTEMPTS = 2
-        ATTEMPT_TIMEOUT = 3.0  # 3000ms
+        ATTEMPT_TIMEOUT = 0.5  # 500ms
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 self.ws = await asyncio.wait_for(
-                    websockets.connect(url, additional_headers=headers),
+                websockets.connect(url, additional_headers=headers),
                     timeout=ATTEMPT_TIMEOUT
                 )
                 logger.info(f"[DEEPGRAM] Connected OK (attempt {attempt}, encoding={self.encoding}, rate={self.sample_rate})")
@@ -100,15 +100,25 @@ class Transcriber(STTProvider):
         return False
 
     async def _listen(self):
-        """Internal loop to process transcription results"""
+        """Internal loop to process transcription results with STT Partial watchdog."""
+        STT_PARTIAL_TIMEOUT = 0.45 # PRD: 450ms ceiling
         try:
-            with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                f.write("DEBUG: Listen Loop Started\n")
-            
-            async for message in self.ws:
-                # Log raw message receipt
-                with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                    f.write(f"RAW MSG: {message}\n")
+            while True:
+                try:
+                    # Pillar 2: Anti-Freeze Watchdog (450ms)
+                    message = await asyncio.wait_for(self.ws.recv(), timeout=STT_PARTIAL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # Watchdog Check: If we sent voice recently but got no transcript, circuit break.
+                    if hasattr(self, '_last_voice_timestamp'):
+                        now = asyncio.get_event_loop().time()
+                        silence_duration = now - self._last_voice_timestamp
+                        
+                        # If we've sent voice in the last 450ms but no response, this is a hang
+                        # We use 0.45s as the PRD ceiling.
+                        if silence_duration > STT_PARTIAL_TIMEOUT and silence_duration < 2.0:
+                            logger.error(f"[CIRCUIT BREAK] STT partial timeout: {silence_duration:.3f}s exceeds {STT_PARTIAL_TIMEOUT}s ceiling.")
+                            raise ConnectionError("STT Partial Timeout Circuit Break")
+                    continue
 
                 data = json.loads(message)
                 
@@ -126,12 +136,11 @@ class Transcriber(STTProvider):
                     detected_lang = data.get("language") # Task 3: Architect Rule - use STT metadata
 
                     if sentence and sentence.strip():
+                        # Mark that we received data to reset any internal watchdog timers
+                        self._last_transcript_time = asyncio.get_event_loop().time()
+                        
                         log_msg = f">>> DG RAW: '{sentence}' (Conf: {conf:.2f}, Final: {is_final}, Lang: {detected_lang})\n"
                         logger.debug(log_msg.strip())
-                        try:
-                            with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                                f.write(log_msg)
-                        except: pass
                     
                     # Process transcripts
                     if len(sentence) > 0:

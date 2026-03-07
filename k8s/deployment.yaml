@@ -51,8 +51,9 @@ spec:
             port: 8000
           initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 2 # Matches /readyz internal timeout
           successThreshold: 1
-          failureThreshold: 3
+          failureThreshold: 2 # Faster recovery on degradation
         livenessProbe:
           httpGet:
             path: /healthz

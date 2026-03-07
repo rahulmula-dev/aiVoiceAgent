@@ -15,18 +15,74 @@ except Exception as e:
     redis_client = None
 
 COUNTER_KEY = "active_inbound_calls"
+ACTIVE_SIDS_KEY = "active_call_sids"
 MAX_INBOUND_CALLS = 30
 TTL_SECONDS = 3600  # 1 hour safety TTL
 
+# Lua script for atomic conditional increment:
+# KEYS[1]: counter key
+# KEYS[2]: set of active SIDs
+# ARGV[1]: call_sid
+# ARGV[2]: max capacity
+# ARGV[3]: TTL
+# Returns: new count if accepted, -1 if rejected (cap), -2 if already counted
+LUA_INCREMENT_IF_UNDER_CAP = """
+if (redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1) then
+    return -2
+end
+
+local current = redis.call('GET', KEYS[1])
+if (current and tonumber(current) >= tonumber(ARGV[2])) then
+    return -1
+else
+    local new = redis.call('INCR', KEYS[1])
+    redis.call('SADD', KEYS[2], ARGV[1])
+    redis.call('EXPIRE', KEYS[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[2], ARGV[3])
+    return new
+end
+"""
+
+# Lua script for atomic SID-based decrement:
+# KEYS[1]: counter key
+# KEYS[2]: set of active SIDs
+# ARGV[1]: call_sid
+# Returns: new count if decremented, -1 if was not in set
+LUA_DECREMENT_ONLY_IF_TRACKED = """
+if (redis.call('SREM', KEYS[2], ARGV[1]) == 1) then
+    local current = redis.call('DECR', KEYS[1])
+    if (tonumber(current) < 0) then
+        redis.call('SET', KEYS[1], 0)
+        return 0
+    end
+    return current
+else
+    return -1
+end
+"""
+
 # Fallback for local testing without redis
 _local_counter = 0
+_local_sids = set()
+
+def check_redis_health() -> bool:
+    """Verifies Redis connectivity for the readiness probe."""
+    if not redis_client:
+        return False
+    try:
+        return redis_client.ping()
+    except Exception as e:
+        logger.warning(f"Redis health check failed: {e}")
+        return False
 
 def reset_active_calls() -> None:
-    global _local_counter
+    global _local_counter, _local_sids
     _local_counter = 0
+    _local_sids = set()
     if redis_client:
         try:
             redis_client.set(COUNTER_KEY, 0)
+            redis_client.delete(ACTIVE_SIDS_KEY)
             logger.info("Active call counter reset to 0 in Redis.")
         except Exception as e:
             logger.error(f"Redis reset error: {e}")
@@ -44,47 +100,55 @@ def get_active_call_count() -> int:
         logger.error(f"Redis get error: {e}")
         return max(0, _local_counter)
 
-def increment_active_calls() -> int:
-    global _local_counter
+def increment_active_calls(call_sid: str = "unknown") -> int:
+    global _local_counter, _local_sids
     if not redis_client:
-        _local_counter += 1
+        if call_sid not in _local_sids:
+            _local_counter += 1
+            _local_sids.add(call_sid)
         return _local_counter
     try:
+        # Best effort standard INCR for legacy non-cap paths
         current = redis_client.incr(COUNTER_KEY)
-        # Set a TTL for safety against zombie increments
+        redis_client.sadd(ACTIVE_SIDS_KEY, call_sid)
         redis_client.expire(COUNTER_KEY, TTL_SECONDS)
+        redis_client.expire(ACTIVE_SIDS_KEY, TTL_SECONDS)
         return current
     except Exception as e:
         logger.error(f"Redis incr error: {e}")
         _local_counter += 1
         return _local_counter
 
-def increment_if_under_cap(max_cap: int) -> tuple[bool, int]:
+def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tuple[bool, int]:
     """
     Atomically checks if the counter is under the capacity limit and increments it.
-    Solves the TOCTOU (Time-Of-Check to Time-Of-Use) race condition.
+    Solves the TOCTOU (Time-Of-Check to Time-Of-Use) race condition using Redis Lua.
     Returns: (is_accepted, new_count)
     """
-    global _local_counter
+    global _local_counter, _local_sids
     
-    # Local fallback logic (uses GIL for atomic-like behavior in single process)
     if not redis_client:
+        if call_sid in _local_sids:
+            return True, _local_counter
         if _local_counter >= max_cap:
             return False, _local_counter
         _local_counter += 1
+        _local_sids.add(call_sid)
         return True, _local_counter
         
     try:
-        # Atomic INCR first
-        current = redis_client.incr(COUNTER_KEY)
-        redis_client.expire(COUNTER_KEY, TTL_SECONDS)
+        # Atomic execution of Lua script
+        result = redis_client.eval(LUA_INCREMENT_IF_UNDER_CAP, 2, COUNTER_KEY, ACTIVE_SIDS_KEY, call_sid, max_cap, TTL_SECONDS)
         
-        # If we exceeded the cap, immediately DECR and reject
-        if current > max_cap:
-            redis_client.decr(COUNTER_KEY)
-            return False, current - 1
+        if result == -1:
+            # CAP HIT: Explicitly log for monitoring/metrics
+            logger.warning(f"[METRIC] Concurrency cap hit! Limit: {max_cap}. Rejecting SID: {call_sid}")
+            return False, get_active_call_count()
+        
+        if result == -2:
+            return True, get_active_call_count()
             
-        return True, current
+        return True, int(result)
     except Exception as e:
         logger.error(f"Redis increment_if_under_cap error: {e}")
         # Fallback to local
@@ -93,17 +157,19 @@ def increment_if_under_cap(max_cap: int) -> tuple[bool, int]:
         _local_counter += 1
         return True, _local_counter
 
-def decrement_active_calls() -> int:
-    global _local_counter
+def decrement_active_calls(call_sid: str = "unknown") -> int:
+    global _local_counter, _local_sids
     if not redis_client:
-        _local_counter = max(0, _local_counter - 1)
+        if call_sid in _local_sids:
+            _local_sids.remove(call_sid)
+            _local_counter = max(0, _local_counter - 1)
         return _local_counter
     try:
-        current = redis_client.decr(COUNTER_KEY)
-        if current < 0:
-            redis_client.set(COUNTER_KEY, 0)
-            return 0
-        return current
+        result = redis_client.eval(LUA_DECREMENT_ONLY_IF_TRACKED, 2, COUNTER_KEY, ACTIVE_SIDS_KEY, call_sid)
+        if result == -1:
+            # SID wasn't tracked, ignore decrement to prevent counter leakage
+            return get_active_call_count()
+        return int(result)
     except Exception as e:
         logger.error(f"Redis decr error: {e}")
         _local_counter = max(0, _local_counter - 1)

@@ -1,0 +1,139 @@
+C:\Users\Sushmitha S\Documents\GDclg\ai-voice-agent\orchestrator\brain.py:3: FutureWarning: 
+
+All support for the `google.generativeai` package has ended. It will no longer be receiving 
+updates or bug fixes. Please switch to the `google.genai` package as soon as possible.
+See README for more details:
+
+https://github.com/google-gemini/deprecated-generative-ai-python/blob/main/README.md
+
+  import google.generativeai as genai
+2026-03-07 14:36:21,483 | INFO     | [N/A] [N/A] | SessionManager | Connected to Redis at redis://localhost:6379
+2026-03-07 14:36:21,664 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from creating-client-class.iot-data to creating-client-class.iot-data-plane
+2026-03-07 14:36:21,754 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from before-call.apigateway to before-call.api-gateway
+2026-03-07 14:36:21,758 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from request-created.machinelearning.Predict to request-created.machine-learning.Predict
+2026-03-07 14:36:21,760 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from before-parameter-build.autoscaling.CreateLaunchConfiguration to before-parameter-build.auto-scaling.CreateLaunchConfiguration
+2026-03-07 14:36:21,760 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from before-parameter-build.route53 to before-parameter-build.route-53
+2026-03-07 14:36:21,760 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from request-created.cloudsearchdomain.Search to request-created.cloudsearch-domain.Search
+2026-03-07 14:36:21,766 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from docs.*.autoscaling.CreateLaunchConfiguration.complete-section to docs.*.auto-scaling.CreateLaunchConfiguration.complete-section
+2026-03-07 14:36:21,769 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from before-parameter-build.logs.CreateExportTask to before-parameter-build.cloudwatch-logs.CreateExportTask
+2026-03-07 14:36:21,772 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from docs.*.logs.CreateExportTask.complete-section to docs.*.cloudwatch-logs.CreateExportTask.complete-section
+2026-03-07 14:36:21,773 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from before-parameter-build.cloudsearchdomain.Search to before-parameter-build.cloudsearch-domain.Search
+2026-03-07 14:36:21,773 | DEBUG    | [N/A] [N/A] | botocore.hooks | Changing event name from docs.*.cloudsearchdomain.Search.complete-section to docs.*.cloudsearch-domain.Search.complete-section
+2026-03-07 14:36:21,780 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\endpoints.json
+2026-03-07 14:36:21,807 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\sdk-default-configuration.json
+2026-03-07 14:36:21,807 | DEBUG    | [N/A] [N/A] | botocore.hooks | Event choose-service-name: calling handler <function handle_service_name_alias at 0x00000248174982C0>
+2026-03-07 14:36:21,849 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\s3\2006-03-01\service-2.json.gz
+2026-03-07 14:36:21,854 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\s3\2006-03-01\service-2.sdk-extras.json
+2026-03-07 14:36:21,925 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\s3\2006-03-01\endpoint-rule-set-1.json.gz
+2026-03-07 14:36:21,936 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\partitions.json
+2026-03-07 14:36:21,939 | DEBUG    | [N/A] [N/A] | botocore.hooks | Event creating-client-class.s3: calling handler <function add_generate_presigned_post at 0x0000024817421D00>
+2026-03-07 14:36:21,942 | DEBUG    | [N/A] [N/A] | botocore.hooks | Event creating-client-class.s3: calling handler <function lazy_call.<locals>._handler at 0x0000024817088220>
+2026-03-07 14:36:21,943 | DEBUG    | [N/A] [N/A] | botocore.hooks | Event creating-client-class.s3: calling handler <function add_generate_presigned_url at 0x0000024817421A80>
+2026-03-07 14:36:21,954 | DEBUG    | [N/A] [N/A] | botocore.configprovider | Looking for endpoint for s3 via: environment_service
+2026-03-07 14:36:21,955 | DEBUG    | [N/A] [N/A] | botocore.configprovider | Looking for endpoint for s3 via: environment_global
+2026-03-07 14:36:21,956 | DEBUG    | [N/A] [N/A] | botocore.configprovider | Looking for endpoint for s3 via: config_service
+2026-03-07 14:36:21,956 | DEBUG    | [N/A] [N/A] | botocore.configprovider | Looking for endpoint for s3 via: config_global
+2026-03-07 14:36:21,956 | DEBUG    | [N/A] [N/A] | botocore.configprovider | No configured endpoint found.
+2026-03-07 14:36:21,956 | DEBUG    | [N/A] [N/A] | botocore.endpoint | Setting s3 timeout as (60, 60)
+2026-03-07 14:36:21,967 | DEBUG    | [N/A] [N/A] | botocore.loaders | Loading JSON file: C:\Users\Sushmitha S\AppData\Local\Programs\Python\Python312\Lib\site-packages\botocore\data\_retry.json
+2026-03-07 14:36:21,969 | DEBUG    | [N/A] [N/A] | botocore.client | Registering retry handlers for service: s3
+2026-03-07 14:36:21,970 | DEBUG    | [N/A] [N/A] | botocore.utils | Registering S3 region redirector handler
+2026-03-07 14:36:21,972 | DEBUG    | [N/A] [N/A] | botocore.utils | Registering S3Express Identity Resolver
+2026-03-07 14:36:23,815 | INFO     | [N/A] [N/A] | Retrieval | KnowledgeBase Connected to Index: gd-college
+C:\Users\Sushmitha S\Documents\GDclg\ai-voice-agent\telephony\server.py:37: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+2026-03-07 14:36:23,892 | DEBUG    | [N/A] [N/A] | asyncio | Using proactor: IocpProactor
+INFO:     Started server process [7040]
+INFO:     Waiting for application startup.
+2026-03-07 14:36:23,958 | INFO     | [N/A] [N/A] | SessionManager | Zombie Collector started.
+2026-03-07 14:36:23,969 | INFO     | [N/A] [N/A] | concurrency | Active call counter reset to 0 in Redis.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+2026-03-07 14:37:50,204 | INFO     | [N/A] [N/A] | CallLogger | Call log saved: C:\Users\Sushmitha S\Documents\GDclg\ai-voice-agent\agent_logging\..\logs\call_772ec7d3.json
+2026-03-07 14:37:50,206 | INFO     | [772ec7d3] [browser_dev] | AuditLogging | Context bound for new call.
+INFO:     127.0.0.1:53331 - "WebSocket /ws/browser" [accepted]
+2026-03-07 14:37:50,212 | DEBUG    | [772ec7d3] [browser_dev] | botocore.hooks | Event choose-service-name: calling handler <function handle_service_name_alias at 0x00000248174982C0>
+2026-03-07 14:37:50,217 | DEBUG    | [772ec7d3] [browser_dev] | botocore.hooks | Event creating-client-class.s3: calling handler <function add_generate_presigned_post at 0x0000024817421D00>
+2026-03-07 14:37:50,220 | DEBUG    | [772ec7d3] [browser_dev] | botocore.hooks | Event creating-client-class.s3: calling handler <function lazy_call.<locals>._handler at 0x0000024817088220>
+2026-03-07 14:37:50,222 | DEBUG    | [772ec7d3] [browser_dev] | botocore.hooks | Event creating-client-class.s3: calling handler <function add_generate_presigned_url at 0x0000024817421A80>
+2026-03-07 14:37:50,223 | DEBUG    | [772ec7d3] [browser_dev] | botocore.configprovider | Looking for endpoint for s3 via: environment_service
+2026-03-07 14:37:50,223 | DEBUG    | [772ec7d3] [browser_dev] | botocore.configprovider | Looking for endpoint for s3 via: environment_global
+2026-03-07 14:37:50,227 | DEBUG    | [772ec7d3] [browser_dev] | botocore.configprovider | Looking for endpoint for s3 via: config_service
+2026-03-07 14:37:50,229 | DEBUG    | [772ec7d3] [browser_dev] | botocore.configprovider | Looking for endpoint for s3 via: config_global
+2026-03-07 14:37:50,231 | DEBUG    | [772ec7d3] [browser_dev] | botocore.configprovider | No configured endpoint found.
+2026-03-07 14:37:50,236 | DEBUG    | [772ec7d3] [browser_dev] | botocore.endpoint | Setting s3 timeout as (60, 60)
+2026-03-07 14:37:50,243 | DEBUG    | [772ec7d3] [browser_dev] | botocore.client | Registering retry handlers for service: s3
+2026-03-07 14:37:50,247 | DEBUG    | [772ec7d3] [browser_dev] | botocore.utils | Registering S3 region redirector handler
+2026-03-07 14:37:50,249 | DEBUG    | [772ec7d3] [browser_dev] | botocore.utils | Registering S3Express Identity Resolver
+2026-03-07 14:37:50,253 | INFO     | [772ec7d3] [browser_dev] | Retrieval | KnowledgeBase Connected to Index: gd-college
+2026-03-07 14:37:50,256 | INFO     | [772ec7d3] [browser_dev] | Brain | Brain Init: Primary=gemini-2.5-flash, Fast=gemini-1.5-flash-8b
+2026-03-07 14:37:50,259 | INFO     | [772ec7d3] [browser_dev] | ContextExtractor | Loaded Context Config from config/college_data.json
+2026-03-07 14:37:50,259 | INFO     | [772ec7d3] [browser_dev] | Transcriber | [DEEPGRAM] Connecting: encoding=linear16 rate=16000
+INFO:     connection open
+2026-03-07 14:37:51,745 | INFO     | [772ec7d3] [browser_dev] | Transcriber | [DEEPGRAM] Connected OK (attempt 1, encoding=linear16, rate=16000)
+2026-03-07 14:37:51,804 | INFO     | [772ec7d3] [browser_dev] | SessionManager | Session created: 772ec7d3 (Call: browser_call_1772874470291, From: unknown) [Redis: True]
+2026-03-07 14:37:51,806 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Telephony Stream Started: 772ec7d3 (Stream SID: browser_1772874470291)
+2026-03-07 14:37:51,810 | INFO     | [772ec7d3] [browser_dev] | CallRecorder | \U0001f534 Recording started: recordings\772ec7d3_20260307_143751.wav (linear16 @ 16000Hz)
+2026-03-07 14:37:52,881 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Starting Silence Monitor
+2026-03-07 14:37:53,023 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | CRM Call Logged: b9c7f62b-53dc-43a8-94d8-3b5e431c5455
+2026-03-07 14:37:53,038 | INFO     | [772ec7d3] [browser_dev] | SessionManager | State transition 772ec7d3: SessionState.NEW -> SessionState.SPEAKING
+2026-03-07 14:37:53,040 | DEBUG    | [772ec7d3] [browser_dev] | Transcriber | \U0001f3a4 AUDIO DIAGNOSTICS: Monitoring microphone input...
+2026-03-07 14:37:53,042 | DEBUG    | [772ec7d3] [browser_dev] | Transcriber | \U0001f3a4 VOICE DETECTED! (linear16 @ 16000Hz, Packet #1)
+2026-03-07 14:37:53,062 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Synthesizing audio stream (33 chars)
+2026-03-07 14:37:54,156 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Persistent TTS HTTP client initialized.
+2026-03-07 14:37:54,248 | ERROR    | [772ec7d3] [browser_dev] | Transcriber | [CIRCUIT BREAK] STT partial timeout: 1.187s exceeds 450ms ceiling.
+2026-03-07 14:37:54,249 | ERROR    | [772ec7d3] [browser_dev] | Transcriber | ERROR - Deepgram Listener Exception: STT Partial Timeout Circuit Break
+2026-03-07 14:37:55,308 | ERROR    | [772ec7d3] [browser_dev] | Synthesizer | TTS Failure after 1 attempt: 
+2026-03-07 14:37:55,393 | ERROR    | [772ec7d3] [browser_dev] | Orchestrator | TTS Synthesis Failed: TTS API Failure: . Triggering fallback audio.
+2026-03-07 14:37:55,393 | INFO     | [772ec7d3] [browser_dev] | Synthesizer | Streaming fallback audio from assets\fallback.mulaw...
+2026-03-07 14:37:55,436 | INFO     | [772ec7d3] [browser_dev] | crm | [CRM] Ticket logged successfully: 39baa53c-a314-40bf-a0c2-be8d97ffa23f
+2026-03-07 14:38:01,040 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Fallback audio streaming complete.
+2026-03-07 14:38:01,127 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | AI: Hello! I am CILA from GD College.
+2026-03-07 14:38:01,139 | INFO     | [772ec7d3] [browser_dev] | CallLogger | Call log saved: C:\Users\Sushmitha S\Documents\GDclg\ai-voice-agent\agent_logging\..\logs\call_772ec7d3.json
+2026-03-07 14:38:01,149 | INFO     | [772ec7d3] [browser_dev] | SessionManager | State transition 772ec7d3: SessionState.SPEAKING -> SessionState.LISTENING
+2026-03-07 14:38:03,089 | DEBUG    | [772ec7d3] [browser_dev] | Transcriber | \U0001f3a4 AUDIO REPORT: Packets=100, Voice=100 (100.0%), Silent=0
+2026-03-07 14:38:11,363 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Silence Warning 1 triggered (Gap: 10.2s)
+2026-03-07 14:38:11,449 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Starting Speak Refusal: 'Are you still there?'
+2026-03-07 14:38:11,450 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Synthesizing audio stream (20 chars)
+2026-03-07 14:38:12,704 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Persistent TTS HTTP client initialized.
+2026-03-07 14:38:13,015 | ERROR    | [772ec7d3] [browser_dev] | Synthesizer | TTS Failure after 1 attempt: 
+2026-03-07 14:38:13,100 | ERROR    | [772ec7d3] [browser_dev] | Orchestrator | Error in speak_refusal: TTS API Failure: 
+2026-03-07 14:38:15,889 | DEBUG    | [772ec7d3] [browser_dev] | Transcriber | \U0001f3a4 AUDIO REPORT: Packets=200, Voice=200 (100.0%), Silent=0
+2026-03-07 14:38:23,188 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Silence Warning 2 triggered (Gap: 10.1s)
+2026-03-07 14:38:23,190 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Starting Speak Refusal: 'I haven't heard from you for a while. I will have to end the call soon if you don't respond.'
+2026-03-07 14:38:23,192 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Synthesizing audio stream (92 chars)
+2026-03-07 14:38:23,811 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Persistent TTS HTTP client initialized.
+2026-03-07 14:38:24,126 | ERROR    | [772ec7d3] [browser_dev] | Synthesizer | TTS Failure after 1 attempt: 
+2026-03-07 14:38:24,126 | ERROR    | [772ec7d3] [browser_dev] | Orchestrator | Error in speak_refusal: TTS API Failure: 
+2026-03-07 14:38:28,698 | DEBUG    | [772ec7d3] [browser_dev] | Transcriber | \U0001f3a4 AUDIO REPORT: Packets=300, Voice=300 (100.0%), Silent=0
+2026-03-07 14:38:34,169 | WARNING  | [772ec7d3] [browser_dev] | Orchestrator | Silence Termination triggered (Gap: 10.0s)
+2026-03-07 14:38:34,171 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Starting Speak Refusal: 'Disconnecting due to silence. Goodbye.'
+2026-03-07 14:38:34,171 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Synthesizing audio stream (38 chars)
+2026-03-07 14:38:34,582 | DEBUG    | [772ec7d3] [browser_dev] | Synthesizer | Persistent TTS HTTP client initialized.
+2026-03-07 14:38:35,417 | ERROR    | [772ec7d3] [browser_dev] | Synthesizer | TTS Failure after 1 attempt: TTFA Budget exhausted during connection (0.83s/0.3s)
+2026-03-07 14:38:35,417 | ERROR    | [772ec7d3] [browser_dev] | Orchestrator | Error in speak_refusal: TTS API Failure: TTFA Budget exhausted during connection (0.83s/0.3s)
+2026-03-07 14:38:35,889 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Media loop: session ended, stopping audio processing.
+2026-03-07 14:38:35,890 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Cleanup started for session 772ec7d3.
+2026-03-07 14:38:35,890 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Cancelling silence monitor
+2026-03-07 14:38:35,890 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Closing Transcriber
+2026-03-07 14:38:35,892 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Silence Monitor cancelled
+2026-03-07 14:38:46,889 | INFO     | [772ec7d3] [browser_dev] | Transcriber | STOP - Deepgram Connection Closed.
+2026-03-07 14:38:46,894 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Closing Synthesizer
+2026-03-07 14:38:46,894 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Logging full session to CRM
+2026-03-07 14:38:47,584 | INFO     | [772ec7d3] [browser_dev] | crm | [CRM] Ticket logged successfully: 67d735bf-2cbb-4a33-93ac-b682a6968e67
+2026-03-07 14:38:47,590 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | >>> CLEANUP: Saving Recording...
+2026-03-07 14:38:47,592 | INFO     | [772ec7d3] [browser_dev] | CallRecorder | \U0001f4be Recording saved: recordings\772ec7d3_20260307_143751.wav
+2026-03-07 14:38:47,592 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Generating final summary for 772ec7d3
+2026-03-07 14:38:47,593 | INFO     | [772ec7d3] [browser_dev] | CallSummary | CALL_SUMMARY: {"id": "772ec7d3", "start": "2026-03-07T14:37:50.186855Z", "dur": 57.41, "turns": 0, "lat_avg": 0, "stats": {"llm": {"p50": 0, "p90": 0, "p95": 0, "p99": 0}, "stt": {"p50": 0, "p90": 0, "p95": 0, "p99": 0}, "rag": {"p50": 0, "p90": 0, "p95": 0, "p99": 0}, "tts": {"p50": 0, "p90": 0, "p95": 0, "p99": 0}}, "status": "completed", "reason": "silence_termination"}
+2026-03-07 14:38:47,602 | INFO     | [772ec7d3] [browser_dev] | CallLogger | Call log saved: C:\Users\Sushmitha S\Documents\GDclg\ai-voice-agent\agent_logging\..\logs\call_772ec7d3.json
+2026-03-07 14:38:47,607 | INFO     | [772ec7d3] [browser_dev] | SessionManager | Session ended: 772ec7d3 (Duration: 55.804037s)
+2026-03-07 14:38:47,610 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Waiting for in-flight audio before closing WebSocket...
+2026-03-07 14:38:49,605 | DEBUG    | [772ec7d3] [browser_dev] | Orchestrator | Cleanup: Closing WebSocket connection
+2026-03-07 14:39:09,647 | INFO     | [772ec7d3] [browser_dev] | Orchestrator | Orchestrator session 772ec7d3 finalized.
+2026-03-07 14:39:09,650 | DEBUG    | [772ec7d3] [browser_dev] | SessionManager | Attempted to end non-existent session: 772ec7d3
+INFO:     connection closed

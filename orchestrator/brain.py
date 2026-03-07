@@ -18,8 +18,8 @@ from contracts.config import FeatureConfig
 from contracts.policy import PRDScripts
 
 # Pillar 2: Anti-Freeze Timeouts
-LLM_TIMEOUT = 12.0
-RAG_TIMEOUT = 5.0
+LLM_TIMEOUT = 0.5
+RAG_TIMEOUT = 0.35
 
 class Brain(LLMEngine):
     # 1. DEFINE SOURCE OF TRUTH FOR REFUSAL SCRIPT
@@ -67,21 +67,27 @@ class Brain(LLMEngine):
 
             genai.configure(api_key=self.api_key)
             
-            self.model_name = 'gemini-2.5-flash'
+            # 4. INITIALIZE MODELS (PRIMARY + FAST FALLBACK)
+            self.model_name = self.config.primary_model
+            self.fast_model_name = self.config.fast_model
+            
+            # Primary Model
             self.model = genai.GenerativeModel(
                 model_name=self.model_name,
                 system_instruction=self.system_instruction,
                 safety_settings=safety_settings
             )
             
-            # print(f"--- USING FLASH LITE MODEL: {self.model_name} ---") <--- REMOVED
-            # logger.info(...) <--- ALREADY THERE
+            # Fast Model (Degradation Fallback)
+            self.fast_model = genai.GenerativeModel(
+                model_name=self.fast_model_name,
+                system_instruction=self.system_instruction,
+                safety_settings=safety_settings
+            )
             
-            logger.info(f"Brain Init: Model={self.model_name}, Key=...{self.api_key[-5:] if self.api_key else 'NONE'}")
-            # print(f"[SUCCESS] Brain Ready with RAG ({self.model_name})") <--- REMOVED
+            logger.info(f"Brain Init: Primary={self.model_name}, Fast={self.fast_model_name}")
         except Exception as e:
             logger.error(f"Brain Init Failed: {e}", exc_info=True)
-            # print(f"!!! Brain Init Error: {e}") <--- REMOVED
 
     def start_new_session(self):
         """
@@ -169,7 +175,7 @@ class Brain(LLMEngine):
             # 🟢 GRACEFUL FALLBACK (Safe Default)
             return "AMBIGUOUS", "I'm listening, please go ahead.", False, "Barge-in"
 
-    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None):
+    async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None, degraded_mode=False):
         """
         Yields responses sentence-by-sentence for low-latency audio streaming.
         Accepts a history list (managed externally).
@@ -420,59 +426,50 @@ class Brain(LLMEngine):
             history = self._fix_history_roles(history)
             history.append({"role": "user", "parts": [rag_prompt]})
 
-            # 4. STREAM GENERATE (with graceful quota handling)
-            try:
-                response_stream = await asyncio.wait_for(
-                    self.model.generate_content_async(
-                        contents=history,
-                        stream=True
-                    ),
-                    timeout=LLM_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Gemini API timed out after {LLM_TIMEOUT}s")
-                yield (PRDScripts.APOLOGY_CAPACITY, {"error": "timeout"})
-                return
-            except ResourceExhausted as quota_error:
-                # GRACEFUL HANDLING: Log single line instead of full traceback
-                logger.warning("Gemini Quota Exceeded (429). Triggering fallback.")
-                
-                # Structured log event for error fallback
-                if self.call_logger:
-                    self.call_logger.log_event("brain", "error_fallback", 
-                                               meta={"reason": "quota_exceeded_429"},
-                                               trace_id=trace_id)
-                
-                # Structural change: yield tuple (text, metadata)
-                yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
-                return
+            # 4. STREAM GENERATE (with graceful quota handling and TTFT enforcement)
+            # A. Select Model based on Degradation State
+            active_model = self.model
+            active_model_name = self.model_name
             
+            # Dynamic Switch: Use fast model if global degradation is ON or current turn is slow
+            if degraded_mode or self.config.is_degradation_mode:
+                active_model = self.fast_model
+                active_model_name = self.fast_model_name
+                logger.warning(f"[DEGRADATION] Switching to FAST model: {active_model_name} (degraded_mode={degraded_mode})")
+
+            # B. Start the generation request
+            response_stream = await active_model.generate_content_async(
+                contents=history,
+                stream=True
+            )
+            
+            # B. Use iterator to enforce TTFT on the FIRST chunk
+            stream_iter = response_stream.__aiter__()
+            first_chunk_received = False
             full_ai_text = ""
             sentence_buffer = ""
-            async for chunk in response_stream:
+
+            while True:
                 try:
-                    # Check if chunk has a valid candidate and part
-                    if not chunk.candidates:
-                        continue
-                        
+                    # PRD Pillar 2: TTFT Guardrail (500ms) - only on the first chunk
+                    if not first_chunk_received:
+                        chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=LLM_TIMEOUT)
+                        first_chunk_received = True
+                    else:
+                        # Normal streaming for subsequent chunks
+                        chunk = await stream_iter.__anext__()
+                    
+                    # Process the chunk
+                    if not chunk.candidates: continue
                     candidate = chunk.candidates[0]
-                    # If blocked by safety or other reasons, log and skip
-                    if candidate.finish_reason not in [0, 1]: # 0=UNSPECIFIED, 1=STOP
-                        logger.warning(f"Chunk blocked by Gemini: {candidate.finish_reason}")
-                        continue
+                    if candidate.finish_reason not in [0, 1]: continue
+                    if not candidate.content.parts: continue
                     
-                    if not candidate.content.parts:
-                        continue
-                    
-                    # Look for the first part that has text
                     for part in candidate.content.parts:
                         if hasattr(part, 'text') and part.text:
                             text_chunk = part.text.replace("*", "")
                             sentence_buffer += text_chunk
-                            
-                            # Split into sentences
                             if any(punct in sentence_buffer for punct in [". ", "? ", "! ", "\n"]):
-                                # Extract complete sentences
                                 parts = sentence_buffer.replace("\n", ". ").split(". ")
                                 for i in range(len(parts) - 1):
                                     sentence = parts[i].strip()
@@ -480,9 +477,19 @@ class Brain(LLMEngine):
                                         full_ai_text += sentence + ". "
                                         yield (sentence + ".", sent_metadata)
                                 sentence_buffer = parts[-1]
+
+                except asyncio.TimeoutError:
+                    logger.error(f"Gemini First Token (TTFT) timed out after {LLM_TIMEOUT}s")
+                    yield (PRDScripts.APOLOGY_CAPACITY, {"error": "timeout_ttft"})
+                    return
+                except StopAsyncIteration:
+                    break
                 except Exception as e:
-                    logger.debug(f"Skipping malformed chunk: {e}")
-                    continue
+                    if "429" in str(e) or "quota" in str(e).lower():
+                        logger.warning("Gemini Quota Exceeded during stream.")
+                        yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
+                        return
+                    raise e
 
             # Yield remaining buffer
             final_sentence = sentence_buffer.strip()

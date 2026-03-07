@@ -72,6 +72,18 @@ class KnowledgeBase(KnowledgeBaseEngine):
             logger.warning(f"KnowledgeBase Init Failed: {e}")
             self.index = None
 
+    async def check_health(self) -> bool:
+        """Verifies KnowledgeBase connectivity for readiness probe."""
+        if not self.index:
+            return False
+        try:
+            # Pinecone check: describe_index_stats is lightweight
+            stats = self.index.describe_index_stats()
+            return stats is not None
+        except Exception as e:
+            logger.warning(f"KnowledgeBase health check failed: {e}")
+            return False
+
     def search(self, query, call_logger=None, top_k=3, trace_id=None):
         """
         Search with strict Safety (Task 2.2) and Confidence (Task 2.3) gates.

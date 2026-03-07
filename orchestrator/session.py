@@ -48,6 +48,9 @@ class Session(BaseModel):
     # Governance: persist language warnings across the call (Phase 1 English-only)
     language_warning_count: int = 0
 
+    # Stream Buffering (Task 10-11): Pre-fetch RAG context tasks (Exclude from persistence)
+    prefetched_context_task: Optional[Any] = Field(None, exclude=True)
+
     class Config:
         arbitrary_types_allowed = True
 

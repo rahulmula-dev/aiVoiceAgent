@@ -59,6 +59,29 @@ class CallLogger:
         
         self.events.append(event_entry)
 
+    def _calculate_percentiles(self, latencies: List[int], percentiles: List[float] = None) -> Dict[str, int]:
+        """
+        Calculates requested percentiles for a list of latencies using the nearest-rank method.
+        Default: p50, p90, p95, p99.
+        """
+        if percentiles is None:
+            percentiles = [0.50, 0.90, 0.95, 0.99]
+            
+        if not latencies:
+            return {f"p{int(p*100)}": 0 for p in percentiles}
+        
+        import math
+        sorted_lats = sorted(latencies)
+        n = len(sorted_lats)
+        
+        results = {}
+        for p in percentiles:
+            # Nearest-rank formula: i = ceil(P/100 * N)
+            idx = max(0, min(n - 1, math.ceil(p * n) - 1))
+            results[f"p{int(p*100)}"] = sorted_lats[idx]
+            
+        return results
+
     def generate_summary_line(self, status: str = None, reason: str = None):
         """
         Generates a saturated one-liner summary for logs.
@@ -90,8 +113,22 @@ class CallLogger:
             # Calculate turns (user spoken events)
             user_turns = len([e for e in events_snapshot if e.get("type") == "stt" and e.get("event") == "user_transcript_final"])
             
-            # Calculate average LLM latency
-            llm_latencies = [e["latency_ms"] for e in events_snapshot if e.get("type") == "orchestrator" and e.get("event") == "llm_response_start" and "latency_ms" in e]
+            # --- LATENCY AGGREGATION (Modular Stats) ---
+            def get_lats(e_type, e_name):
+                return [e["latency_ms"] for e in events_snapshot 
+                        if e.get("type") == e_type and e.get("event") == e_name and "latency_ms" in e]
+
+            llm_latencies = get_lats("orchestrator", "llm_response_start")
+            stt_latencies = get_lats("stt", "user_transcript_final")
+            rag_latencies = get_lats("retrieval", "rag_search_latency")
+            tts_latencies = get_lats("tts", "audio_stream_start")
+            
+            # TELEMETRY MONITORING: Warn if core subsystems are missing events (indicates broken hooks)
+            if user_turns > 0: # Only check if the user actually spoke
+                for name, lats in [("LLM", llm_latencies), ("STT", stt_latencies), ("RAG", rag_latencies), ("TTS", tts_latencies)]:
+                    if not lats:
+                        logger.warning(f"[TELEMETRY_MISS] Subsystem {name} reported 0 latency events for call {self.call_id}")
+
             avg_latency = int(sum(llm_latencies) / len(llm_latencies)) if llm_latencies else 0
             
             summary = {
@@ -100,6 +137,12 @@ class CallLogger:
                 "dur": duration,
                 "turns": user_turns,
                 "lat_avg": avg_latency,
+                "stats": {
+                    "llm": self._calculate_percentiles(llm_latencies),
+                    "stt": self._calculate_percentiles(stt_latencies),
+                    "rag": self._calculate_percentiles(rag_latencies),
+                    "tts": self._calculate_percentiles(tts_latencies)
+                },
                 "status": self.status,
                 "reason": self.reason
             }

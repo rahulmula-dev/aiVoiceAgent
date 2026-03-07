@@ -33,7 +33,7 @@ class Synthesizer(TTSEngine):
             # Optimize connection pool
             # Set keepalive_expiry to 5s to avoid using stale connections
             limits = httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=5.0)
-            self._client = httpx.AsyncClient(timeout=10.0, limits=limits)
+            self._client = httpx.AsyncClient(timeout=0.3, limits=limits)
             logger.debug("Persistent TTS HTTP client initialized.")
         return self._client
 
@@ -64,19 +64,37 @@ class Synthesizer(TTSEngine):
         for attempt in range(max_retries):
             try:
                 client = await self._get_client()
+                # Task HIGH-P4-02: Bound AGGREGATE TTFA (Connect + Headers + First Byte)
+                start_ttfa = asyncio.get_event_loop().time()
+                
                 async with client.stream("POST", self.url, headers=headers, json=payload) as response:
                     response.raise_for_status()
-                    logger.debug(f"Deepgram TTS stream opened.")
                     
-                    first_chunk = True
-                    async for chunk in response.aiter_bytes(chunk_size=1024):
+                    # Convert to manual iterator to enforce TTFA on the first byte only
+                    stream_iter = response.aiter_bytes(chunk_size=1024).__aiter__()
+                    
+                    try:
+                        # Calculate remaining budget for TTFA
+                        elapsed = asyncio.get_event_loop().time() - start_ttfa
+                        
+                        if elapsed >= 0.3:
+                             raise TTSException(f"TTFA Budget exhausted during connection ({elapsed:.2f}s/0.3s)")
+                             
+                        remaining = 0.3 - elapsed
+                        chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=remaining)
+                        if chunk:
+                            yield chunk
+                    except (asyncio.TimeoutError, StopAsyncIteration):
+                        # Calculate final total for log
+                        total_elapsed = asyncio.get_event_loop().time() - start_ttfa
+                        raise TTSException(f"TTFA Breach: Deepgram took too long to provide first byte (>{total_elapsed:.2f}s)")
+
+                    # Subsequent chunks stream with the default httpx 0.3s per-read timeout
+                    async for chunk in stream_iter:
                         if call_id in self._stop_signals:
                             logger.debug(f"Stop signal received for {call_id}. Interrupting TTS.")
                             break
                         if chunk:
-                            if first_chunk:
-                                logger.debug(f"First audio chunk received from Deepgram (Size: {len(chunk)})")
-                                first_chunk = False
                             yield chunk
                 # If we successfully finished the stream, break the retry loop
                 if not (call_id in self._stop_signals):

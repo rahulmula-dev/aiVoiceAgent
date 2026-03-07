@@ -242,8 +242,10 @@ class VoiceOrchestrator:
                 return # CRITICAL: Return so it never hits the LLM
         
         # ... proceed with English processing ...
-        # Task 3 & 4: Start Turn Timer
-        turn_start_time = asyncio.get_event_loop().time()
+        # Task 3 & 4: Start Turn Timer (Include STT Latency)
+        # turn_start_time now represents the moment the user stopped speaking.
+        now = asyncio.get_event_loop().time()
+        turn_start_time = now - stt_latency
         trace_id = str(uuid.uuid4())
 
         # STATE-AWARE NON-ENGLISH DETECTION: Handle empty transcripts from Deepgram
@@ -778,14 +780,34 @@ class VoiceOrchestrator:
 
         # 0.5. CONCURRENCY SAFETY GATE (S4-7)
         from telephony.concurrency import get_active_call_count, MAX_INBOUND_CALLS
-        if get_active_call_count() > MAX_INBOUND_CALLS:
-            logger.critical("[SAFETY GATE] Concurrent active calls exceeded hard cap inside pipeline. Rejection triggered.")
+        # Defensive Fail-safe: If we see count >= 30 here, it means we are at/over the hard cap.
+        if get_active_call_count() >= MAX_INBOUND_CALLS:
+            logger.critical("[SAFETY GATE] Concurrent active calls at/exceeded hard cap inside pipeline. Rejection triggered.")
+            
+            # 1. Release the slot IMMEDIATELY to prevent "clogging" during a burst
+            from telephony.concurrency import decrement_active_calls
+            decrement_active_calls(call_sid=self._early_sid)
+
+            # 2. Record CRM ticket asynchronously (Pillar 3 Forensic Pillar)
+            from datetime import datetime
+            timestamp = datetime.now().isoformat()
+            summary = f"Caller number: {self._early_caller}, reason = OVER_CAPACITY, timestamp: {timestamp}"
+            
+            self._create_task_with_log(self.crm.create_ticket(
+                transcript="Call rejected inside WebSocket pipeline due to hard 30-call concurrency limit.",
+                summary=summary,
+                sentiment="Negative",
+                call_id=self._early_sid,
+                title="OVER_CAPACITY | Voice Agent Safety Gate"
+            ))
+
+            # 3. Handle state transition and fallback audio
             self.state.transition_to(CallState.ESCALATION)
             try:
-                goodbye_text = "All our lines are busy at the moment, but I will arrange a callback."
-                async for chunk in self.synthesizer.speak(goodbye_text):
-                    await self._send_response_chunk(chunk)
-                await asyncio.sleep(4) 
+                # PRD: "it is impossible for an over-limit call to receive a partial or degraded AI response"
+                # Use local mulaw file to prevent ANY billable Deepgram TTS API usage for rejected callers.
+                await self.synthesizer.play_fallback_audio(websocket)
+                await asyncio.sleep(1) # Final grace period for audio delivery
             except Exception as e:
                 logger.error(f"Failed to play capacity-failure audio: {e}")
             
@@ -834,7 +856,7 @@ class VoiceOrchestrator:
             while True:
                 # 1. Wait for 'start' or first 'media' to get Identity
                 try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=5.0)
+                    message = await asyncio.wait_for(websocket.receive(), timeout=0.3)
                 except asyncio.TimeoutError:
                     if not sid:
                         logger.warning("Identity detection timed out. Using fallback IDs.")
@@ -1179,9 +1201,22 @@ class VoiceOrchestrator:
                     if self.call_logger:
                         self.call_logger.log_event("orchestrator", "llm_request_start", trace_id=trace_id)
                     
-                    # We are technically in RAG/Eval state before generating
-                    # For simplicity, treating "Generating" as INTENT_EVAL -> RESPONSE_VALIDATION flow
-                    
+                    # Task 3 & 4: Early Latency Check (Before RAG/LLM)
+                    self._latency_alert_emitted = False
+                    if turn_start_time:
+                         current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                         if current_turn_elapsed > 3.0:
+                             sid = self.session.session_id if self.session else "unknown"
+                             logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
+                             self._latency_alert_emitted = True
+                             
+                             # 🟢 COMPLIANCE: formal 'Alert Payload' for monitoring hooks (Prometheus/CW Alerts)
+                             if self.call_logger:
+                                 self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 3.0, "status": "warning"})
+
+                         if current_turn_elapsed > 5.0:
+                             raise LatencyBreachError(f"Pre-generation latency already at {current_turn_elapsed:.2f}s")
+
                     # Extract Caller Number for Auto-ID
                     caller_num = self.session.caller_number if self.session else "unknown"
                     
@@ -1200,7 +1235,8 @@ class VoiceOrchestrator:
                         intent=intent, 
                         trace_id=trace_id, 
                         call_context=active_context,
-                        prefetched_context_task=prefetched_task
+                        prefetched_context_task=prefetched_task,
+                        degraded_mode=self._latency_alert_emitted
                     ):
                         # Invalidate after first usage in this turn
                         if hasattr(self.session, 'prefetched_context_task'):
@@ -1208,7 +1244,16 @@ class VoiceOrchestrator:
                         # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
                         if turn_start_time:
                             current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                            if current_turn_elapsed > 12.0:
+                            
+                            # 🟢 Alert at 3s for auto-scaling hook
+                            if current_turn_elapsed > 3.0 and not self._latency_alert_emitted:
+                                logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | Elapsed: {current_turn_elapsed:.1f}s")
+                                self._latency_alert_emitted = True
+                                if self.call_logger:
+                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 3.0, "status": "warning"})
+                                
+                            # 🟢 Circuit Break at 5s ceiling
+                            if current_turn_elapsed > 5.0:
                                 raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                                 
                         self.session.touch()
@@ -1292,6 +1337,16 @@ class VoiceOrchestrator:
 
                 # S4-11: Ensure worker task is done before finishing parent task
                 await audio_queue.join()
+                
+                # --- FINAL LATENCY CHECK (Covers TTS Synthesis) ---
+                if turn_start_time:
+                    current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                    if current_turn_elapsed > 3.0 and not self._latency_alert_emitted:
+                        logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | Elapsed: {current_turn_elapsed:.1f}s")
+                        self._latency_alert_emitted = True
+                    if current_turn_elapsed > 5.0:
+                         raise LatencyBreachError(f"Turn completion timed out at {current_turn_elapsed:.2f}s")
+
                 await audio_queue.put(None)
                 await worker_task
                 

@@ -60,6 +60,19 @@ class CRMClient(CRMEngine):
         # AWS explicitly requires hyphens, translating from PRD's 'crm_failover_queue'
         self.s3_bucket = "crm-failover-queue"
 
+    async def check_health(self) -> bool:
+        """Verifies CRM API reachability for readiness probe."""
+        url = f"{self.base_url}/health" # Standard health endpoint
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=2.0)
+                # Any non-5xx response is usually a sign of reachability, 
+                # but we'll accept 200/201/204
+                return response.status_code < 500
+        except Exception as e:
+            logger.warning(f"CRM health check failed: {e}")
+            return False
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_fixed(0.25),
