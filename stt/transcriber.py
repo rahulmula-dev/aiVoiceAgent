@@ -12,16 +12,8 @@ from orchestrator.interfaces import STTProvider
 # Configure logging
 logger = std_logging.getLogger("Transcriber")
 
-# Task 2: Resource Safety & Disk Protection (PRD Section 8)
-log_dir = "logs"
-os.makedirs(log_dir, exist_ok=True)
-stt_handler = RotatingFileHandler(
-    os.path.join(log_dir, "stt_debug.log"), 
-    maxBytes=5*1024*1024, # 5MB
-    backupCount=2
-)
-stt_handler.setFormatter(std_logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-logger.addHandler(stt_handler)
+# Task 2 & 4: Root Purge (PRD P3-07)
+# STT logs are now routed to the global S3-tracked audit logs; local rotation is disabled.
 
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
@@ -32,6 +24,11 @@ class Transcriber(STTProvider):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY missing in .env")
+        
+        # Workstream 2: AI Data Residency (CRITICAL-P3-02)
+        if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
+            logger.critical("RESIDENCY VIOLATION: DPA_CANADA_ACTIVE is not set. Deepgram data export blocked.")
+            raise Exception("Data Residency Violation: Canadian DPA required for Deepgram STT.")
         
         self.on_transcript_callback = on_transcript_callback
         self.model = os.getenv("DEEPGRAM_MODEL", "nova-2-phone")

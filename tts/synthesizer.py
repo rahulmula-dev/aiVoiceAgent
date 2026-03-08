@@ -21,6 +21,11 @@ class Synthesizer(TTSEngine):
             logger.error("DEEPGRAM_API_KEY is missing")
             raise ValueError("DEEPGRAM_API_KEY not found")
         
+        # Workstream 2: AI Data Residency (CRITICAL-P3-02)
+        if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
+            logger.critical("RESIDENCY VIOLATION: DPA_CANADA_ACTIVE is not set. Deepgram data export blocked.")
+            raise Exception("Data Residency Violation: Canadian DPA required for Deepgram TTS.")
+        
         # Deepgram Aura Options
         self.url = f"https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding={encoding}&sample_rate={sample_rate}&container=none"
         self._client = None

@@ -276,6 +276,17 @@ class KBIngestionPipeline:
             # We delete by filter (supported in Pinecone Serverless and recent SDKs)
             # Metadata key is 'ingestion_timestamp'
             self.index.delete(filter={"ingestion_timestamp": {"$lt": cutoff_iso}})
+            
+            # Workstream 5: RetentionAudit (CRITICAL-P3-06)
+            audit_msg = f"RetentionAudit: Purged embeddings older than {cutoff_iso}"
+            logging.getLogger("RetentionAudit").info(audit_msg)
+            
+            # Also log to a dedicated local audit file (as a buffer for S3 syncing)
+            audit_file = os.path.join("logs", "retention_audit.log")
+            os.makedirs("logs", exist_ok=True)
+            with open(audit_file, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat()}] {audit_msg}\n")
+            
             logger.info("Retention Job Complete: Stale embeddings pruned.")
         except Exception as e:
             logger.error(f"Retention Job Failed: {e}")

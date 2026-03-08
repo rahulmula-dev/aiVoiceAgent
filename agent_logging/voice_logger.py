@@ -155,16 +155,3 @@ def bind_call_context(sid, phone):
     ctx_phone_number.set(masked_phone)
     # This info log will now automatically show the SID and Masked Phone!
     logging.getLogger("AuditLogging").info(f"Context bound for new call (SID: {sid}).")
-
-def log_conversation_turn(session_id, role, text):
-    """
-    LEGACY: Appends a human-readable turn to conversation_log.txt.
-    Maintained for backward compatibility. Consider using the context-aware logger directly.
-    """
-    try:
-        with open("conversation_log.txt", "a", encoding="utf-8") as f:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            session_short = session_id[-10:] if session_id else "UNKNOWN"
-            f.write(f"\n[{timestamp}] [Session: {session_short}] {role}: {text}")
-    except Exception as e:
-        logging.getLogger("ConversationLog").error(f"Error writing to conversation_log.txt: {e}")

@@ -274,6 +274,23 @@ class CallLogger:
                 "events": events_snapshot
             }
             
+            # 5. SYNC TO S3 (CRITICAL-P3-01)
+            from utils.s3_storage import S3Storage
+            s3 = S3Storage()
+            
+            # Upload Events File
+            if os.path.exists(self.events_file):
+                s3.upload_file(self.events_file, f"events/{os.path.basename(self.events_file)}")
+                
+            # Upload Summary File
+            summary_file = os.path.join(self.log_dir, "call_summary.log")
+            if os.path.exists(summary_file):
+                # We don't delete the aggregate summary file yet, or we rename it per call
+                s3_summary_key = f"summaries/{self.call_id}_summary.log"
+                # For aggregate logs, we might just want to copy or upload a snapshot
+                s3.upload_file(summary_file, s3_summary_key, delete_local=False)
+
+            logger.info(f"Audit trace for {self.call_id} synced to S3.")
             # File path for the final sealed log
             log_file = os.path.join(self.log_dir, f"call_{self.call_id}.json")
 

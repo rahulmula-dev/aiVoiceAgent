@@ -28,11 +28,17 @@ class CRMClient(CRMEngine):
     """
     def __init__(self):
         # Load API keys from .env
-        self.api_key = os.getenv("CRM_API_KEY", "crm_test_key_123")
-        self.base_url = os.getenv("CRM_BASE_URL", "http://72.61.172.170:8000")
-        self.app_env = os.getenv("APP_ENV", "production").lower()
-        
-        # 1. CRM SECURITY GUARD (Task 1)
+        # 1. CRM SECURITY GUARD (Task 1 & Task 3)
+        # Force HTTPS and Block IP Addresses (CRITICAL-P3-03)
+        if not self.base_url.startswith("https://"):
+            logger.error(f"SECURITY VIOLATION: CRM_BASE_URL must use HTTPS. Found: {self.base_url}")
+            raise SecurityError("Insecure CRM Endpoint: HTTPS required.")
+            
+        ip_pattern = r'https?://(\d{1,3}\.){3}\d{1,3}'
+        if re.match(ip_pattern, self.base_url):
+            logger.error(f"SECURITY VIOLATION: CRM_BASE_URL cannot be a raw IP. Found: {self.base_url}")
+            raise SecurityError("Insecure CRM Endpoint: DNS verified hostname required.")
+
         # Prevent production credentials in staging/development
         if self.app_env in ["staging", "development", "test"]:
             prod_indicators = ["live", "prod", "production"]
@@ -48,18 +54,9 @@ class CRMClient(CRMEngine):
         # IDEMPOTENCY: Local cache of processed call_ids to prevent duplicates
         self.processed_calls = {} # Map call_id -> ticket_id
         
-        # CONFIG: S3 DLQ Path (Canada Region - PRD Section 5)
-        import boto3
-        aws_kwargs = {'region_name': 'ca-central-1'}
-        if not os.getenv("AWS_ACCESS_KEY_ID"):
-            # Boto3 attempts to fetch from IMDS (169.254.169.254) if keys are missing.
-            # This synchronous HTTP request blocks the asyncio event loop for several seconds causing timeouts
-            aws_kwargs['aws_access_key_id'] = 'dummy_key_to_bypass_imds'
-            aws_kwargs['aws_secret_access_key'] = 'dummy_secret_to_bypass_imds'
-            
-        self.s3_client = boto3.client('s3', **aws_kwargs)
-        # AWS explicitly requires hyphens, translating from PRD's 'crm_failover_queue'
-        self.s3_bucket = "crm-failover-queue"
+        # CONFIG: S3 DLQ Path (ca-central-1 - PRD Section 5)
+        from utils.s3_storage import S3Storage
+        self.s3_queue = S3Storage(bucket_name="crm-failover-queue")
 
     async def check_health(self) -> bool:
         """Verifies CRM API reachability for readiness probe."""
@@ -108,7 +105,7 @@ class CRMClient(CRMEngine):
         # However, for the System to link them, we likely need to return the ID from this call and use it.
         
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(verify=True) as client:
                 response = await client.post(url, headers=self.headers, json=payload, timeout=5.0)
                 
             if response.status_code >= 500:
@@ -284,9 +281,17 @@ class CRMClient(CRMEngine):
             "retry_count": 0
         }
         
-        # 1. LOCAL PERSISTENCE FIRST (Pillar 2: Reliability)
+        # 1. ATTEMPT S3 UPLOAD FIRST (ca-central-1)
+        # CRITICAL-P3-04: Local disk is only for buffer/dead-end
+        s3_key = f"dlq_tickets/{entry_id}.json"
+        s3_success = self.s3_queue.upload_json(entry, s3_key)
+        
+        if s3_success:
+            logger.info(f"[CRM] Payload synced directly to S3 DLQ: {entry_id}")
+            return
+
+        # 2. LOCAL PERSISTENCE ONLY IF S3 FAILS (Pillar 2: Reliability)
         # NOTE: For true crash-resilience in K8s, logs/ must be a PersistentVolume.
-        # If logs/ is ephemeral, data is lost on pod restart.
         dlq_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "crm_dlq")
         os.makedirs(dlq_dir, exist_ok=True)
         local_file = os.path.join(dlq_dir, f"{entry_id}.json")
@@ -294,29 +299,9 @@ class CRMClient(CRMEngine):
         try:
             with open(local_file, "w", encoding="utf-8") as f:
                 json.dump(entry, f, indent=2)
-            logger.info(f"[CRM] DLQ entry saved locally: {local_file}")
+            logger.warning(f"[CRM] S3 Failed. Saved to local DLQ buffer: {local_file}")
         except Exception as e:
-            # If even local disk fails, we have a major infra issue, but we still try S3
-            logger.critical(f"[CRM] FATAL: Failed to write to local DLQ disk! {e}")
-
-        # 2. ATTEMPT S3 UPLOAD (ca-central-1)
-        try:
-            self.s3_client.put_object(
-                Bucket=self.s3_bucket,
-                Key=f"dlq_tickets/{entry_id}.json",
-                Body=json.dumps(entry)
-            )
-            logger.info(f"[CRM] Payload synced to S3 DLQ: {entry_id}")
-            
-            # If S3 succeeds, we can safely remove the local "buffer" file
-            # as it is now durable in the ca-central-1 cloud.
-            if os.path.exists(local_file):
-                os.remove(local_file)
-                
-        except Exception as e:
-            # If S3 fails, we do NOT delete the local file. 
-            # The background reconciler will find it later.
-            logger.error(f"[CRM] S3 DLQ Upload Failed. Entry remains stored at {local_file}. Error: {e}")
+            logger.critical(f"[CRM] FATAL: S3 and Local Disk both failed! {e}")
 
 
 

@@ -65,6 +65,11 @@ class Brain(LLMEngine):
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ]
 
+            # Workstream 2: AI Data Residency (CRITICAL-P3-02)
+            if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
+                logger.critical("RESIDENCY VIOLATION: DPA_CANADA_ACTIVE is not set. Google Gemini data export blocked.")
+                raise Exception("Data Residency Violation: Canadian DPA required for Gemini.")
+
             genai.configure(api_key=self.api_key)
             
             # 4. INITIALIZE MODELS (PRIMARY + FAST FALLBACK)

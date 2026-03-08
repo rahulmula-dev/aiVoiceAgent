@@ -15,7 +15,7 @@ from contracts.policy import ResponsePolicyEngine, PRDScripts
 from contracts.schemas import CallContext
 from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
-from agent_logging import log_conversation_turn, CallLogger
+from agent_logging import CallLogger
 from .session_manager import SessionManager, SessionState
 from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
@@ -449,7 +449,7 @@ class VoiceOrchestrator:
                 logger.debug("[GOVERNANCE] First valid transcript received. Enabling strict empty-frame checks.")
                 self.user_has_spoken = True
                 
-            log_conversation_turn(self.session.session_id, "USER", text)
+            # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "user", "parts": [text]})
             self.session.touch()
         
@@ -769,7 +769,8 @@ class VoiceOrchestrator:
             
             logger.info(f"AI (Refusal): {text} (Sent {chunks_sent} audio chunks)")
             if self.session:
-                log_conversation_turn(self.session.session_id, "AI", text)
+                # log_conversation_turn is deprecated (PRD P3-07)
+                pass
             
             # SYNC FIX: Wait for the agent to finish speaking before allowing more input
             if self.mode == "audio":
@@ -1455,7 +1456,7 @@ class VoiceOrchestrator:
                     worker_task.cancel()
             logger.info(f"AI: {full_ai_text.strip()}")
             self.last_response_was_question = full_ai_text.strip().endswith("?")
-            log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
+            # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
             if self.call_logger:
