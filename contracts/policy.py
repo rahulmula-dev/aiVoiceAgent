@@ -149,7 +149,8 @@ class ResponsePolicyEngine:
         "robot", "going", "since", "empower", "empowers", "empowering", "financial",
         "independence", "business", "marketing", "portfolio", "building", "interview",
         "preparation", "gender", "genders", "skills", "mission", "vision", "values",
-        "career", "vocational", "technical", "gd college", "cila agent",
+        "career", "vocational", "technical", "gd college", "cila agent", "issue", "question",
+        "uh", "um", "hmm", "ah", "mhm",
         "continue", "restart", "give", "list", "kill", "people", "common", "india", 
         "us", "africa", "america", "visa", "status", "so", "yeah"
     }
@@ -218,8 +219,8 @@ class ResponsePolicyEngine:
         # Example: "Mujhe Cosmetology join karna hai" = low density = FAIL.
         is_very_short = len(words) <= 2
         
-        # User feedback: "Strict for user input (0.60)"
-        threshold = 0.60
+        # User feedback: "Strict for user input (0.87)"
+        threshold = 0.87
         is_mixed_danger = not is_very_short and density < threshold
         
         if is_mixed_danger:
@@ -232,7 +233,7 @@ class ResponsePolicyEngine:
             # definitely NOT a common word and NOT purely alphabetical (names).
             
             # Trust density more for short samples.
-            if density >= 0.70:
+            if density >= 0.85:
                 policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to High Density ({density:.2f}): '{text}'")
                 return True
                 
@@ -265,7 +266,7 @@ class ResponsePolicyEngine:
         if len(words) < 3:
             policy_logger.debug(f"[GOVERNANCE] Bypass Langdetect (Too few words: {len(words)}): '{text}'")
             # For very short inputs, rely purely on density + ASCII checks above.
-            return density >= 0.80
+            return density >= 0.85
 
         try:
             detected_langs = detect_langs(text)
@@ -278,7 +279,7 @@ class ResponsePolicyEngine:
                 if top.lang != 'en' and top.prob >= 0.40:
                     # langdetect is extremely unreliable on short, high-density English sentences
                     # (especially introductions containing proper names). If density is high, treat as English.
-                    if density >= 0.80:
+                    if density >= 0.90:
                         policy_logger.info(
                             f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) due to High English Density "
                             f"({density:.2f}). Text='{text}'"
@@ -388,32 +389,55 @@ class ResponsePolicyEngine:
 
     def classify_intent(self, user_text: str, detected_lang: str = None) -> str:
         """
-        Classifies user intent into: 'PROCEED', 'SENSITIVE', 'HARD_REFUSAL_IMMIGRATION', etc.
+        Classifies user intent into: 'PROCEED', 'SENSITIVE', 'HARD_REFUSAL_IMMIGRATION', 'AMBIGUOUS', etc.
+        Hardened with multi-layered confidence gates and partial match logic (P5-01).
         """
         # 0. Check Language (Layer 1 - Hard-coded Gate)
         # Block non-English input immediately using STT metadata + Text heuristics
         if not self._is_english(user_text, detected_lang=detected_lang):
             return "HARD_REFUSAL_LANGUAGE"
 
-        lower = user_text.lower()
+        lower = user_text.lower().strip()
         
-        # 1. Check Sensitive (Highest Priority)
+        # 1. Check Sensitive (Highest Priority - Full & Substring match)
         for keyword in self.SENSITIVE_KEYWORDS:
-            if keyword in lower:
+            if self._contains_word(lower, keyword):
                 return "SENSITIVE"
         
-        # 2. Check Hard Refusals
+        # 2. Check Hard Refusals (Layer 2 - Partial Match Logic)
+        # Uses more aggressive substring matching to prevent bypasses like "visastatus"
+        found_refusal = None
         for category, keywords in self.HARD_REFUSAL_KEYWORDS.items():
             for k in keywords:
-                # Use smart boundary check for keys like 'pr', 'visa'
+                # REFINEMENT: If the word is > 3 chars, check for ANY substring presence
+                # if k in lower: 
+                #     found_refusal = f"HARD_REFUSAL_{category.upper()}"
+                #     break
+                # Use _contains_word which handles short vs long words correctly
                 if self._contains_word(lower, k):
-                    return f"HARD_REFUSAL_{category.upper()}"
+                    found_refusal = f"HARD_REFUSAL_{category.upper()}"
+                    break
+            if found_refusal: break
+            
+        if found_refusal:
+            return found_refusal
 
         # 3. High-Sentiment / Angry Caller Detection
         for keyword in self.ANGER_KEYWORDS:
             if keyword in lower:
                 return "ESCALATION_REQUIRED"
-                    
+
+        # 4. Ambiguity Gate (Layer 3)
+        # If the input is extremely short or doesn't follow a clear pattern, mark as AMBIGUOUS
+        # to prevent hallucinations in the downstream barge-in/thought logic.
+        words = lower.split()
+        if len(words) == 0:
+            return "AMBIGUOUS"
+        
+        # If it's just a single common word without context, it might be ambiguous
+        if len(words) == 1 and words[0] in self.COMMON_ENGLISH_WORDS and words[0] not in ["hello", "hi", "hey", "ok", "okay", "yes", "no", "yup"]:
+            return "AMBIGUOUS"
+
         return "PROCEED"
 
     def get_refusal_script(self, intent: str) -> str:
@@ -446,6 +470,9 @@ class ResponsePolicyEngine:
             
         if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES":
             return PRDScripts.REFUSAL_FINANCIAL_DISPUTES
+
+        if intent == "AMBIGUOUS":
+            return PRDScripts.APOLOGY_CLARIFICATION
 
         # T4 fix: Translation/jailbreak bypass → English-only refusal
         if intent == "HARD_REFUSAL_LANGUAGE_BYPASS":

@@ -378,7 +378,7 @@ async def handle_incoming_call(request: Request):
 
     # Pass statusCallback on the stream/stream wrapper isn't natively standard for Stream cleanup, 
     # instead we will monitor standard Twilio Call Status Webhook callbacks for the Number itself.
-    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect machineDetection="Enable"><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
     return Response(content=twiml, media_type="application/xml")
 
 @app.post("/api/call-status")

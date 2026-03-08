@@ -169,15 +169,28 @@ class CRMClient(CRMEngine):
              short_id = call_id_str[-4:] if len(call_id_str) > 4 else call_id_str
              final_title = f"{final_title} | Call-{short_id}"
 
+        # Forensic Metadata Enrichment (Task 6)
+        enhanced_metadata = {
+            "structured_turns": structured_turns
+        } if structured_turns else {}
+        
+        if session_obj:
+            if session_obj.interruption_snapshot:
+                enhanced_metadata["interruption_snapshot"] = session_obj.interruption_snapshot
+            if session_obj.termination_reason:
+                enhanced_metadata["termination_reason"] = session_obj.termination_reason
+            if session_obj.metadata:
+                enhanced_metadata["session_metadata"] = session_obj.metadata
+            if session_obj.caller_type:
+                enhanced_metadata["caller_type"] = session_obj.caller_type
+
         ticket_data = {
             "call_id": call_id_str,
             "title": final_title,
             "description": summary,
             "status": "OPEN",
             "priority": priority,
-            "metadata": {
-                "structured_turns": structured_turns
-            } if structured_turns else {}
+            "metadata": enhanced_metadata
         }
         
         try:

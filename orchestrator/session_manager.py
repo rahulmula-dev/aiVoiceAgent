@@ -43,7 +43,7 @@ class SessionManager:
                 now = datetime.now()
                 to_delete = []
                 for sid, session in self.sessions.items():
-                    if now - session.last_accessed > timedelta(minutes=self.ttl_minutes):
+                    if now - session.last_active > timedelta(minutes=self.ttl_minutes):
                         to_delete.append(sid)
                 
                 for sid in to_delete:
@@ -62,7 +62,8 @@ class SessionManager:
                             sentiment="Negative",
                             call_id=sid,
                             title="Zombie_Session_Pruned",
-                            structured_turns=getattr(session, 'structured_turns', None)
+                            structured_turns=getattr(session, 'structured_turns', None),
+                            session_obj=session
                         ))
                     except Exception as crm_e:
                         logger.error(f"[DLQ] Failed to create zombie CRM ticket for {sid}: {crm_e}")

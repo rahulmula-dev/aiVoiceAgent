@@ -24,9 +24,10 @@ class Session(BaseModel):
     crm_call_id: Optional[str] = None
     caller_number: str = "unknown"
     caller_type: str = "unknown_lead"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     start_time: datetime = Field(default_factory=datetime.now)
     end_time: Optional[datetime] = None
-    last_accessed: datetime = Field(default_factory=datetime.now)
+    last_active: datetime = Field(default_factory=datetime.now)
     
     # State Machine (Pillar 2)
     current_state: SessionState = SessionState.NEW
@@ -57,5 +58,5 @@ class Session(BaseModel):
         arbitrary_types_allowed = True
 
     def touch(self):
-        """Update last_accessed timestamp for TTL."""
-        self.last_accessed = datetime.now()
+        """Update last_active timestamp for TTL."""
+        self.last_active = datetime.now()

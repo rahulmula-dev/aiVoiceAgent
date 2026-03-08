@@ -54,7 +54,7 @@ class Brain(LLMEngine):
             3. STRUCTURED: If the user asks for a list or steps, use a numbered list (1., 2., 3.).
             4. RAPPORT: If you don't know the user's name, ask politely: "May I know who I am speaking with?" If you do, use it naturally.
             5. LIMITS: No immigration, medical, or legal advice.
-            6. BARGE-IN: If interrupted, classify as NEW_TOPIC or SAME_TOPIC and respond naturally without asking procedural questions.
+            6. BARGE-IN: If interrupted, classify as NEW_TOPIC, SAME_TOPIC, or AMBIGUOUS and respond naturally without asking procedural questions.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -127,9 +127,7 @@ class Brain(LLMEngine):
         {context_block}
 
         RULES:
-        - For NEW_TOPIC: Respond directly to the new topic with zero reference to your previous interrupted response.
-        - For SAME_TOPIC: Naturally incorporate the clarification into your response as a continuation.
-        - For AMBIGUOUS: Respond to the most likely interpretation without asking for clarification.
+        - For NEW_TOPIC, SAME_TOPIC, or AMBIGUOUS: Provide a fresh, direct response to the user's interruption based on the context below, with zero reference to the text that was just interrupted.
         - ALWAYS prioritize the [KNOWLEDGE BASE CONTEXT] for your answers if it is provided.
 
         You must respond in VALID JSON format ONLY:
@@ -167,7 +165,7 @@ class Brain(LLMEngine):
                 data.get("classification", "AMBIGUOUS"),
                 data.get("response", "I'm listening, please go ahead."),
                 data.get("is_multi_step", False),
-                data.get("topic", "General"),
+                self._derive_topic("unknown", data.get("topic", "General")),
                 "unknown",
                 []
             )
@@ -284,7 +282,7 @@ class Brain(LLMEngine):
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
-                rag_topic = "General"
+                rag_topic = self._derive_topic(intent, "General")
                 kb_v = "unknown"
                 c_ids = []
             
@@ -570,18 +568,35 @@ class Brain(LLMEngine):
             return True
 
     @classmethod
-    def is_kb_refusal(cls, text: str) -> bool:
+    def is_kb_refusal(cls, text: str):
         """
         Utilities for the Orchestrator to detect if the Brain generated the mandatory refusal.
         Using a soft match is safer (in case of minor punctuation deviations).
         """
         if not text: return False
+        refusal_patt = cls.KB_MISS_SCRIPT.strip().lower().replace(".", "")
+        clean_text = text.strip().lower().replace(".", "")
+        return refusal_patt in clean_text or clean_text in refusal_patt
+
+    def _derive_topic(self, intent: str, rag_topic: str) -> str:
+        """
+        [MEDIUM-P5-03] Logic-based Topic Tagger.
+        Prioritizes RAG category, then Intent, then fallback.
+        """
+        if rag_topic and rag_topic != "General":
+            return rag_topic
+            
+        intent_map = {
+            "JOB_QUERY": "Admissions & Careers",
+            "VENDOR_PAYMENT": "Finance & Operations",
+            "TRANSCRIPT_REQUEST": "Registrar Services",
+            "FEES": "Tuition & Fees",
+            "PROCEED": "Student Onboarding",
+            "REFUSE": "Policy Enforcement",
+            "AMBIGUOUS": "General Inquiry"
+        }
         
-        # Use the single source of truth, removing punctuation/case for safer matching
-        # "I do not have that information. A staff member will follow up." -> "i do not have that information"
-        
-        target = cls.KB_MISS_SCRIPT.lower().split(".")[0] # Check first sentence roughly
-        return target in text.lower()
+        return intent_map.get(intent, "General Inquiry")
 
 if __name__ == "__main__":
     # Simple standalone test

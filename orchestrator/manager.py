@@ -84,6 +84,7 @@ class VoiceOrchestrator:
 
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
+        self.last_response_was_question = False
 
     def _create_task_with_log(self, coro):
         """
@@ -164,17 +165,8 @@ class VoiceOrchestrator:
 
         if not is_final:
             # S4-11: Immediate Audio Stop on Interruption (Partial Transcript)
-            if self.response_task and not self.response_task.done():
-                if self.state.get_state() == CallState.SPEAKING:
-                    # S4-NoiseGuard: Ignore noise/echo/single-word artifacts from interrupting
-                    word_count = len(raw_text.split())
-                    if (word_count < 2 and len(raw_text) < 6) or confidence < 0.4:
-                        logger.debug(f"[BARGE-IN DEBOUNCE] Ignoring noise: '{raw_text}' (conf={confidence:.2f})")
-                    else:
-                        logger.info(f">>> IMMEDIATE STOP: Partial transcript received: '{raw_text}' (conf={confidence:.2f})")
-                        self.synthesizer.stop_current_speech(self.sid)
-                        self._create_task_with_log(self._send_clear_message())
-                        self.state.transition_to(CallState.INTERRUPTED)
+            # [REMOVED for Telephony-Layer VAD Hardening - Task 2]
+            # Interruption logic moved to handle_audio_stream (Telephony 'speech' event)
             
             # Reset silence timer on partials so the monitor doesn't trigger while user is talking
             self.last_interaction_time = time.time()
@@ -539,16 +531,18 @@ class VoiceOrchestrator:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
                 
-                # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Competitors, Fees, etc.)
-                self._create_task_with_log(self.crm.create_ticket(
-                    transcript=text,
-                    summary=f"Policy Violation: {intent}",
-                    sentiment="SECURITY_ALERT" if "SENSITIVE" in intent else "Neutral",
-                    call_logger=self.call_logger,
-                    call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
-                    title=f"Policy Refusal: {intent}",
-                    session_obj=self.session
-                ))
+                # [P5-01]: Skip CRM noise for purely ambiguous/noisy inputs
+                if intent != "AMBIGUOUS":
+                    # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Competitors, Fees, etc.)
+                    self._create_task_with_log(self.crm.create_ticket(
+                        transcript=text,
+                        summary=f"Policy Violation: {intent}",
+                        sentiment="SECURITY_ALERT" if "SENSITIVE" in intent else "Neutral",
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or self.session.session_id if self.session else trace_id,
+                        title=f"Policy Refusal: {intent}",
+                        session_obj=self.session
+                    ))
 
             # 🟢 S4 Hardening: Hard LLM Bypass (Policy Violation)
             if self.response_task and not self.response_task.done():
@@ -564,6 +558,15 @@ class VoiceOrchestrator:
                 return # SHORT-CIRCUIT: Do not proceed to barge-in or brain
             
             # D. Strikes 1-2 and other refusals: Speak refusal, stay on call
+            # [P5-01]: "The Cough Problem" - Silent Ambiguity on Barge-in
+            # If the user made noise (cough/filler) that triggered VAD (INTERRUPTED state), 
+            # and the resulting transcript is AMBIGUOUS, do not speak the apology.
+            if intent == "AMBIGUOUS" and self.state.get_state() == CallState.INTERRUPTED:
+                logger.info(f"[GOVERNANCE] Silent Ambiguity: Noise/Filler detected during barge-in ('{text}'). Skipping apology.")
+                # Transition back to listening if we were interrupted by noise
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                return
+
             self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
             return # SHORT-CIRCUIT
         # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
@@ -597,6 +600,9 @@ class VoiceOrchestrator:
                 logger.info(f">>> IMMEDIATE STOP: Interrupted by final transcript: '{raw_text}'")
                 partial_text = self.synthesizer.stop_current_speech(self.sid)
                 self._create_task_with_log(self._send_clear_message())
+                
+                # [P5-03]: Save before transition to INTERRUPTED
+                self.session_manager.save_session(self.session)
                 self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
 
                 logger.debug("AI was speaking. triggering barge-in handler.")
@@ -684,6 +690,7 @@ class VoiceOrchestrator:
             context_text=context_text,
             trace_id=trace_id
         )
+        logger.info(f"[AUDIT] Grounded Barge-In generated (Classification: {classification}). Trace: {trace_id}")
         
         # Aggregate any metadata from barge-in classification too
         if self.session:
@@ -978,11 +985,18 @@ class VoiceOrchestrator:
                     )
                     if crm_id:
                         self.session.crm_call_id = str(crm_id)
+                        # [P5-03]: Add stream SID to metadata for cross-session tracking
+                        if "twilio_metadata" not in self.session.metadata:
+                            self.session.metadata["twilio_metadata"] = {}
+                        self.session.metadata["twilio_metadata"]["stream_sid"] = self.sid
+                        self.session.metadata["twilio_metadata"]["call_sid"] = call_sid
                         logger.info(f"CRM Call Logged: {crm_id}")
                 except Exception as e:
                     logger.error(f"Failed to log call to CRM: {e}")
 
                 # Initial Greeting
+                # [P5-03]: Explicit save BEFORE update_state to prevent Redis overwrite of caller_type/crm_id
+                self.session_manager.save_session(self.session)
                 self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                 greeting = PRDScripts.GREETING
                 self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
@@ -1015,6 +1029,26 @@ class VoiceOrchestrator:
                             self.recorder.write_chunk(payload)
                         await self.transcriber.send_audio(payload)
                         self.session.touch() # Life signal
+                    
+                    elif data['event'] == 'speech':
+                        # [P5-01]: Hardened Telephony-Layer Interruption
+                        telephony_speech_start = asyncio.get_event_loop().time()
+                        logger.info(f"[TELEPHONY VAD] User speech started (Twilio Signal)")
+                        if self.response_task and not self.response_task.done():
+                            current_state = self.state.get_state()
+                            if current_state == CallState.SPEAKING:
+                                logger.info(">>> IMMEDIATE STOP: Interrupted by Telephony VAD signal.")
+                                self.synthesizer.stop_current_speech(self.sid)
+                                self._create_task_with_log(self._send_clear_message())
+                                self.state.transition_to(CallState.INTERRUPTED)
+                                
+                                # Latency Enforcement Check (Task Requirement)
+                                audio_output_halt = asyncio.get_event_loop().time()
+                                halt_latency = (audio_output_halt - telephony_speech_start) * 1000
+                                logger.info(f"[LATENCY] Telephony VAD Halt: {halt_latency:.1f}ms (Ceiling: 300ms)")
+                                
+                                if halt_latency > 300:
+                                    logger.warning(f"[LATENCY_BREACH] Telephony halt exceeded 300ms budget: {halt_latency:.1f}ms")
                     
                     elif data['event'] == 'stop':
                         logger.debug(f"Telephony Stream Stopped: {sid}")
@@ -1127,6 +1161,10 @@ class VoiceOrchestrator:
                 }
                 self.session.structured_turns.append(turn)
                 self.session.current_speaking_turn_id = new_id
+            
+            # [P5-03]: Explicit save AFTER turn creation to prevent Redis overwrite 
+            # by subsequent update_state() calls.
+            self.session_manager.save_session(self.session)
 
             full_ai_text = ""
             audio_queue = asyncio.Queue()
@@ -1305,6 +1343,7 @@ class VoiceOrchestrator:
                                 raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                                 
                         self.session.touch()
+                        self.session_manager.save_session(self.session)
                         self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
                         
                         # Perform safety check (Response Policy) before streaming
@@ -1410,6 +1449,7 @@ class VoiceOrchestrator:
                 if not worker_task.done():
                     worker_task.cancel()
             logger.info(f"AI: {full_ai_text.strip()}")
+            self.last_response_was_question = full_ai_text.strip().endswith("?")
             log_conversation_turn(self.session.session_id, "AI", full_ai_text.strip())
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
@@ -1437,6 +1477,7 @@ class VoiceOrchestrator:
                     session_obj=self.session
                 ))
             
+            self.session_manager.save_session(self.session)
             self.session_manager.update_state(self.session.session_id, SessionState.LISTENING)
 
         except LatencyBreachError as lbe:
@@ -1650,6 +1691,8 @@ class VoiceOrchestrator:
                 
             # 3. End and remove session from manager (Pillar 2)
             if self.session:
+                # [P5-03]: Guaranteed Persistence - Final save before removal
+                self.session_manager.save_session(self.session)
                 self.session_manager.end_session(sid)
             
             # Force close websocket to break any receive loops
@@ -1791,68 +1834,62 @@ class VoiceOrchestrator:
                 if gap < 1.0:
                     continue
 
-                # Stage 1: Initial Warning (10s+)
+                # Stage 1: Initial Warning (10s+) - Same for both paths
                 if gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Warning 1 triggered (Gap: {gap:.1f}s)")
+                    logger.info(f"Silence Warning 1 triggered (Gap: {gap:.1f}s, Context: {'Question' if self.last_response_was_question else 'Info'})")
                     self.silence_stage = 1
                     self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
                     
-                    # Prompt #1 - await so it fully completes before the loop continues
                     msg = PRDScripts.SILENCE_1
                     await self.speak_refusal(msg)
                     
-                # Stage 2: Secondary Warning (Another 10s passed since Prompt 1)
+                # Stage 2: Secondary Logic
                 elif gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"Silence Warning 2 triggered (Gap: {gap:.1f}s)")
-                    self.silence_stage = 2
-                    self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
-                    
-                    # Prompt #2 - await so it fully completes before the loop continues
-                    msg = PRDScripts.SILENCE_2
-                    await self.speak_refusal(msg)
-                    
-                # Stage 3: Termination (Another 10s passed since Prompt 2)
+                    if self.last_response_was_question:
+                        # Clarifying Question Path: 10s repeat (Prompt #2)
+                        logger.info(f"Silence Warning 2 (Repeat) triggered for Question context (Gap: {gap:.1f}s)")
+                        self.silence_stage = 2
+                        self.last_interaction_time = time.time()
+                        msg = PRDScripts.SILENCE_2
+                        await self.speak_refusal(msg)
+                    else:
+                        # Informational Path: 20s total silence target (gap > 10 after previous 10 = 20s)
+                        # We trigger termination immediately if it was informational
+                        logger.warning(f"Silence Termination triggered for Informational context (Gap: {gap:.1f}s)")
+                        await self._trigger_silence_termination()
+                        break
+                        
+                # Stage 3: Termination for Question Path
                 elif gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"Silence Termination triggered (Gap: {gap:.1f}s)")
-                    self.silence_stage = 3 # Prevent loops
-
-                    # Set the real termination reason BEFORE cleanup so the summary log is correct
-                    if self.session:
-                        self.session.termination_reason = "silence_termination"
-
-                    # STEP 1: Speak goodbye FIRST, while WebSocket is still fully open.
-                    # We must NOT set CALL_END yet — that would break the media loop and
-                    # close the WebSocket before the audio chunks are delivered.
-                    goodbye = PRDScripts.SILENCE_TERMINATION
-                    await self.speak_refusal(goodbye)
-
-                    # STEP 2: NOW transition to CALL_END.
-                    # speak_refusal's finally block tried to go to LISTENING, but we
-                    # set CALL_END here immediately after so the media loop will break
-                    # on the next iteration.
-                    self.state.transition_to(CallState.CALL_END)
-
-                    # STEP 3: Create CRM ticket (awaited so it's in the log before save)
-                    try:
-                        await self.crm.create_ticket(
-                            transcript="[System]: Call terminated due to extended user silence (30s+).",
-                            summary="Silence Termination",
-                            sentiment="Neutral",
-                            call_logger=self.call_logger,
-                            call_id=self.session.crm_call_id or self.session.session_id,
-                            structured_turns=self.session.structured_turns
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to create Silence Termination CRM ticket: {e}")
-
-                    # STEP 4: Cleanup and exit monitor loop
-                    await self.cleanup()
+                    logger.warning(f"Silence Termination triggered for Question context (Gap: {gap:.1f}s)")
+                    await self._trigger_silence_termination()
                     break
-                    
+
         except asyncio.CancelledError:
             logger.debug("Silence Monitor cancelled")
         except Exception as e:
             logger.error(f"Error in Silence Monitor: {e}", exc_info=True)
+        finally:
+            logger.debug("Silence Monitor loop exited.")
+
+    async def _trigger_silence_termination(self):
+        """
+        [MEDIUM-P5-04] Preemption: Kill hanging tasks before speaking final refusal.
+        """
+        self.silence_stage = 3 # Prevent loops
+        if self.session:
+            self.session.termination_reason = "silence_termination"
+
+        # Preemptive Cleanup: Kills hanging Brain/RAG tasks immediately
+        await self.cleanup()
+
+        # Speak final termination while socket is in CALL_END state but still open
+        try:
+            self.state.transition_to(CallState.CALL_END)
+        except: pass
+        
+        goodbye = PRDScripts.SILENCE_TERMINATION
+        await self.speak_refusal(goodbye)
 
     async def _language_termination_flow(self, refusal_text, trace_id):
         """
