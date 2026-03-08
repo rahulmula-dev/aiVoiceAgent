@@ -341,7 +341,7 @@ async def handle_incoming_call(request: Request):
     logging.getLogger("Server").info(f"Incoming Voice Webhook. SID: {call_sid}, From: {mask_phone_number(from_number)}")
     
     from telephony.concurrency import increment_if_under_cap, MAX_INBOUND_CALLS
-    is_accepted, new_count = increment_if_under_cap(MAX_INBOUND_CALLS, call_sid=call_sid)
+    is_accepted, new_count = await increment_if_under_cap(MAX_INBOUND_CALLS, call_sid=call_sid)
     
     if not is_accepted:
         logging.getLogger("Server").warning(f"[Concurrency] SUPER MAX REACHED! Active calls: {new_count}/{MAX_INBOUND_CALLS}. Rejecting SID: {call_sid}")
@@ -394,7 +394,7 @@ async def handle_call_status(request: Request):
         
         if status in ["completed", "failed", "busy", "no-answer", "canceled"]:
             from telephony.concurrency import decrement_active_calls, MAX_INBOUND_CALLS
-            new_count = decrement_active_calls(call_sid=call_sid)
+            new_count = await decrement_active_calls(call_sid=call_sid)
             logging.getLogger("Server").info(f"[Concurrency] Call ended ({status}). Decremented active calls to: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
     except Exception as e:
         logging.getLogger("Server").error(f"Failed to process call-status: {e}")
@@ -432,6 +432,9 @@ async def handle_media_stream(websocket: WebSocket):
         # Use factory with shared session manager
         manager = create_default_orchestrator(call_logger=call_logger, session_manager=default_session_manager)
         
+        # Register for zombie recovery access
+        default_session_manager.register_orchestrator(session_id, manager)
+        
         await manager.handle_audio_stream(websocket)
         call_logger.log_event("telephony", "call_ended", meta={"reason": "websocket_closed"})
         
@@ -448,6 +451,7 @@ async def handle_media_stream(websocket: WebSocket):
         call_logger.generate_summary_line()
         call_logger.save_log(session_obj=getattr(manager, 'session', None))
         logger.info(f"Forensic Audit trace finalized for {session_id}")
+        default_session_manager.unregister_orchestrator(session_id)
         default_session_manager.end_session(session_id)
 
 @app.websocket("/ws/browser")
@@ -509,6 +513,7 @@ async def handle_browser_stream(websocket: WebSocket):
         # EMERGENCY FLUSH (Forensic Pillar 2)
         call_logger.generate_summary_line()
         call_logger.save_log(session_obj=getattr(manager, 'session', None))
+        default_session_manager.unregister_orchestrator(session_id)
         default_session_manager.end_session(session_id)
 
 @app.get("/chat-ui", response_class=HTMLResponse)

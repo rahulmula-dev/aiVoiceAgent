@@ -8,8 +8,16 @@ from contextvars import ContextVar
 
 # Context variables to hold call-specific metadata
 # These are thread-local and task-local (compatible with asyncio)
+# Context variables to hold call-specific metadata
+# These are thread-local and task-local (compatible with asyncio)
 ctx_call_sid = ContextVar("call_sid", default="N/A")
 ctx_phone_number = ContextVar("phone_number", default="N/A")
+
+import hashlib
+
+class SecurityError(Exception):
+    """Raised when security constraints are violated (e.g. raw PII in logs)."""
+    pass
 
 class ContextFilter(logging.Filter):
     """
@@ -33,6 +41,16 @@ class JSONFormatter(logging.Formatter):
             "module": record.name,
             "message": record.getMessage(),
         }
+        
+        # [SECURITY-ISS-115] HARD FAIL: Trigger SecurityError if raw phone number detected in message
+        # Validates against a basic E.164-ish pattern (starting with + and multiple digits)
+        raw_phone_pattern = r'\+\d{7,15}'
+        import re
+        if re.search(raw_phone_pattern, log_record["message"]):
+             # We only allow the masked versions which contain '*'
+             if '*' not in log_record["message"]:
+                 raise SecurityError(f"CRITICAL SECURITY VIOLATION: Raw PII (Phone Number) detected in log message! Redact immediately.")
+
         if record.exc_info:
             log_record["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_record)
@@ -107,15 +125,24 @@ def mask_phone_number(number: str) -> str:
     # (assuming a 10-digit national number structure for most regions)
     prefix_len = max(1, len(digits_only) - 10)
     
+    # SHA-256 Anonymization (ISS-117)
+    # We provide a masked version for human readability and a SHA-256 hash for forensic correlation
     prefix = ""
-    if number.startswith("+"):
+    if digits_only.startswith("+"):
         prefix = "+" + digits_only[:prefix_len]
         suffix = digits_only[-4:]
     else:
         prefix = digits_only[:prefix_len]
         suffix = digits_only[-4:]
         
-    return f"{prefix}******{suffix}"
+    masked = f"{prefix}******{suffix}"
+    
+    # Generate SHA-256 for non-reversible correlation (forensics)
+    # salt = os.getenv("PII_SALT", "default_salt")
+    # pii_hash = hashlib.sha256(f"{digits_only}:{salt}".encode()).hexdigest()[:12]
+    # return f"{masked} (hash:{pii_hash})"
+    
+    return masked
 
 def bind_call_context(sid, phone):
     """

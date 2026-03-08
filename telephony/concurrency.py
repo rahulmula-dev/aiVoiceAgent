@@ -64,6 +64,10 @@ end
 # Fallback for local testing without redis
 _local_counter = 0
 _local_sids = set()
+_local_lock = asyncio.Lock() if 'asyncio' in globals() else None
+
+import asyncio
+_local_lock = asyncio.Lock()
 
 def check_redis_health() -> bool:
     """Verifies Redis connectivity for the readiness probe."""
@@ -119,7 +123,7 @@ def increment_active_calls(call_sid: str = "unknown") -> int:
         _local_counter += 1
         return _local_counter
 
-def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tuple[bool, int]:
+async def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tuple[bool, int]:
     """
     Atomically checks if the counter is under the capacity limit and increments it.
     Solves the TOCTOU (Time-Of-Check to Time-Of-Use) race condition using Redis Lua.
@@ -128,13 +132,14 @@ def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tuple[boo
     global _local_counter, _local_sids
     
     if not redis_client:
-        if call_sid in _local_sids:
+        async with _local_lock:
+            if call_sid in _local_sids:
+                return True, _local_counter
+            if _local_counter >= max_cap:
+                return False, _local_counter
+            _local_counter += 1
+            _local_sids.add(call_sid)
             return True, _local_counter
-        if _local_counter >= max_cap:
-            return False, _local_counter
-        _local_counter += 1
-        _local_sids.add(call_sid)
-        return True, _local_counter
         
     try:
         # Atomic execution of Lua script
@@ -152,18 +157,21 @@ def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tuple[boo
     except Exception as e:
         logger.error(f"Redis increment_if_under_cap error: {e}")
         # Fallback to local
-        if _local_counter >= max_cap:
-            return False, _local_counter
-        _local_counter += 1
-        return True, _local_counter
+        async with _local_lock:
+            if _local_counter >= max_cap:
+                return False, _local_counter
+            _local_counter += 1
+            _local_sids.add(call_sid)
+            return True, _local_counter
 
-def decrement_active_calls(call_sid: str = "unknown") -> int:
+async def decrement_active_calls(call_sid: str = "unknown") -> int:
     global _local_counter, _local_sids
     if not redis_client:
-        if call_sid in _local_sids:
-            _local_sids.remove(call_sid)
-            _local_counter = max(0, _local_counter - 1)
-        return _local_counter
+        async with _local_lock:
+            if call_sid in _local_sids:
+                _local_sids.remove(call_sid)
+                _local_counter = max(0, _local_counter - 1)
+            return _local_counter
     try:
         result = redis_client.eval(LUA_DECREMENT_ONLY_IF_TRACKED, 2, COUNTER_KEY, ACTIVE_SIDS_KEY, call_sid)
         if result == -1:
@@ -172,5 +180,8 @@ def decrement_active_calls(call_sid: str = "unknown") -> int:
         return int(result)
     except Exception as e:
         logger.error(f"Redis decr error: {e}")
-        _local_counter = max(0, _local_counter - 1)
-        return _local_counter
+        async with _local_lock:
+            if call_sid in _local_sids:
+                _local_sids.remove(call_sid)
+                _local_counter = max(0, _local_counter - 1)
+            return _local_counter

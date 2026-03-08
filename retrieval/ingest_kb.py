@@ -170,13 +170,23 @@ class KBIngestionPipeline:
             import time
             time.sleep(5)
             
-        logger.info(f"Creating Index {self.index_name} in us-east-1...")
-        self.pc.create_index(
-            name=self.index_name,
-            dimension=3072, 
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-        )
+        # [REGION-ENFORCEMENT-ISS-123] Lock to ca-central-1
+        TARGET_REGION = "ca-central-1"
+        PROHIBITED_REGION = "us-east-1"
+        
+        logger.info(f"Creating Index {self.index_name} in {TARGET_REGION}...")
+        try:
+            self.pc.create_index(
+                name=self.index_name,
+                dimension=3072, 
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region=TARGET_REGION)
+            )
+        except Exception as e:
+            if PROHIBITED_REGION in str(e):
+                logger.error(f"FATAL: Pinecone region violation! Attempted to use prohibited region {PROHIBITED_REGION}.")
+                raise RuntimeError(f"Infrastructure Security Violation: Region {PROHIBITED_REGION} is prohibited.")
+            raise e
         import time
         time.sleep(15) # Wait for index to be ready
             
@@ -185,6 +195,10 @@ class KBIngestionPipeline:
         
         self.version_id = get_next_version()
         logger.info(f"Initialized Pipeline with Version: {self.version_id}")
+        
+        # [RETENTION-ISS-161] 6-Month Data Retention Job
+        # Automatically prune data older than 180 days on every run.
+        self.prune_old_embeddings(days=180)
 
     def upload_chunk(self, text: str, category: KBCCategory, program: Optional[str] = None, is_sensitive: bool = False, hard_refusal_category: Optional[str] = None):
         """
@@ -243,6 +257,28 @@ class KBIngestionPipeline:
         except Exception as e:
             logger.error(f"Failed to process chunk: {e}")
             return False
+
+    def prune_old_embeddings(self, days: int = 180):
+        """
+        [ISS-161] Retention Policy: Deletes vectors older than 'days' days.
+        Ensures metadata storage compliance.
+        """
+        import time
+        from datetime import timedelta
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        cutoff_iso = cutoff_date.isoformat() + "Z"
+        
+        logger.info(f"Running Retention Job: Pruning vectors older than {cutoff_iso}...")
+        
+        try:
+            # Pinecone metadata filters support string comparison for ISO timestamps
+            # We delete by filter (supported in Pinecone Serverless and recent SDKs)
+            # Metadata key is 'ingestion_timestamp'
+            self.index.delete(filter={"ingestion_timestamp": {"$lt": cutoff_iso}})
+            logger.info("Retention Job Complete: Stale embeddings pruned.")
+        except Exception as e:
+            logger.error(f"Retention Job Failed: {e}")
 
 # --- FINAL INGESTION BLOCK ---
 

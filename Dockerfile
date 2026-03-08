@@ -26,6 +26,10 @@ COPY . .
 # Expose port 8000 for the FastAPI application
 EXPOSE 8000
 
+# Healthcheck for K8s/Docker monitoring
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
 # Run the application
 # 24x7 Warm Operation: Uvicorn workers ensure no cold starts
 CMD ["python", "run_server.py"]

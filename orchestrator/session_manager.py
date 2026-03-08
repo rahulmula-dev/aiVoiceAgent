@@ -25,6 +25,7 @@ except Exception as e:
 class SessionManager:
     def __init__(self, ttl_minutes: int = 5):
         self.sessions: Dict[str, Session] = {}
+        self.orchestrators: Dict[str, object] = {} # session_id -> VoiceOrchestrator
         self.ttl_minutes = ttl_minutes
         self._collector_task = None
         self.use_redis = redis_client is not None
@@ -49,24 +50,41 @@ class SessionManager:
                 for sid in to_delete:
                     logger.warning(f"ZOMBIE COLLECTION: Pruning hanging session {sid}")
                     session = self.sessions.get(sid)
-                    # PATH E FIX: Create a CRM ticket for every zombie session pruned
+                    
+                    # [ISS-162] Zombie Recovery: Ensure a "Session Pruned" ticket is sent
                     try:
                         from crm.client import CRMClient
                         crm = CRMClient()
-                        history_text = "[System]: Session pruned by zombie collector — no graceful exit detected."
+                        
+                        # Forensic Check: Was this a system failure or just a timeout?
+                        history_text = "[ZOMBIE_RECOVERY]: Session timed out and was pruned by the system."
                         if session and session.conversation_history:
                             history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in session.conversation_history])
-                        asyncio.create_task(crm.create_ticket(
+                        
+                        # Create HIGH priority ticket for forensics
+                        await crm.create_ticket(
                             transcript=history_text,
-                            summary=f"Zombie Session Pruned: {sid}",
+                            summary=f"CRITICAL: Session Pruned (Zombie Recovery) - {sid}",
                             sentiment="Negative",
                             call_id=sid,
-                            title="Zombie_Session_Pruned",
+                            title="Session Pruned (Zombie Recovery)",
                             structured_turns=getattr(session, 'structured_turns', None),
                             session_obj=session
-                        ))
+                        )
                     except Exception as crm_e:
                         logger.error(f"[DLQ] Failed to create zombie CRM ticket for {sid}: {crm_e}")
+                    
+                    # [ISS-119] Full Cleanup: Stop active tasks and close providers
+                    orchestrator = self.orchestrators.get(sid)
+                    if orchestrator:
+                        try:
+                            # Use run_coroutine_threadsafe or similar if needed, 
+                            # but collector is already an async task.
+                            await orchestrator.cleanup()
+                        except Exception as clean_e:
+                            logger.error(f"Failed to cleanup stale orchestrator for {sid}: {clean_e}")
+                    
+                    # Call end_session which performs final state transition and removal
                     self.end_session(sid)
             except Exception as e:
                 logger.error(f"Error in Zombie Collector: {e}")
@@ -145,6 +163,21 @@ class SessionManager:
                 del self.sessions[session_id]
         else:
             logger.debug(f"Attempted to end non-existent session: {session_id}")
+        
+        # Always remove from registry
+        if session_id in self.orchestrators:
+            del self.orchestrators[session_id]
+
+    def register_orchestrator(self, session_id: str, orchestrator: object):
+        """Registers an active orchestrator for zombie recovery/cleanup access."""
+        self.orchestrators[session_id] = orchestrator
+        logger.debug(f"Orchestrator registered for session: {session_id}")
+
+    def unregister_orchestrator(self, session_id: str):
+        """Unregisters an orchestrator."""
+        if session_id in self.orchestrators:
+            del self.orchestrators[session_id]
+            logger.debug(f"Orchestrator unregistered for session: {session_id}")
 
 # Global instance for shared use (Singleton-ish)
 default_session_manager = SessionManager()

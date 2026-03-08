@@ -1145,7 +1145,8 @@ class VoiceOrchestrator:
         if not self.session: return
         
         try:
-            # S4-11: Structured Turn Entry
+            # [P5-03]: Atomic Redis Save Pattern (Tasks 1-2-3)
+            # 1. Append structured_turns
             if self.session:
                 new_id = len(self.session.structured_turns) + 1
                 turn = {
@@ -1162,9 +1163,13 @@ class VoiceOrchestrator:
                 self.session.structured_turns.append(turn)
                 self.session.current_speaking_turn_id = new_id
             
-            # [P5-03]: Explicit save AFTER turn creation to prevent Redis overwrite 
-            # by subsequent update_state() calls.
+            # 2. await save_session()
             self.session_manager.save_session(self.session)
+            
+            # 3. await update_state()
+            # Transitioning to INTENT_EVAL here to satisfy the 1-2-3 sequence logic
+            self.state.transition_to(CallState.INTENT_EVAL, trace_id=trace_id)
+            self.session_manager.update_state(self.session.session_id, SessionState.LISTENING) # Initial state update
 
             full_ai_text = ""
             audio_queue = asyncio.Queue()
@@ -1830,38 +1835,43 @@ class VoiceOrchestrator:
                 # 3. Check Silence Duration
                 gap = time.time() - self.last_interaction_time
                 
+                # [SILENCE-ISS-158] Contextual Silence Machine
+                # Stage 0: Normal
+                # Stage 1: Initial Warning (10s)
+                # Stage 2: Secondary Warning (20s - Questions only)
+                # Stage 3: Termination Triggered
+                
                 # Verify we haven't just reset (race condition check)
                 if gap < 1.0:
                     continue
 
                 # Stage 1: Initial Warning (10s+) - Same for both paths
                 if gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Warning 1 triggered (Gap: {gap:.1f}s, Context: {'Question' if self.last_response_was_question else 'Info'})")
+                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {gap:.1f}s, Context: {'Question' if self.last_response_was_question else 'Info'})")
                     self.silence_stage = 1
-                    self.last_interaction_time = time.time() # CRITICAL: Reset timer immediately
+                    self.last_interaction_time = time.time() # Reset timer for next stage
                     
                     msg = PRDScripts.SILENCE_1
                     await self.speak_refusal(msg)
                     
-                # Stage 2: Secondary Logic
+                # Stage 2/3: Logic differentiation
                 elif gap > 10.0 and self.silence_stage == 1:
                     if self.last_response_was_question:
-                        # Clarifying Question Path: 10s repeat (Prompt #2)
-                        logger.info(f"Silence Warning 2 (Repeat) triggered for Question context (Gap: {gap:.1f}s)")
+                        # Clarifying Question Path: 10s repeat (Stage 2)
+                        logger.info(f"Silence Stage 2 (Repeat Prompt) triggered (Gap: {gap:.1f}s)")
                         self.silence_stage = 2
                         self.last_interaction_time = time.time()
                         msg = PRDScripts.SILENCE_2
                         await self.speak_refusal(msg)
                     else:
-                        # Informational Path: 20s total silence target (gap > 10 after previous 10 = 20s)
-                        # We trigger termination immediately if it was informational
-                        logger.warning(f"Silence Termination triggered for Informational context (Gap: {gap:.1f}s)")
+                        # Informational Path: 20s total (Stage 3)
+                        logger.warning(f"Silence Stage 3 (Termination) triggered for Informational context (Total: 20s)")
                         await self._trigger_silence_termination()
                         break
                         
                 # Stage 3: Termination for Question Path
                 elif gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"Silence Termination triggered for Question context (Gap: {gap:.1f}s)")
+                    logger.warning(f"Silence Stage 3 (Termination) triggered for Question context (Total: 30s)")
                     await self._trigger_silence_termination()
                     break
 

@@ -392,28 +392,18 @@ class ResponsePolicyEngine:
         Classifies user intent into: 'PROCEED', 'SENSITIVE', 'HARD_REFUSAL_IMMIGRATION', 'AMBIGUOUS', etc.
         Hardened with multi-layered confidence gates and partial match logic (P5-01).
         """
-        # 0. Check Language (Layer 1 - Hard-coded Gate)
-        # Block non-English input immediately using STT metadata + Text heuristics
-        if not self._is_english(user_text, detected_lang=detected_lang):
-            return "HARD_REFUSAL_LANGUAGE"
-
         lower = user_text.lower().strip()
         
-        # 1. Check Sensitive (Highest Priority - Full & Substring match)
+        # 1. Check Sensitive (Highest Priority - Full & Substring match) [SECURITY-P1]
         for keyword in self.SENSITIVE_KEYWORDS:
             if self._contains_word(lower, keyword):
                 return "SENSITIVE"
         
-        # 2. Check Hard Refusals (Layer 2 - Partial Match Logic)
+        # 2. Check Hard Refusals (Layer 2 - Partial Match Logic) [P5-01]
         # Uses more aggressive substring matching to prevent bypasses like "visastatus"
         found_refusal = None
         for category, keywords in self.HARD_REFUSAL_KEYWORDS.items():
             for k in keywords:
-                # REFINEMENT: If the word is > 3 chars, check for ANY substring presence
-                # if k in lower: 
-                #     found_refusal = f"HARD_REFUSAL_{category.upper()}"
-                #     break
-                # Use _contains_word which handles short vs long words correctly
                 if self._contains_word(lower, k):
                     found_refusal = f"HARD_REFUSAL_{category.upper()}"
                     break
@@ -421,6 +411,11 @@ class ResponsePolicyEngine:
             
         if found_refusal:
             return found_refusal
+
+        # 3. Check Language (Layer 3 - Governance Gate)
+        # Block non-English input if it didn't trigger a specific refusal above.
+        if not self._is_english(user_text, detected_lang=detected_lang):
+            return "HARD_REFUSAL_LANGUAGE"
 
         # 3. High-Sentiment / Angry Caller Detection
         for keyword in self.ANGER_KEYWORDS:

@@ -127,7 +127,7 @@ class Brain(LLMEngine):
         {context_block}
 
         RULES:
-        - For NEW_TOPIC, SAME_TOPIC, or AMBIGUOUS: Provide a fresh, direct response to the user's interruption based on the context below, with zero reference to the text that was just interrupted.
+        - Provide a direct, standalone response to the user's new query using only the context below. Ignore the previous interrupted sentence.
         - ALWAYS prioritize the [KNOWLEDGE BASE CONTEXT] for your answers if it is provided.
 
         You must respond in VALID JSON format ONLY:
@@ -373,10 +373,10 @@ class Brain(LLMEngine):
             logger.info(log_str)
             # --------------------------------------------------
 
-            # ── RAG SCORE FLOOR ───────────────────────────────────────────────────
+            # ── [GROUNDING-ISS-121] MANDATORY 0.58 THRESHOLD ───────────────────────────
             # S4 Refinement Fix: Hard gate to prevent hallucination.
-            # DO NOT pass to LLM if grounding and CRM are both missed.
-            if not has_grounding and not crm_hit:
+            # If rag_score < 0.58 and no CRM hit, yield ESCALATION and kill the turn.
+            if (rag_score < 0.58) and not crm_hit:
                 # 1. Create the CRM callback ticket
                 if self.crm_client and call_context:
                     try:

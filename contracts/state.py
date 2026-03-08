@@ -66,28 +66,23 @@ class StateMachine:
         # Check Rulebook
         valid_next_states = self.ALLOWED_TRANSITIONS.get(self.current_state, [])
         
-        # In strict mode, raise error. For now, log warning.
+        # [STATE-GATE-ISS-119] HARD FAIL: Raise Exception and block invalid jumps
         if new_state not in valid_next_states:
              # Basic loose check: allow transitions to CALL_END from anywhere
             if new_state == CallState.CALL_END:
                 pass
             else:
-                msg = f"STATE VIOLATION: {self.current_state.value} -> {new_state.value}"
+                msg = f"CRITICAL STATE VIOLATION: Invalid transition attempted from {self.current_state.value} to {new_state.value}"
                 
                 # 1. Log violation to JSON for debugging
                 if self.call_logger:
-                    self.call_logger.log_event("state_machine", "violation", 
+                    self.call_logger.log_event("state_machine", "error", 
                                              meta={"msg": msg}, 
                                              trace_id=trace_id)
                 
-                # 2. Report to CRM (Mock) - Meets Requirement
-                if self.crm_client:
-                    asyncio.create_task(self.crm_client.create_ticket(
-                        transcript=msg,
-                        summary="System State Violation",
-                        sentiment="SYSTEM_ERROR",
-                        call_logger=self.call_logger
-                    ))
+                # 2. Raise Exception to block the transition
+                logger.error(msg)
+                raise ValueError(msg)
         
         # 3. Update State
         old_state = self.current_state
