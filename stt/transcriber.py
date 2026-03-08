@@ -4,12 +4,26 @@ import asyncio
 import websockets
 import base64
 import logging as std_logging
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 
 from orchestrator.interfaces import STTProvider
 
 # Configure logging
 logger = std_logging.getLogger("Transcriber")
+
+# Task 2: Resource Safety & Disk Protection (PRD Section 8)
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+stt_handler = RotatingFileHandler(
+    os.path.join(log_dir, "stt_debug.log"), 
+    maxBytes=5*1024*1024, # 5MB
+    backupCount=2
+)
+stt_handler.setFormatter(std_logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(stt_handler)
+
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
 load_dotenv()
 
@@ -62,10 +76,8 @@ class Transcriber(STTProvider):
         }
 
         logger.info(f"[DEEPGRAM] Connecting: encoding={self.encoding} rate={self.sample_rate}")
-        try:
-            with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                f.write(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}\n")
-        except: pass
+        if DEBUG_MODE:
+            logger.debug(f"CONNECT ATTEMPT: encoding={self.encoding} sample_rate={self.sample_rate}")
 
         # PRD §5 RETRY LOOP: 2 attempts, ≤500ms each
         MAX_ATTEMPTS = 2
@@ -79,20 +91,16 @@ class Transcriber(STTProvider):
                     timeout=ATTEMPT_TIMEOUT
                 )
                 logger.info(f"[DEEPGRAM] Connected OK (attempt {attempt}, encoding={self.encoding}, rate={self.sample_rate})")
-                try:
-                    with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                        f.write(f"CONNECTED OK (attempt {attempt}): encoding={self.encoding} sample_rate={self.sample_rate}\n")
-                except: pass
+                if DEBUG_MODE:
+                    logger.debug(f"CONNECTED OK (attempt {attempt}): encoding={self.encoding} sample_rate={self.sample_rate}")
 
                 asyncio.create_task(self._listen())
                 return True
             except (asyncio.TimeoutError, Exception) as e:
                 last_error = e
                 logger.warning(f"[DEEPGRAM] Connection attempt {attempt}/{MAX_ATTEMPTS} FAILED: {e}")
-                try:
-                    with open("deepgram_debug.txt", "a", encoding="utf-8") as f:
-                        f.write(f"CONNECT ATTEMPT {attempt} FAILED: {e}\n")
-                except: pass
+                if DEBUG_MODE:
+                    logger.debug(f"CONNECT ATTEMPT {attempt} FAILED: {e}")
                 if attempt < MAX_ATTEMPTS:
                     await asyncio.sleep(0.05)  # 50ms back-off before retry
 
@@ -139,8 +147,9 @@ class Transcriber(STTProvider):
                         # Mark that we received data to reset any internal watchdog timers
                         self._last_transcript_time = asyncio.get_event_loop().time()
                         
-                        log_msg = f">>> DG RAW: '{sentence}' (Conf: {conf:.2f}, Final: {is_final}, Lang: {detected_lang})\n"
-                        logger.debug(log_msg.strip())
+                        if DEBUG_MODE:
+                            log_msg = f">>> DG RAW: '{sentence}' (Conf: {conf:.2f}, Final: {is_final}, Lang: {detected_lang})\n"
+                            logger.debug(log_msg.strip())
                     
                     # Process transcripts
                     if len(sentence) > 0:

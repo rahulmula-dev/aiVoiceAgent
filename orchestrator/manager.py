@@ -121,19 +121,35 @@ class VoiceOrchestrator:
         return False
 
     def _on_stt_listener_error(self, err: Exception):
-        """Called when the Deepgram _listen loop crashes. Creates a CRM ticket."""
+        """Called when the Deepgram _listen loop crashes. Triggers fatal fallback and cleanup."""
         if not self.crm:
             return
-        call_id = (self.session.crm_call_id or self.session.session_id) if self.session else getattr(self, 'sid', 'unknown')
+        
+        logger.error(f"[FATAL] STT Listener Crash: {err}")
+        
+        # 1. Create forensic ticket
+        call_id = (self.session.crm_call_id or self.session.session_id) if self.session else getattr(self, '_early_sid', 'unknown')
         self._create_task_with_log(self.crm.create_ticket(
-            transcript=f"[SYSTEM_EVENT] STT Listener (Deepgram WebSocket) failed: {err}",
-            summary="System Alert: STT Listener Failure",
+            transcript=f"[SYSTEM_EVENT] STT Listener (Deepgram WebSocket) crashed mid-call: {err}",
+            summary="System Alert: STT Listener Failure (Fatal)",
             sentiment="Negative",
             call_logger=self.call_logger,
             call_id=call_id,
             title="System Alert: STT Listener Failure",
             session_obj=self.session
         ))
+
+        # 2. Trigger No-Silence Guarantee (PRD §7)
+        async def _fatal_fallback():
+            try:
+                # Play apology before hanging up
+                async for chunk in self.synthesizer.speak(PRDScripts.APOLOGY_FATAL):
+                    await self._send_response_chunk(chunk)
+                await asyncio.sleep(2.0)
+            except: pass
+            await self.cleanup()
+
+        self._create_task_with_log(_fatal_fallback())
 
     async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
         """
@@ -1823,7 +1839,7 @@ class VoiceOrchestrator:
                             summary="Silence Termination",
                             sentiment="Neutral",
                             call_logger=self.call_logger,
-                            call_id=self.session.session_id,
+                            call_id=self.session.crm_call_id or self.session.session_id,
                             structured_turns=self.session.structured_turns
                         )
                     except Exception as e:

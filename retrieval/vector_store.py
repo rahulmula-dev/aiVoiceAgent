@@ -94,7 +94,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
 
         # PRD §5 RETRY LOOP: 2 attempts, ≤300ms each
         MAX_ATTEMPTS = 2
-        ATTEMPT_TIMEOUT = 0.8  # 800ms account for network latency
+        ATTEMPT_TIMEOUT = 0.3  # 300ms budget per PRD §5
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):

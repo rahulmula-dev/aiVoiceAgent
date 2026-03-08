@@ -19,7 +19,7 @@ from contracts.policy import PRDScripts
 
 # Pillar 2: Anti-Freeze Timeouts
 LLM_TIMEOUT = 0.5
-RAG_TIMEOUT = 0.35
+RAG_TIMEOUT = 0.3
 
 class Brain(LLMEngine):
     # 1. DEFINE SOURCE OF TRUTH FOR REFUSAL SCRIPT
@@ -280,7 +280,7 @@ class Brain(LLMEngine):
             has_grounding = bool(context_text and context_text not in invalid_contexts)
             
             # Logging accuracy fix: 'kb_hit' means GOOD hit, not just ANY hit
-            
+            if not has_grounding:
                 context_text = "No specific documents found."
                 has_grounding = False
                 rag_score = 0.0
