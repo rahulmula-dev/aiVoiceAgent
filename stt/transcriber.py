@@ -42,6 +42,15 @@ class Transcriber(STTProvider):
         self.ws = None
         self._keep_alive_task = None
         self._listener_error_callback = None
+        
+        # Diagnostics
+        self._packet_counter = 0
+        self._total_packets = 0
+        self._silent_packets = 0
+        self._voice_packets = 0
+        self._is_listening = False
+        self._last_keepalive_time = 0
+        self._heartbeat_task = None
 
     def set_callback(self, callback):
         self.on_transcript_callback = callback
@@ -68,9 +77,9 @@ class Transcriber(STTProvider):
             "replace=Male:Nail",
         ]
 
-        # Task 3: Architect Rule - detect_language is unsupported for streaming (causes HTTP 400)
         # We use 'en' as the default engine to prevent 400 Errors.
         params.append("language=en")
+        params.append("keepalive=true")
 
         url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
         headers = {
@@ -90,7 +99,7 @@ class Transcriber(STTProvider):
         # The WebSocket handshake to Deepgram can legitimately take 1-3s depending on
         # network conditions over Ngrok.
         MAX_ATTEMPTS = 2
-        ATTEMPT_TIMEOUT = 5.0  # 5s per attempt for TCP handshake resilience
+        ATTEMPT_TIMEOUT = 15.0  # 15s for TCP handshake resilience in high-latency environments
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -99,10 +108,8 @@ class Transcriber(STTProvider):
                     websockets.connect(url, additional_headers=headers),
                     timeout=ATTEMPT_TIMEOUT
                 )
-                logger.info(f"[DEEPGRAM] Connected OK (attempt {attempt}, encoding={self.encoding}, rate={self.sample_rate})")
-                if DEBUG_MODE:
-                    logger.debug(f"CONNECTED OK (attempt {attempt}): encoding={self.encoding} sample_rate={self.sample_rate}")
-
+                self._is_listening = True
+                self._start_heartbeat()
                 asyncio.create_task(self._listen())
                 return True
             except (asyncio.TimeoutError, Exception) as e:
@@ -142,6 +149,13 @@ class Transcriber(STTProvider):
                 msg_type = data.get("type")
                 if msg_type == "Metadata":
                     logger.debug(f"DG Metadata Received (ID: {data.get('request_id')})")
+                    continue
+                if msg_type == "Error":
+                    logger.error(f"[DEEPGRAM ERROR] {data.get('message')}: {data.get('description')}")
+                    continue
+
+                if not self.on_transcript_callback:
+                    # If we have no callback (i.e. connection is idle in the pool), drain and ignore the results
                     continue
 
                 if "channel" in data:
@@ -191,6 +205,13 @@ class Transcriber(STTProvider):
 
         except Exception as e:
             logger.error(f"ERROR - Deepgram Listener Exception: {e}")
+        finally:
+            self._is_listening = False
+            self._stop_heartbeat()
+            if self.ws:
+                try: await self.ws.close()
+                except: pass
+            logger.info(f"Deepgram Listener Loop terminated for {id(self)}")
             if self._listener_error_callback:
                 try:
                     cb = self._listener_error_callback(e)
@@ -255,6 +276,54 @@ class Transcriber(STTProvider):
                 raise ConnectionError(f"STT Connection Dropped: {e}")
         else:
             raise ConnectionError("STT Connection is not established or was closed.")
+
+    def _start_heartbeat(self):
+        self._stop_heartbeat()
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    def _stop_heartbeat(self):
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+    async def _heartbeat_loop(self):
+        """Active background heartbeat to satisfy Deepgram's inactivity timeout."""
+        try:
+            while self._is_listening:
+                await asyncio.sleep(10) # Send every 10 seconds
+                if self.ws and not getattr(self.ws, 'closed', True):
+                    await self.send_keepalive()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Heartbeat loop error: {e}")
+
+    async def send_keepalive(self):
+        """
+        Sends the official Deepgram JSON keepalive.
+        PRD: Ensure connections don't die while pooled.
+        """
+        if self.ws and not getattr(self.ws, 'closed', True):
+            try:
+                # Official Deepgram Heartbeat: {"type": "KeepAlive"}
+                # See: https://developers.deepgram.com/docs/keep-alive
+                await self.ws.send(json.dumps({"type": "KeepAlive"}))
+                self._last_keepalive_time = asyncio.get_event_loop().time()
+            except Exception as e:
+                logger.debug(f"KeepAlive failed: {e}")
+
+    def reset_state(self):
+        """Resets the Transcriber state so it can be returned to the connection pool clean"""
+        self.on_transcript_callback = None
+        self._packet_counter = 0
+        self._total_packets = 0
+        self._silent_packets = 0
+        self._voice_packets = 0
+        self._listener_error_callback = None
+        if hasattr(self, '_last_voice_timestamp'):
+            delattr(self, '_last_voice_timestamp')
+        if hasattr(self, '_first_voice_detected'):
+            delattr(self, '_first_voice_detected')
 
     async def close(self):
         """Gracefully closes the connection"""

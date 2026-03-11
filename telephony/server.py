@@ -46,6 +46,17 @@ async def startup_event():
     # S4-7 Additions: Reset active concurrency tracking on startup
     from telephony.concurrency import reset_active_calls
     reset_active_calls()
+
+    # S5-1: Initialize Connection Pools synchronously before accepting calls
+    from stt.stt_pool import stt_pool
+    from tts.elevenlabs_pool import elevenlabs_pool
+    
+    logger.info("Initializing pre-warmed WebSocket pools...")
+    # S5-1: strict raise instead of swallowing
+    await stt_pool.initialize()
+
+    if os.getenv("TTS_PROVIDER", "deepgram").lower() == "elevenlabs":
+        await elevenlabs_pool.initialize()
     
     # [HIGH-P3-04] Activate CRM Failover Reconciliation Worker
     from crm.reconciliation_job import start_background_worker
@@ -423,6 +434,7 @@ async def handle_media_stream(websocket: WebSocket):
     # Initialize Logger - PILLAR 3 will now create the Ghost File on disk immediately
     call_logger = CallLogger(call_id=session_id, caller_number=from_number)
     bind_call_context(session_id, from_number)
+    logger.info(f">>> NEW WEBSOCKET CONNECTION: session={session_id} call_sid={call_sid} from={from_number}")
     call_logger.log_event("telephony", "call_connected", meta={"call_sid": call_sid})
 
     manager = None
@@ -430,7 +442,7 @@ async def handle_media_stream(websocket: WebSocket):
         await websocket.accept()
         
         # Use factory with shared session manager
-        manager = create_default_orchestrator(call_logger=call_logger, session_manager=default_session_manager)
+        manager = await create_default_orchestrator(call_logger=call_logger, session_manager=default_session_manager)
         
         # Register for zombie recovery access
         default_session_manager.register_orchestrator(session_id, manager)
@@ -442,12 +454,47 @@ async def handle_media_stream(websocket: WebSocket):
         logger.warning(f"WebSocket {session_id} cancelled (likely disconnection).")
         call_logger.reason = "user_hangup"
     except Exception as e:
+        if type(e).__name__ == "PoolExhaustedError":
+            logger.error(f"[CAPACITY] Call {session_id} rejected due to exhausted pool: {e}")
+            call_logger.log_event("telephony", "call_rejected", meta={"reason": "pool_exhausted"})
+            try:
+                from crm.client import CRMClient
+                crm_client = CRMClient()
+                asyncio.create_task(
+                    crm_client.create_ticket(
+                        transcript="System capacity reached. Call politely rejected.",
+                        summary=f"Call rejected gracefully for {from_number} due to connection pool exhaustion (Concurrency Cap Reached).",
+                        sentiment="negative"
+                    )
+                )
+            except Exception as crm_e:
+                logger.error(f"Failed to create CRM ticket for rejected call: {crm_e}")
+
+            try:
+                from tts.synthesizer import Synthesizer
+                synth = Synthesizer()
+                await synth.play_fallback_audio(websocket, streamSid=call_sid)
+                await asyncio.sleep(1)
+                await websocket.close(code=1008, reason="Pool Exhausted")
+            except:
+                pass
+            call_logger.reason = "capacity_exhausted"
+            return
+            
         call_logger.log_event("telephony", "call_failed", meta={"error": str(e)})
         logger.error(f"Media stream error for {session_id}: {e}", exc_info=True)
         call_logger.reason = "error"
     finally:
         # 2. EMERGENCY FLUSH (Forensic Pillar 2) - Mandatory execution
         # Regardless of how we exit (crash, cancel, success), save the audit trace.
+        
+        # 🟢 ABRUPT DISCONNECT SAFETY (S4 Fix): Instantly return pooled sockets
+        if manager:
+            try:
+                await manager.cleanup()
+            except Exception as e:
+                logger.error(f"Manager cleanup failed during disconnect for {session_id}: {e}")
+                
         call_logger.generate_summary_line()
         call_logger.save_log(session_obj=manager.session if manager else None)
         logger.info(f"Forensic Audit trace finalized for {session_id}")

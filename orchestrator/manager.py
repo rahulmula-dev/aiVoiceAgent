@@ -800,10 +800,9 @@ class VoiceOrchestrator:
             
             logger.info(f"AI (Refusal): {text} (Sent {chunks_sent} audio chunks)")
             if self.session:
-                # log_conversation_turn is deprecated (PRD P3-07)
                 pass
             
-            # SYNC FIX: Wait for the agent to finish speaking before allowing more input
+            # Typical Pattern: Wait for the agent to finish speaking before allowing more input
             if self.mode == "audio":
                 # Estimate how long it will take to speak the text (Approx 15 chars/sec)
                 duration = len(text) / 15.0
@@ -931,7 +930,8 @@ class VoiceOrchestrator:
             while True:
                 # 1. Wait for 'start' or first 'media' to get Identity
                 try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=0.3)
+                    # [FIX]: Increase timeout from 0.3s to 2.0s to allow for network jitter during Twilio handshake
+                    message = await asyncio.wait_for(websocket.receive(), timeout=2.0)
                 except asyncio.TimeoutError:
                     if not sid:
                         logger.warning("Identity detection timed out. Using fallback IDs.")
@@ -1160,9 +1160,6 @@ class VoiceOrchestrator:
                 logger.error(f"Text Orchestrator Error: {e}", exc_info=True)
             # Cleanup is handled by session_scope primarily, but we can keep explicit cleanup if needed for websocket/tasks
             # but session_scope handles the session end.
-            # We'll keep manual cleanup for websocket closure if needed, but remove await self.cleanup() if it conflicts.
-            # actually manager.py cleanup() does a lot. let's keep it but ensure it doesn't double-close session if scope does it.
-            # The session_scope ends the session in session_manager. 
             # cleanup() also calls session_manager.end_session.
             # To be safe and simple: just wrap the loop. 
             finally:
@@ -1253,7 +1250,7 @@ class VoiceOrchestrator:
                             logger.error(f"TTS Synthesis Failed: {e}. Triggering fallback audio.")
                             # PRD §7: No-Silence Guarantee. Trigger local fallback.
                             if hasattr(self.synthesizer, 'play_fallback_audio'):
-                                await self.synthesizer.play_fallback_audio(self.websocket)
+                                await self.synthesizer.play_fallback_audio(self.websocket, streamSid=self.sid)
                             
                         audio_queue.task_done()
                     
@@ -1651,20 +1648,31 @@ class VoiceOrchestrator:
                     self.response_task.cancel()
                     try:
                         await self.response_task
-                    except asyncio.CancelledError:
+                    except (asyncio.CancelledError, Exception):
                         pass
 
             # Cancel Silence Monitor
-            if self.silence_task and not self.silence_task.done():
-                logger.debug("Cleanup: Cancelling silence monitor")
-                self.silence_task.cancel()
+            try:
+                if self.silence_task and not self.silence_task.done():
+                    logger.debug("Cleanup: Cancelling silence monitor")
+                    self.silence_task.cancel()
+            except Exception as e:
+                pass
 
-            if self.transcriber: 
-                logger.debug("Cleanup: Closing Transcriber")
-                await self.transcriber.close()
+            try:
+                if self.transcriber: 
+                    logger.debug("Cleanup: Closing Transcriber")
+                    await self.transcriber.close()
+            except Exception as e:
+                logger.error(f"Cleanup: Transcriber close failed: {e}")
                 
-            logger.debug("Cleanup: Closing Synthesizer")
-            await self.synthesizer.close()
+            try:
+                if self.synthesizer:
+                    logger.debug("Cleanup: Closing Synthesizer")
+                    await self.synthesizer.close()
+            except Exception as e:
+                logger.error(f"Cleanup: Synthesizer close failed: {e}")
+                
             # LAYERED FALLBACK: Null-Safe Ticket Data (DLQ-wrapped for exception safety)
             try:
                 if self.session and self.session.conversation_history:

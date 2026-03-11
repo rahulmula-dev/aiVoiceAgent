@@ -14,6 +14,9 @@ class TTSException(Exception):
     """Custom exception for TTS failures."""
     pass
 
+# Global shared client for Deepgram TTS Keep-Alive pooling across calls
+_SHARED_CLIENT: httpx.AsyncClient = None
+
 class Synthesizer(TTSEngine):
     def __init__(self, encoding="mulaw", sample_rate=8000):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
@@ -21,36 +24,25 @@ class Synthesizer(TTSEngine):
             logger.error("DEEPGRAM_API_KEY is missing")
             raise ValueError("DEEPGRAM_API_KEY not found")
         
-        # Workstream 2: AI Data Residency (CRITICAL-P3-02)
-        # [PRD] Strict enforcement for production
-        # if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
-        #     logger.critical("RESIDENCY VIOLATION: DPA_CANADA_ACTIVE is not set. Deepgram data export blocked.")
-        #     raise Exception("Data Residency Violation: Canadian DPA required for Deepgram TTS.")
-        
-        # [DEV] Bypassed for local testing so calls don't crash
         if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
             logger.warning("[DEV] DPA_CANADA_ACTIVE not set. Bypassing residency check for TTS local testing.")
         
-        # Deepgram Aura Options
         self.url = f"https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding={encoding}&sample_rate={sample_rate}&container=none"
-        self._client = None
         self._active_texts = {} # call_id -> current_text
         self._stop_signals = set() # call_id
 
     async def _get_client(self):
+        global _SHARED_CLIENT
         # Pillar 3: Persistence for Latency Reduction
-        if self._client is None or self._client.is_closed:
-            # Optimize connection pool
-            # Set keepalive_expiry to 5s to avoid using stale connections
-            limits = httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=5.0)
-
-            # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-            # self._client = httpx.AsyncClient(timeout=0.3, limits=limits)
+        if _SHARED_CLIENT is None or _SHARED_CLIENT.is_closed:
+            # Optimize connection pool for high concurrency
+            pool_size = int(os.getenv("ELEVENLABS_POOL_SIZE", "30")) # Share the same limit
+            limits = httpx.Limits(max_keepalive_connections=pool_size, max_connections=pool_size, keepalive_expiry=5.0)
 
             # --- [LOCAL TESTING TIMERS] ---
-            self._client = httpx.AsyncClient(timeout=10.0, limits=limits)
-            logger.debug("Persistent TTS HTTP client initialized.")
-        return self._client
+            _SHARED_CLIENT = httpx.AsyncClient(timeout=10.0, limits=limits)
+            logger.debug("Persistent TTS HTTP shared client initialized.")
+        return _SHARED_CLIENT
 
     async def speak(self, text_input, call_id=None):
         """
@@ -92,7 +84,7 @@ class Synthesizer(TTSEngine):
                     # TTFA_BUDGET = 0.3 
                     
                     # --- [LOCAL TESTING TIMERS] ---
-                    TTFA_BUDGET = 3.0  # 3s TTFA ceiling (network-resilient)
+                    TTFA_BUDGET = 15.0  # 15s TTFA ceiling (network-resilient for local dev/testing)
                     try:
                         # Calculate remaining budget for TTFA
                         elapsed = asyncio.get_event_loop().time() - start_ttfa
@@ -127,12 +119,13 @@ class Synthesizer(TTSEngine):
             except Exception as e:
                 logger.error(f"TTS Failure after {max_retries} attempt: {e}")
                 # Pillar 3: Force client recreation on next session if it failed
-                if self._client:
-                    await self._client.aclose()
-                    self._client = None
-                raise TTSException(f"TTS API Failure: {e}")
+                # [FIX]: Ensure global client is cleared on fatal error
+                import tts.synthesizer
+                tts.synthesizer._SHARED_CLIENT = None
+                logger.error(f"TTS POST Failed: {e}")
+                raise TTSException(f"TTS Service Unreachable: {e}")
 
-    async def play_fallback_audio(self, websocket):
+    async def play_fallback_audio(self, websocket, streamSid: str = None):
         """
         Streams a local pre-recorded audio file to the WebSocket.
         Chunks data into 160-byte segments (20ms of audio @ 8kHz mulaw).
@@ -162,13 +155,17 @@ class Synthesizer(TTSEngine):
                             "payload": base64.b64encode(chunk).decode("utf-8")
                         }
                     }
+                    if streamSid:
+                        media_msg["streamSid"] = streamSid
+                        
                     await websocket.send_text(json.dumps(media_msg))
                     
-                    # Throttle to 20ms to mimic real-time playback
-                    await asyncio.sleep(0.02)
+                    # Throttle to 15ms to mimic real-time playback
+                    await asyncio.sleep(0.015)
             logger.debug("Fallback audio streaming complete.")
         except Exception as e:
-            logger.error(f"Failed to play fallback audio: {e}")
+            import traceback
+            logger.error(f"Error streaming fallback audio: {e}\n{traceback.format_exc()}")
 
     def stop_current_speech(self, call_id: str) -> str:
         """
@@ -180,10 +177,25 @@ class Synthesizer(TTSEngine):
         logger.info(f"Interrupted speech for {call_id}: '{text}'")
         return text
 
+    def reset_state(self):
+        """TTSEngine Interface compatibility: clear cache/buffers between calls."""
+        self._stop_signals.clear()
+        self._active_texts.clear()
+
     async def close(self):
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            logger.info("Persistent TTS HTTP client closed.")
+        """
+        Does NOT close the shared HTTP Keep-Alive client.
+        We just clean up internal states.
+        """
+        self.reset_state()
+        logger.debug("Synthesizer instance returned (shared HTTP pool remains active).")
+        
+    @classmethod
+    async def shutdown_client(cls):
+        global _SHARED_CLIENT
+        if _SHARED_CLIENT and not _SHARED_CLIENT.is_closed:
+            await _SHARED_CLIENT.aclose()
+            logger.info("Persistent TTS HTTP shared client closed.")
 
 if __name__ == "__main__":
     # Test
