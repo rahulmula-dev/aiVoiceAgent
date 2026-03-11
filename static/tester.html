@@ -159,6 +159,7 @@
         let mediaStream;
         let scriptProcessor;
         let isConnected = false;
+        let isSpeaking = false;
         let nextPlayTime = 0;
         let activeSources = [];
 
@@ -204,11 +205,12 @@
                     }
                 });
 
-                // 3. Connect WebSocket
+                // 3. Connect WebSocket (with Token Support)
+                const urlParams = new URLSearchParams(window.location.search);
+                const token = urlParams.get('token') || '';
+
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                ws = new WebSocket(`${protocol}//${window.location.host}/ws/browser`);
-                // For local static file testing, hardcode localhost port if needed:
-                // ws = new WebSocket(`ws://localhost:8085/ws/browser`);
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws/browser?token=${token}`);
 
                 ws.onopen = () => {
                     log("WebSocket Connected");
@@ -296,6 +298,18 @@
                 if (meter) meter.style.width = Math.min(100, volume * 400) + "%";
 
                 const pcmData = f32toPCM16(inputData);
+
+                // Quick VAD for immediate Stop
+                if (volume > 0.05) {
+                    if (!isSpeaking) {
+                        isSpeaking = true;
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ event: "speech" }));
+                        }
+                    }
+                } else if (volume < 0.01) {
+                    isSpeaking = false;
+                }
 
                 // Robust Base64 conversion
                 const bytes = new Uint8Array(pcmData.buffer);

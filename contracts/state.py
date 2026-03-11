@@ -44,11 +44,11 @@ class StateMachine:
                 CallState.ESCALATION
             ],
             
-            CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING],
+            CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
-            CallState.RETRIEVAL: [CallState.RESPONSE_VALIDATION, CallState.ESCALATION],
+            CallState.RETRIEVAL: [CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
-            CallState.RESPONSE_VALIDATION: [CallState.SPEAKING, CallState.ESCALATION, CallState.LISTENING],
+            CallState.RESPONSE_VALIDATION: [CallState.SPEAKING, CallState.ESCALATION, CallState.LISTENING, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
             CallState.ESCALATION: [CallState.CALL_END, CallState.SPEAKING],
             

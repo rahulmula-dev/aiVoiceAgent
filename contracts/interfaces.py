@@ -72,6 +72,14 @@ class CRMEngine(Protocol):
         duration_seconds: int = 0
     ) -> Any: ...
     
+    async def create_callback(
+        self,
+        ticket_id: str,
+        phone_number: str,
+        reason: str,
+        preferred_time: str = "ASAP"
+    ) -> Any: ...
+    
 
 
     async def get_ticket_status(self, ticket_id: str) -> dict: ...

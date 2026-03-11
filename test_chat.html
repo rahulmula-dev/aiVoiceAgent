@@ -40,8 +40,11 @@
     let ws;
 
     function connect() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const token = urlParams.get('token') || '';
+        
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/chat`);
+        ws = new WebSocket(`${protocol}//${window.location.host}/chat?token=${token}`);
 
         ws.onopen = () => {
             statusDiv.textContent = "Connected | Logic Active | Zero Cost";
@@ -56,7 +59,7 @@
         };
 
         ws.onclose = () => {
-            statusDiv.textContent = "Disconnected. Refresh to retry.";
+            statusDiv.textContent = "Disconnected. Refresh with ?token=... to retry.";
             statusDiv.style.color = "red";
             input.disabled = true;
             btn.disabled = true;
@@ -64,7 +67,7 @@
         
         ws.onerror = (e) => {
             console.error(e);
-            statusDiv.textContent = "Connection Error";
+            statusDiv.textContent = "Auth Error: Check if token is valid.";
         }
     }
 

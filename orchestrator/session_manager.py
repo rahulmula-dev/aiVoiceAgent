@@ -14,7 +14,9 @@ REDIS_URL = os.getenv("REDIS_URL")
 try:
     if REDIS_URL:
         import redis
-        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=0.1, socket_connect_timeout=0.1)
+        # Attempt a quick ping to confirm it is actually alive before proceeding
+        redis_client.ping()
         logger.info(f"Connected to Redis at {REDIS_URL}")
     else:
         redis_client = None

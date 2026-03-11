@@ -1,9 +1,11 @@
 # Telephony Server - Twilio Entry Point (Modular v2)
 import os
+import asyncio
 import logging
 import uvicorn
+from typing import List, Dict, Any, Optional
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, Request, Response, Header, HTTPException, status
+from fastapi import FastAPI, WebSocket, Request, Response, Header, HTTPException, status, Depends, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from orchestrator.manager import VoiceOrchestrator
@@ -99,61 +101,58 @@ async def readyz():
     PRD: CRM failure is NON-CRITICAL (S3 DLQ handles failover).
     """
     import asyncio
-    
-    # Run all health checks in parallel with a 2.0s timeout (Pillar 2: Latency)
+
+    async def _safe(coro):
+        """Wraps each health check so individual timeouts never crash the probe."""
+        try:
+            # [PRD] return await asyncio.wait_for(coro, timeout=2.0)  # 2s strict for K8s
+            # [DEV] Slightly longer so CRM's own 2s timeout resolves cleanly first
+            return await asyncio.wait_for(coro, timeout=3.5)
+        except Exception:
+            return False
+
     try:
-        # Wrap everything in a hard timeout to prevent /readyz from hanging
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                _crm_checker.check_health(),
-                _kb_checker.check_health(),
-                asyncio.to_thread(check_redis_health),
-                return_exceptions=True
-            ),
-            timeout=2.0
+        crm_ok, kb_ok, redis_ok = await asyncio.gather(
+            _safe(_crm_checker.check_health()),
+            _safe(_kb_checker.check_health()),
+            _safe(asyncio.to_thread(check_redis_health)),
         )
-        
-        crm_ok = results[0] if not isinstance(results[0], Exception) else False
-        kb_ok = results[1] if not isinstance(results[1], Exception) else False
-        redis_ok = results[2] if not isinstance(results[2], Exception) else False
         stt_ok = bool(os.getenv("DEEPGRAM_API_KEY"))
-        
+
         status_map = {
             "crm": "connected" if crm_ok else "degraded (DLQ active)",
             "retrieval": "ready" if kb_ok else "failed",
             "redis": "connected" if redis_ok else "disconnected",
             "stt": "configured" if stt_ok else "missing_key"
         }
-        
+
         # PARTIAL DEGRADATION POLICY:
         # Redis, STT, and KB are required for a baseline "High Quality" call.
         # CRM is optional because we have robust S3-based DLQ failover.
         is_ready = all([kb_ok, redis_ok, stt_ok])
-        
+
         if not is_ready:
             logger.warning(f"[HEALTH] Readiness probe failed (CRITICAL): {status_map}")
             return Response(
-                content=f"Service Unhealthy: {status_map}", 
+                content=f"Service Unhealthy: {status_map}",
                 status_code=503,
                 media_type="application/json"
             )
-            
+
         if not crm_ok:
             logger.warning(f"[HEALTH] Running in DEGRADED mode (CRM unavailable): {status_map}")
 
         return {
-            "status": "ready" if is_ready else "unhealthy",
+            "status": "ready",
             "mode": "production" if crm_ok else "degraded (logging via DLQ)",
             "timestamp": datetime.now().isoformat(),
             "services": status_map
         }
-        
-    except asyncio.TimeoutError:
-        logger.error("[HEALTH] Readiness probe TIMEOUT after 2.0s")
-        return Response(content="Readiness Check Timeout", status_code=504)
+
     except Exception as e:
-        logger.error(f"[HEALTH] Critical failure during readiness check: {e}")
+        logger.error(f"[HEALTH] Unexpected readiness check failure: {e}")
         return Response(content="Readiness Check Error", status_code=500)
+
 
 @app.post("/admin/reload-config")
 async def reload_config(
@@ -378,7 +377,7 @@ async def handle_incoming_call(request: Request):
 
     # Pass statusCallback on the stream/stream wrapper isn't natively standard for Stream cleanup, 
     # instead we will monitor standard Twilio Call Status Webhook callbacks for the Number itself.
-    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect machineDetection="Enable"><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
     return Response(content=twiml, media_type="application/xml")
 
 @app.post("/api/call-status")
@@ -426,6 +425,7 @@ async def handle_media_stream(websocket: WebSocket):
     bind_call_context(session_id, from_number)
     call_logger.log_event("telephony", "call_connected", meta={"call_sid": call_sid})
 
+    manager = None
     try:
         await websocket.accept()
         
@@ -449,7 +449,7 @@ async def handle_media_stream(websocket: WebSocket):
         # 2. EMERGENCY FLUSH (Forensic Pillar 2) - Mandatory execution
         # Regardless of how we exit (crash, cancel, success), save the audit trace.
         call_logger.generate_summary_line()
-        call_logger.save_log(session_obj=getattr(manager, 'session', None))
+        call_logger.save_log(session_obj=manager.session if manager else None)
         logger.info(f"Forensic Audit trace finalized for {session_id}")
         default_session_manager.unregister_orchestrator(session_id)
         default_session_manager.end_session(session_id)

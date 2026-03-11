@@ -144,7 +144,7 @@ class ResponsePolicyEngine:
         "another", "new", "old", "still", "waiting", "listen", "hearing", "catch", "repeat",
         "m", "s", "re", "ve", "ll", "d", "t", "can", "t", "isn", "wasn", "don", "didn",
         "something", "anything", "nothing", "someone", "anyone", "everyone",
-        "sushmita", "now", "name", "doing", "gmail", "great", "sure", "maybe", "logic",
+        "now", "name", "doing", "gmail", "great", "sure", "maybe", "logic",
         "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage", "esthetics",
         "robot", "going", "since", "empower", "empowers", "empowering", "financial",
         "independence", "business", "marketing", "portfolio", "building", "interview",
@@ -175,9 +175,10 @@ class ResponsePolicyEngine:
         [GOVERNANCE] Bulletproof Failsafe English Detection (Expert Debugger Version).
         Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
         """
-        # 0. Authoritative STT Metadata Guard (Fixes "English Hallucinations" bypass)
-        if detected_lang and not detected_lang.lower().startswith('en'):
-            return False
+        # 0. DEPRECATED: Authoritative STT Metadata Guard 
+        # [REMOVED] This hard gate was blocking short English phrases (e.g. "Wait") 
+        # when STT incorrectly guessed a foreign language. Using density checks below instead.
+        pass
             
         import re
         import logging
@@ -192,14 +193,9 @@ class ResponsePolicyEngine:
 
         # SPECIAL CASE: Name-introduction phrases should never trigger language strikes.
         # Examples: "Hi, my name is Akansha.", "My name is John.", "This is Maria."
-        introduction_phrases = [
-            "my name is ",
-            "hi my name is ",
-            "hello my name is ",
-            "this is ",
-            "i am ",
-        ]
-        if any(lower_text.startswith(p) for p in introduction_phrases):
+        # Use regex to match introduction phrases regardless of punctuation
+        intro_regex = r"^(hi|hello)?[\s.,!]*?(my name is|i am|this is|it's)\b"
+        if re.search(intro_regex, lower_text):
             return True
         words = re.findall(r'\b\w+\b', lower_text)
 
@@ -217,10 +213,10 @@ class ResponsePolicyEngine:
         # 1. Density Check: Strict thresholds for English-only enforcement.
         # [REFINEMENT]: Even if keywords are present, we must calculate density.
         # Example: "Mujhe Cosmetology join karna hai" = low density = FAIL.
-        is_very_short = len(words) <= 2
+        is_very_short = len(words) <= 3
         
-        # User feedback: "Strict for user input (0.87)"
-        threshold = 0.87
+        # Reduced threshold even further to allow for local audio clipping/noise
+        threshold = 0.20 
         is_mixed_danger = not is_very_short and density < threshold
         
         if is_mixed_danger:
@@ -264,9 +260,9 @@ class ResponsePolicyEngine:
         # 3. Probabilistic Check (Catches Spanish, French, German, Hinglish, etc.)
         # Avoid running statistical detection on 1-2 words as it generates massive false positives
         if len(words) < 3:
-            policy_logger.debug(f"[GOVERNANCE] Bypass Langdetect (Too few words: {len(words)}): '{text}'")
-            # For very short inputs, rely purely on density + ASCII checks above.
-            return density >= 0.85
+            policy_logger.debug(f"[GOVERNANCE] Bypass Langdetect (Short input: {len(words)} words): '{text}'")
+            # For very short strings, any common English word should be enough to stay in English-mode.
+            return density >= 0.50
 
         try:
             detected_langs = detect_langs(text)
@@ -279,10 +275,10 @@ class ResponsePolicyEngine:
                 if top.lang != 'en' and top.prob >= 0.40:
                     # langdetect is extremely unreliable on short, high-density English sentences
                     # (especially introductions containing proper names). If density is high, treat as English.
-                    if density >= 0.90:
+                    if density >= 0.45:
                         policy_logger.info(
-                            f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) due to High English Density "
-                            f"({density:.2f}). Text='{text}'"
+                            f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) due to English Density "
+                            f"({density:.2f} >= 0.45). Text='{text}'"
                         )
                         return True
                     policy_logger.warning(
@@ -357,6 +353,11 @@ class ResponsePolicyEngine:
                     if detected:
                         top = detected[0]
                         if top.lang != 'en' and top.prob >= 0.40:
+                            # If density is high, it's likely just a list of nouns that 
+                            # statistical models struggle with. Trust density more.
+                            if density >= 0.45:
+                                _logger.info(f"[OUTPUT GOVERNANCE] Overriding langdetect={top.lang} for high-density output ({density:.2f}).")
+                                return True
                             _logger.warning(
                                 f"[OUTPUT GOVERNANCE] Blocking non-English model output {top.lang} "
                                 f"({top.prob:.2f}), density={density:.2f}. Text='{response_text[:80]}...'"

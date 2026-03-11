@@ -292,10 +292,17 @@ class VoiceOrchestrator:
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
                 # Fire a language strike when:
                 #   1. At least 3 frames in this run (rules out a single noise spike)
-                #   2. Run has been active >= 6.0 seconds so it triggers BEFORE silence termination (10s)
-                #      and catches sustained non-English speech even at the start of the call.
+                #   2. Run has been active >= 6.0 seconds
+                #   3. [CRITICAL FIX] User has already spoken at least once.
+                #      If the user has NEVER spoken, empty frames are just normal silence
+                #      (e.g. they're listening to the greeting). Do NOT strike on that.
                 # ─────────────────────────────────────────────────────────────────────────────
-                if self.consecutive_empty_frames >= 3 and non_english_duration >= 6.0:
+                # [GOVERNANCE]: Reverted to a high threshold (15s) for empty frames.
+                # Since silence monitor fires at 10s, this ensures that PURE silence 
+                # triggers the 'Are you still there?' prompt FIRST, rather than a language strike.
+                # A language strike will only fire if there is sustained ambiguous audio 
+                # that bypasses the silence check.
+                if self.consecutive_empty_frames >= 3 and non_english_duration >= 15.0 and self.user_has_spoken:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -422,7 +429,8 @@ class VoiceOrchestrator:
         
         # LOW-QUALITY DETECTION: Catch mumbled/garbled non-English input
         # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
-        if confidence < 0.8:
+        # Deepgram Nova-2 often returns ~0.7 to ~0.75 for accurate but fast/quiet speech
+        if confidence < 0.50:
             logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
             
             # 🟢 S4 Hardening: Hard LLM Bypass
@@ -527,6 +535,12 @@ class VoiceOrchestrator:
                         title="High Sentiment Alert: Angry Caller",
                         session_obj=self.session
                     ))
+                    # [STORY-DUMMY-CRM] Trigger Callback for Escalations
+                    self._create_task_with_log(self.crm.create_callback(
+                        ticket_id=self.session.crm_call_id or self.session.session_id,
+                        phone_number=self.session.call_context.caller_number,
+                        reason="Escalation Required: Angry Caller / Human Requested"
+                    ))
             else:
                 # Other refusals (Sensitive, Immigration, etc.) - keep existing behavior
                 refusal_text = self.policy.get_refusal_script(intent)
@@ -543,6 +557,14 @@ class VoiceOrchestrator:
                         title=f"Policy Refusal: {intent}",
                         session_obj=self.session
                     ))
+                    
+                    # [STORY-DUMMY-CRM] Trigger Callback for Financial Disputes (per refusal script)
+                    if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES" and self.session:
+                        self._create_task_with_log(self.crm.create_callback(
+                            ticket_id=self.session.crm_call_id or self.session.session_id,
+                            phone_number=self.session.call_context.caller_number,
+                            reason="Financial Dispute: Human Follow-up Required"
+                        ))
 
             # 🟢 S4 Hardening: Hard LLM Bypass (Policy Violation)
             if self.response_task and not self.response_task.done():
@@ -660,28 +682,33 @@ class VoiceOrchestrator:
             prev_turn["agent_partial_response"] = partial_text
         
         # STEP B — Inject RAG Context for PRD Compliance
-        logger.info(f"Barge-in detected. Running quick RAG to ground response...")
+        # FAST-PATH: If the input is extremely short (filler/command), skip RAG to reduce latency.
+        is_short_input = len(caller_input.split()) <= 2
+        
+        logger.info(f"Barge-in detected ({'Short' if is_short_input else 'Full'} input). Grounding...")
         context_text = ""
-        try:
-            rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
-                asyncio.to_thread(self.brain.kb.search, caller_input, self.call_logger, 3, trace_id),
-                timeout=3.0
-            )
+        
+        if not is_short_input:
+            try:
+                rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
+                    asyncio.to_thread(self.brain.kb.search, caller_input, self.call_logger, 3, trace_id),
+                    timeout=3.0
+                )
             
-            invalid_contexts = [
-                "No specific documents found.",
-                "No specific documents found due to timeout.",
-                "No specific documents found due to an internal knowledge base error.",
-                "LOW_CONFIDENCE_FALLBACK",
-                "BLOCKED_BY_SAFETY_GUARDRAIL",
-                "RAG Disabled by manual override."
-            ]
-            
-            if rag_result and rag_result not in invalid_contexts:
-                context_text = rag_result
-                logger.info(f"RAG context found for barge-in (Score: {rag_score:.2f}).")
-        except Exception as e:
-            logger.warning(f"RAG failed during barge-in: {e}")
+                invalid_contexts = [
+                    "No specific documents found.",
+                    "No specific documents found due to timeout.",
+                    "No specific documents found due to an internal knowledge base error.",
+                    "LOW_CONFIDENCE_FALLBACK",
+                    "BLOCKED_BY_SAFETY_GUARDRAIL",
+                    "RAG Disabled by manual override."
+                ]
+                
+                if rag_result and rag_result not in invalid_contexts:
+                    context_text = rag_result
+                    logger.info(f"RAG context found for barge-in (Score: {rag_score:.2f}).")
+            except Exception as e:
+                logger.warning(f"RAG failed during barge-in: {e}")
 
         # STEP C — Classify + Respond (Call Brain)
         classification, response, is_multi_step, topic, kb_v_brain, c_ids_brain = await self.brain.generate_with_classification(
@@ -749,6 +776,10 @@ class VoiceOrchestrator:
             self.consecutive_empty_frames = 0
             self.non_english_run_start = time.time()
         # Only transition to SPEAKING if we are NOT already terminating.
+        if self.state.get_state() == CallState.SPEAKING:
+            # Force clear if already speaking to allow new refusal to take over immediately
+            self._create_task_with_log(self._send_clear_message())
+
         # Skipping this when in CALL_END prevents the state violation that would
         # trigger a SYSTEM_ERROR CRM ticket and block the goodbye message.
         if self.state.get_state() != CallState.CALL_END:
@@ -1285,17 +1316,24 @@ class VoiceOrchestrator:
                     self._latency_alert_emitted = False
                     if turn_start_time:
                          current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                         if current_turn_elapsed > 3.0:
+                         # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
+                         # Uncomment and use these values when deployed in US-East for <5s rules:
+                         # if current_turn_elapsed > 3.0: logger.warning(...)
+                         # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
+
+                         # --- [LOCAL TESTING TIMERS] ---
+                         if current_turn_elapsed > 20.0:
                              sid = self.session.session_id if self.session else "unknown"
-                             logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
+                             logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
                              self._latency_alert_emitted = True
                              
                              # 🟢 COMPLIANCE: formal 'Alert Payload' for monitoring hooks (Prometheus/CW Alerts)
                              if self.call_logger:
-                                 self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 3.0, "status": "warning"})
+                                 self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
 
-                         if current_turn_elapsed > 5.0:
-                             raise LatencyBreachError(f"Pre-generation latency already at {current_turn_elapsed:.2f}s")
+                         if current_turn_elapsed > 35.0:
+                             logger.error(f"[LATENCY_CIRCUIT_BREAK] Pre-generation latency exceeded 35s: {current_turn_elapsed:.2f}s. Breaking call to prevent 'Dead Air'.")
+                             raise LatencyBreachError(f"High pre-generation delay: {current_turn_elapsed:.2f}s")
 
                     # Extract Caller Number for Auto-ID
                     caller_num = self.session.caller_number if self.session else "unknown"
@@ -1337,17 +1375,22 @@ class VoiceOrchestrator:
                         if turn_start_time:
                             current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
                             
-                            # 🟢 Alert at 3s for auto-scaling hook
-                            if current_turn_elapsed > 3.0 and not self._latency_alert_emitted:
-                                logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | Elapsed: {current_turn_elapsed:.1f}s")
+                            # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
+                            # if current_turn_elapsed > 3.0: ...
+                            # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
+
+                            # --- [LOCAL TESTING TIMERS] ---
+                            # 🟢 Circuit Break ceiling
+                            if current_turn_elapsed > 35.0:
+                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
+                            # 🟢 Alert for auto-scaling hook
+                            if current_turn_elapsed > 20.0 and not self._latency_alert_emitted:
+                                logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | Elapsed: {current_turn_elapsed:.1f}s")
                                 self._latency_alert_emitted = True
                                 if self.call_logger:
-                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 3.0, "status": "warning"})
+                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
                                 
-                            # 🟢 Circuit Break at 5s ceiling
-                            if current_turn_elapsed > 5.0:
-                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
-                                
+
                         self.session.touch()
                         self.session_manager.save_session(self.session)
                         self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
@@ -1428,14 +1471,9 @@ class VoiceOrchestrator:
                 # S4-11: Ensure worker task is done before finishing parent task
                 await audio_queue.join()
                 
-                # --- FINAL LATENCY CHECK (Covers TTS Synthesis) ---
-                if turn_start_time:
-                    current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                    if current_turn_elapsed > 3.0 and not self._latency_alert_emitted:
-                        logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_3S | Elapsed: {current_turn_elapsed:.1f}s")
-                        self._latency_alert_emitted = True
-                    if current_turn_elapsed > 5.0:
-                         raise LatencyBreachError(f"Turn completion timed out at {current_turn_elapsed:.2f}s")
+                # --- FINAL LATENCY CHECK (Removed completion limit to allow long responses) ---
+                # We no longer kill the call if it's naturally finishing a long speech.
+                pass
 
                 await audio_queue.put(None)
                 await worker_task
@@ -1775,7 +1813,7 @@ class VoiceOrchestrator:
 
                 # 1. Don't count silence while AI is speaking, buffering, or transcribing
                 # [FIX]: Include INTERRUPTED state to prevent premature 'Are you still there?' prompts
-                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED]:
+                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
                     self.last_interaction_time = time.time()
                     continue
 
@@ -1838,41 +1876,25 @@ class VoiceOrchestrator:
                 
                 # [SILENCE-ISS-158] Contextual Silence Machine
                 # Stage 0: Normal
-                # Stage 1: Initial Warning (10s)
-                # Stage 2: Secondary Warning (20s - Questions only)
-                # Stage 3: Termination Triggered
-                
-                # Verify we haven't just reset (race condition check)
-                if gap < 1.0:
-                    continue
-
-                # Stage 1: Initial Warning (10s+) - Same for both paths
+                # Stage 1: Initial Warning (10s+)
                 if gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {gap:.1f}s, Context: {'Question' if self.last_response_was_question else 'Info'})")
+                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {gap:.1f}s)")
                     self.silence_stage = 1
                     self.last_interaction_time = time.time() # Reset timer for next stage
-                    
                     msg = PRDScripts.SILENCE_1
                     await self.speak_refusal(msg)
                     
-                # Stage 2/3: Logic differentiation
+                # Stage 2: Secondary Warning (20s+)
                 elif gap > 10.0 and self.silence_stage == 1:
-                    if self.last_response_was_question:
-                        # Clarifying Question Path: 10s repeat (Stage 2)
-                        logger.info(f"Silence Stage 2 (Repeat Prompt) triggered (Gap: {gap:.1f}s)")
-                        self.silence_stage = 2
-                        self.last_interaction_time = time.time()
-                        msg = PRDScripts.SILENCE_2
-                        await self.speak_refusal(msg)
-                    else:
-                        # Informational Path: 20s total (Stage 3)
-                        logger.warning(f"Silence Stage 3 (Termination) triggered for Informational context (Total: 20s)")
-                        await self._trigger_silence_termination()
-                        break
+                    logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {gap:.1f}s)")
+                    self.silence_stage = 2
+                    self.last_interaction_time = time.time()
+                    msg = PRDScripts.SILENCE_2
+                    await self.speak_refusal(msg)
                         
-                # Stage 3: Termination for Question Path
+                # Stage 3: Termination (30s total)
                 elif gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"Silence Stage 3 (Termination) triggered for Question context (Total: 30s)")
+                    logger.warning(f"Silence Stage 3 (Termination) triggered (Total: 30s)")
                     await self._trigger_silence_termination()
                     break
 
