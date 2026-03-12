@@ -72,7 +72,8 @@ _local_lock = asyncio.Lock()
 def check_redis_health() -> bool:
     """Verifies Redis connectivity for the readiness probe."""
     if not redis_client:
-        return False
+        # For local testing, we fall back to local RAM counters, so it's "ready"
+        return os.getenv("LOCAL_TEST", "false").lower() == "true"
     try:
         return redis_client.ping()
     except Exception as e:

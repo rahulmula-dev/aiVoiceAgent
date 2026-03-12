@@ -140,7 +140,10 @@ async def readyz():
         # PARTIAL DEGRADATION POLICY:
         # Redis, STT, and KB are required for a baseline "High Quality" call.
         # CRM is optional because we have robust S3-based DLQ failover.
-        is_ready = all([kb_ok, redis_ok, stt_ok])
+        local_test = os.getenv("LOCAL_TEST", "false").lower() == "true"
+        # Redis is required in production, but optional in local test mode (RAM counter fallback)
+        redis_required = not local_test
+        is_ready = all([kb_ok, stt_ok]) and (redis_ok or not redis_required)
 
         if not is_ready:
             logger.warning(f"[HEALTH] Readiness probe failed (CRITICAL): {status_map}")

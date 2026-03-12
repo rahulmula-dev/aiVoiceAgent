@@ -180,7 +180,7 @@ class VoiceOrchestrator:
                         logger.debug(f"[STREAM BUFFER] Starting proactive KB lookup for: '{raw_text}'")
                         # Fire and forget KB search
                         self.session.prefetched_context_task = asyncio.create_task(
-                            asyncio.to_thread(self.brain.kb.search, raw_text, self.call_logger, 3)
+                            self.brain.kb.search(raw_text, self.call_logger, 3)
                         )
                 else:
                     logger.debug(f"[STREAM BUFFER] Blocked proactive KB lookup due to policy: {intent} ('{raw_text}')")
@@ -691,7 +691,7 @@ class VoiceOrchestrator:
         if not is_short_input:
             try:
                 rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
-                    asyncio.to_thread(self.brain.kb.search, caller_input, self.call_logger, 3, trace_id),
+                    self.brain.kb.search(caller_input, self.call_logger, 3, trace_id),
                     timeout=3.0
                 )
             
