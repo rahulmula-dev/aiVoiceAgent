@@ -15,7 +15,8 @@ load_dotenv()
 from telephony.server import app
 
 if __name__ == "__main__":
-    PORT = int(os.getenv("PORT", 8000))
+    # Change the default port to 8001 to avoid conflicts on 8000
+    PORT = int(os.getenv("PORT", 8001))
     print(f"\n>>> Starting AI Voice Agent Server at http://localhost:{PORT}")
     print(f">>> TEST CHAT UI AVAILABLE AT: http://localhost:{PORT}/chat-ui")
     print(f">>> Root Directory: {ROOT_DIR}")

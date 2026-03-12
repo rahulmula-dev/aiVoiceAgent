@@ -12,13 +12,10 @@ from agent_logging import CallLogger
 from typing import Optional
 
 
-def create_default_orchestrator(call_logger: Optional[CallLogger] = None, 
+async def create_default_orchestrator(call_logger: Optional[CallLogger] = None, 
                                 session_manager: Optional[SessionManager] = None) -> VoiceOrchestrator:
     """
-    Factory method to create a VoiceOrchestrator with default providers.
-    
-    This encapsulates the instantiation logic, preventing the telephony layer
-    from directly depending on concrete STT/TTS implementations.
+    Factory method to create a VoiceOrchestrator with pre-warmed pool providers.
     
     Args:
         call_logger: Optional CallLogger instance for call event tracking
@@ -28,12 +25,44 @@ def create_default_orchestrator(call_logger: Optional[CallLogger] = None,
         VoiceOrchestrator: Fully configured orchestrator with default providers
         
     Example:
-        >>> manager = create_default_orchestrator(call_logger)
+        >>> manager = await create_default_orchestrator(call_logger)
         >>> await manager.handle_audio_stream(websocket)
     """
-    # Instantiate default providers
-    stt_provider = Transcriber()
-    tts_provider = Synthesizer()
+    import os
+    from stt.stt_pool import stt_pool, PooledTranscriber
+    from tts.elevenlabs_pool import elevenlabs_pool, PooledTTSEngine
+
+    # 1. Acquire STT (Deepgram Websockets)
+    stt_timeout = 10.0 # Strict timeout for POOLED acquisition
+    try:
+        raw_stt = await stt_pool.acquire(timeout=stt_timeout)
+    except Exception as e:
+        import logging
+        logger = logging.getLogger("OrchestratorFactory")
+        logger.warning(f"STT Pool Acquisition Failed: {e}. Falling back to fresh connection (Latency risk).")
+        # PRD §5 Fallback: If pool is exhausted/latency-spiked, open a fresh socket to SAVE the call.
+        from stt.stt_pool import create_transcriber
+        raw_stt = await create_transcriber()
+        if not raw_stt:
+            logger.error("STT Fallback also failed.")
+            raise e
+    logger.info(f"Orchestrator Factory: STT provider ready (session={session_id})")
+    stt_provider = PooledTranscriber(stt_pool, raw_stt)
+
+    # 2. Acquire TTS
+    tts_provider_name = os.getenv("TTS_PROVIDER", "deepgram").lower()
+    if tts_provider_name == "elevenlabs":
+        tts_timeout = int(os.getenv("ELEVENLABS_SESSION_TIMEOUT_MS", "300")) / 1000.0
+        try:
+            raw_tts = await elevenlabs_pool.acquire(timeout=tts_timeout)
+        except Exception as e:
+            # If TTS checkout fails, release STT back to pool
+            await stt_provider.close()
+            raise e
+        tts_provider = PooledTTSEngine(elevenlabs_pool, raw_tts)
+    else:
+        # Default testing path via Deepgram HTTP Sync Limit upgraded
+        tts_provider = Synthesizer()
     
     # Return configured orchestrator with dependency injection
     return VoiceOrchestrator(

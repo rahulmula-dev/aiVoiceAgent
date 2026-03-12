@@ -41,6 +41,17 @@ class CallContext(BaseModel):
     transcript_log: List[str] = Field(default_factory=list)
     trace_id: Optional[str] = Field(None, description="Unique ID for request tracing")
     kb_version_id: Optional[str] = Field(None, description="Knowledge Base version identifier")
+    
+    # Persistent Memory Fields (Story S4-9)
+    program_interest: Optional[str] = None
+    intake: Optional[str] = None
+    user_name: Optional[str] = None
+    last_intents: List[str] = Field(default_factory=list)
+    last_agent_answer_summary: Optional[str] = None
+    study_mode: Optional[str] = None
+    campus: Optional[str] = None
+    retrieved_chunks_snapshot: List[str] = Field(default_factory=list)
+    chunk_ids_used: List[str] = Field(default_factory=list, description="IDs of all pieces of KB knowledge used in this call")
 
 class EscalationEvent(BaseModel):
     """

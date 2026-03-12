@@ -159,7 +159,9 @@
         let mediaStream;
         let scriptProcessor;
         let isConnected = false;
+        let isSpeaking = false;
         let nextPlayTime = 0;
+        let activeSources = [];
 
         const STATUS_DIV = document.getElementById('status');
         const WS_INDICATOR = document.getElementById('wsIndicator');
@@ -188,7 +190,10 @@
             try {
                 // 1. Initialize Audio Context (16kHz for STT compatibility)
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                log(`AudioContext initialized: ${audioContext.sampleRate}Hz`);
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                log(`AudioContext init: ${audioContext.sampleRate}Hz, State: ${audioContext.state}`);
 
                 // 2. Override browser 44.1/48k capture to 16k if possible, strictly mono
                 mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -200,15 +205,21 @@
                     }
                 });
 
-                // 3. Connect WebSocket
+                // 3. Connect WebSocket (with Token Support)
+                const urlParams = new URLSearchParams(window.location.search);
+                const token = urlParams.get('token') || '';
+
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                ws = new WebSocket(`${protocol}//${window.location.host}/ws/browser`);
-                // For local static file testing, hardcode localhost port if needed:
-                // ws = new WebSocket(`ws://localhost:8085/ws/browser`);
+                ws = new WebSocket(`${protocol}//${window.location.host}/ws/browser?token=${token}`);
 
                 ws.onopen = () => {
                     log("WebSocket Connected");
                     setStatus(true);
+
+                    if (audioContext && audioContext.state === 'suspended') {
+                        audioContext.resume();
+                        log(`AudioContext resumed in ws.onopen`);
+                    }
 
                     // 4. Send Twilio-mimic Start Event
                     const startMsg = {
@@ -235,16 +246,20 @@
                     } else if (msg.event === 'clear') {
                         // Clear buffer (Interruption)
                         log("⚠️ Interruption - Clearing Buffer");
-                        // We can't strictly "clear" the AudioContext buffer queue easily without creating new nodes,
-                        // but resetting nextPlayTime helps sync.
+                        activeSources.forEach(source => {
+                            try { source.stop(); } catch (e) { }
+                        });
+                        activeSources = [];
                         nextPlayTime = audioContext.currentTime;
                     }
                 };
 
                 ws.onclose = () => {
-                    log("WebSocket Closed");
-                    stopCall();
+                    log("WebSocket Closed - finishing audio...");
+                    // Wait for queued audio (e.g. goodbye message) to finish before teardown
+                    setTimeout(() => stopCall(), 3000);
                 };
+
 
                 ws.onerror = (e) => {
                     log(`WebSocket Error: ${e}`);
@@ -284,6 +299,18 @@
 
                 const pcmData = f32toPCM16(inputData);
 
+                // Quick VAD for immediate Stop
+                if (volume > 0.05) {
+                    if (!isSpeaking) {
+                        isSpeaking = true;
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ event: "speech" }));
+                        }
+                    }
+                } else if (volume < 0.01) {
+                    isSpeaking = false;
+                }
+
                 // Robust Base64 conversion
                 const bytes = new Uint8Array(pcmData.buffer);
                 let binary = '';
@@ -315,6 +342,13 @@
                 nextPlayTime = audioContext.currentTime;
             }
             source.start(nextPlayTime);
+
+            // Track source to allow interruption
+            activeSources.push(source);
+            source.onended = () => {
+                activeSources = activeSources.filter(s => s !== source);
+            };
+
             nextPlayTime += buffer.duration;
         }
 

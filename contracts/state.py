@@ -12,6 +12,7 @@ class CallState(Enum):
     RETRIEVAL = "RETRIEVAL"
     RESPONSE_VALIDATION = "RESPONSE_VALIDATION"
     SPEAKING = "SPEAKING"
+    INTERRUPTED = "INTERRUPTED"
     ESCALATION = "ESCALATION"
     CALL_END = "CALL_END"
 
@@ -28,22 +29,26 @@ class StateMachine:
         self.ALLOWED_TRANSITIONS = {
             CallState.CALL_INIT: [CallState.LISTENING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL],
             
-            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION],
+            CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.TRANSCRIBING],
             
-            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION],
+            CallState.INTERRUPTED: [CallState.LISTENING, CallState.CALL_END, CallState.TRANSCRIBING, CallState.SPEAKING],
+
+            CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.ESCALATION],
             
             CallState.TRANSCRIBING: [
                 CallState.INTENT_EVAL, 
                 CallState.LISTENING,
                 CallState.SPEAKING,
-                CallState.CALL_END
+                CallState.CALL_END,
+                CallState.INTERRUPTED,
+                CallState.ESCALATION
             ],
             
-            CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING],
+            CallState.INTENT_EVAL: [CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.SPEAKING, CallState.LISTENING, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
-            CallState.RETRIEVAL: [CallState.RESPONSE_VALIDATION, CallState.ESCALATION],
+            CallState.RETRIEVAL: [CallState.RESPONSE_VALIDATION, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
-            CallState.RESPONSE_VALIDATION: [CallState.SPEAKING, CallState.ESCALATION, CallState.LISTENING],
+            CallState.RESPONSE_VALIDATION: [CallState.SPEAKING, CallState.ESCALATION, CallState.LISTENING, CallState.TRANSCRIBING, CallState.INTERRUPTED],
             
             CallState.ESCALATION: [CallState.CALL_END, CallState.SPEAKING],
             
@@ -61,28 +66,23 @@ class StateMachine:
         # Check Rulebook
         valid_next_states = self.ALLOWED_TRANSITIONS.get(self.current_state, [])
         
-        # In strict mode, raise error. For now, log warning.
+        # [STATE-GATE-ISS-119] HARD FAIL: Raise Exception and block invalid jumps
         if new_state not in valid_next_states:
              # Basic loose check: allow transitions to CALL_END from anywhere
             if new_state == CallState.CALL_END:
                 pass
             else:
-                msg = f"STATE VIOLATION: {self.current_state.value} -> {new_state.value}"
+                msg = f"CRITICAL STATE VIOLATION: Invalid transition attempted from {self.current_state.value} to {new_state.value}"
                 
                 # 1. Log violation to JSON for debugging
                 if self.call_logger:
-                    self.call_logger.log_event("state_machine", "violation", 
+                    self.call_logger.log_event("state_machine", "error", 
                                              meta={"msg": msg}, 
                                              trace_id=trace_id)
                 
-                # 2. Report to CRM (Mock) - Meets Requirement
-                if self.crm_client:
-                    asyncio.create_task(self.crm_client.create_ticket(
-                        transcript=msg,
-                        summary="System State Violation",
-                        sentiment="SYSTEM_ERROR",
-                        call_logger=self.call_logger
-                    ))
+                # 2. Raise Exception to block the transition
+                logger.error(msg)
+                raise ValueError(msg)
         
         # 3. Update State
         old_state = self.current_state

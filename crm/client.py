@@ -3,15 +3,31 @@ import logging
 import json
 import os
 import datetime
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+import httpx
+import re
+from typing import Optional, Dict
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type, before_sleep_log
 
 # Configure logger
 logger = logging.getLogger("crm")
 
+def scrub_html(text: str) -> str:
+    """Aggressively removes HTML tags and collapses whitespace for clean logging."""
+    if not text: return ""
+    # Strip everything between < >
+    clean = re.sub(r'<[^>]*>', ' ', text)
+    # Collapse multiple spaces/newlines
+    clean = ' '.join(clean.split())
+    return clean[:200]
+
 from contracts.interfaces import CRMEngine
 
-# Custom Exception for Retry Logic
+# Custom Exceptions
 class CRMConnectionError(Exception):
+    pass
+
+class SecurityError(Exception):
+    """Raised when security constraints are violated (e.g. Prod keys in Staging)."""
     pass
 
 class CRMClient(CRMEngine):
@@ -20,44 +36,194 @@ class CRMClient(CRMEngine):
     Handles ticket creation with Idempotency, Retries, and Dead-Letter Queue (DLQ).
     """
     def __init__(self):
-        # In production, load API keys from .env
-        self.api_key = "placeholder_key"
-        self.base_url = "https://api-in21.leadsquared.com/v2"
+        # Load API keys from .env
+        self.api_key = os.getenv("CRM_API_KEY", "crm_test_key_123")
+        self.base_url = os.getenv("CRM_BASE_URL", "https://api.leadsquared.com")
+        self.app_env = os.getenv("APP_ENV", "production").lower()
+        
+        # 1. CRM SECURITY GUARD (Task 1 & Task 3)
+        # Force HTTPS and Block IP Addresses (CRITICAL-P3-03)
+        if not self.base_url.startswith("https://") and self.app_env not in ["dev", "development", "test"]:
+            logger.error(f"SECURITY VIOLATION: CRM_BASE_URL must use HTTPS in production. Found: {self.base_url}")
+            raise SecurityError("Insecure CRM Endpoint: HTTPS required.")
+            
+        ip_pattern = r'https?://(\d{1,3}\.){3}\d{1,3}'
+        if re.match(ip_pattern, self.base_url) and self.app_env not in ["dev", "development", "test"]:
+            logger.error(f"SECURITY VIOLATION: CRM_BASE_URL cannot be a raw IP in production. Found: {self.base_url}")
+            raise SecurityError("Insecure CRM Endpoint: DNS verified hostname required.")
+
+        # Prevent production credentials in staging/development
+        if self.app_env in ["staging", "development", "test"]:
+            prod_indicators = ["live", "prod", "production"]
+            if any(indicator in self.api_key.lower() for indicator in prod_indicators):
+                logger.critical(f"FATAL SECURITY BREACH: Production CRM credentials detected in {self.app_env} environment!")
+                raise SecurityError(f"FATAL: Production CRM credentials detected in {self.app_env} environment.")
+
+        self.headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json"
+        }
         
         # IDEMPOTENCY: Local cache of processed call_ids to prevent duplicates
-        # In a distributed system, this should be Redis. For single-instance, a set is fine.
         self.processed_calls = {} # Map call_id -> ticket_id
         
-        # CONFIG: DLQ Path
-        self.dlq_path = os.path.join(os.getcwd(), "logs", "crm_dlq.json")
+        # CONFIG: S3 DLQ Path (ca-central-1 - PRD Section 5)
+        from utils.s3_storage import S3Storage
+        self.s3_queue = S3Storage(bucket_name="crm-failover-queue")
 
-    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None):
+    @property
+    def is_configured(self) -> bool:
+        """Checks if the CRM API key is set to a non-default value."""
+        default_key = "crm_test_key_123"
+        return self.api_key and self.api_key != default_key
+
+    async def check_health(self) -> bool:
+        """Verifies CRM API reachability for readiness probe."""
+        url = f"{self.base_url}/health" # Standard health endpoint
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=2.0)
+                # Any non-5xx response is usually a sign of reachability, 
+                # but we'll accept 200/201/204
+                return response.status_code < 500
+        except Exception as e:
+            logger.warning(f"CRM health check failed: {e}")
+            return False
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_fixed(0.25),
+        retry=retry_if_exception_type(CRMConnectionError),
+        before_sleep=before_sleep_log(logger, logging.WARNING)
+    )
+    async def log_call(self, call_id: str, caller_phone: str, caller_type: str = "unknown", 
+                      summary: str = "", transcript: str = "", sentiment: str = "neutral", 
+                      duration_seconds: int = 0):
+        """
+        Logs a call to the CRM. This is the PARENT record for any tickets.
+        """
+        url = f"{self.base_url}/calls"
+        payload = {
+            "caller_phone": caller_phone,
+            "caller_type": caller_type,
+            "summary": summary or "Call Initiated",
+            "transcript": transcript or "Transcript pending...",
+            "sentiment": sentiment,
+            "duration_seconds": duration_seconds,
+            "created_at": datetime.datetime.now().isoformat()
+        }
+        
+        # We don't send call_id in the body? The user requirement says "Every inbound call should create a Call record".
+        # But tickets need 'call_id'. Usually the CRM *returns* the call_id or we generate it.
+        # But in this system, we have our own 'call_id' (session_id).
+        # Typically, we should probably pass our 'call_id' if the CRM supports it, 
+        # OR we use the CRM's returned ID as the 'call_id' for tickets.
+        # Looking at the user request: 
+        # "Stored fields: ... call_id (required for Ticket)".
+        # It doesn't explicitly say /calls accepts 'call_id'. 
+        # However, for the System to link them, we likely need to return the ID from this call and use it.
+        
+        try:
+            async with httpx.AsyncClient(verify=True) as client:
+                response = await client.post(url, headers=self.headers, json=payload, timeout=5.0)
+                
+            if response.status_code >= 500:
+                raise CRMConnectionError(f"Server Error {response.status_code}")
+            
+            if response.status_code not in [200, 201]:
+                # PILLAR 3: Aggressive HTML scrubbing to prevent terminal clutter
+                err_text = scrub_html(response.text)
+                if not err_text:
+                    err_text = f"Empty Response Body (Status {response.status_code})"
+                
+                logger.error(f"[CRM] Failed to log call: {err_text}")
+                return None
+                
+            data = response.json()
+            # If the CRM returns an ID, use it. If not, use our session ID? 
+            # The prompt says: "Create Ticket... call_id: 'CALL_ID_HERE'".
+            # This implies the POST /calls returns an ID we must use.
+            crm_call_id = data.get("id") or data.get("call_id")
+            
+            # Map our internal session ID to the CRM's ID if needed, or just return it.
+            return crm_call_id
+
+        except httpx.RequestError as e:
+            raise CRMConnectionError(f"Connection Failed: {e}")
+
+    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None, session_obj=None):
         """
         Creates a ticket in LeadSquared for the interaction.
         Arguments:
-            call_id (str): MANDATORY. Used for idempotency.
+            call_id (str): MANDATORY. This should be the ID returned by `log_call` if possible, 
+                           OR the session ID if the CRM accepts external IDs.
+                           (Based on "CALL_ID_HERE", it's likely the CRM internal ID).
+            structured_turns (list, optional): S4-11 metadata.
+            session_obj (Session, optional): Full session context for enrichment.
         """
         # 1. IDEMPOTENCY CHECK
-        if call_id and call_id in self.processed_calls:
-            existing_ticket = self.processed_calls[call_id]
-            logger.info(f"[CRM] Idempotency Hit: Ticket already exists for call {call_id} -> {existing_ticket}")
+        idempotency_key = f"{call_id}:{summary}" if call_id else None
+        if idempotency_key and idempotency_key in self.processed_calls:
+            existing_ticket = self.processed_calls[idempotency_key]
+            logger.info(f"[CRM] Idempotency Hit: Ticket '{summary}' already exists for call {call_id} -> {existing_ticket}")
             return {"status": "success", "ticket_id": existing_ticket, "message": "Already processed"}
 
+        priority = "NORMAL"
+        if sentiment == "Negative": priority = "HIGH"
+        if "escalat" in summary.lower(): priority = "HIGH"
+
+        # Allow custom title or default to template
+        final_title = title or f"Voice Agent Ticket - {sentiment}"
+        
+        # Enforce call_id is a valid scalar string (preventing PydanticValidationError input_type=list or input=null)
+        if isinstance(call_id, list):
+            call_id_str = str(call_id[0]) if call_id else "unknown_call_id"
+        elif call_id:
+            call_id_str = str(call_id)
+        else:
+            call_id_str = "unknown_call_id"
+            
+        # DEBUG: Append short Call ID to title so user can distinguish them on dashboard
+        if call_id_str:
+             short_id = call_id_str[-4:] if len(call_id_str) > 4 else call_id_str
+             final_title = f"{final_title} | Call-{short_id}"
+
+        # Forensic Metadata Enrichment (Task 6)
+        enhanced_metadata = {
+            "structured_turns": structured_turns
+        } if structured_turns else {}
+        
+        if session_obj:
+            if session_obj.interruption_snapshot:
+                enhanced_metadata["interruption_snapshot"] = session_obj.interruption_snapshot
+            if session_obj.termination_reason:
+                enhanced_metadata["termination_reason"] = session_obj.termination_reason
+            if session_obj.metadata:
+                enhanced_metadata["session_metadata"] = session_obj.metadata
+            if session_obj.caller_type:
+                enhanced_metadata["caller_type"] = session_obj.caller_type
+
         ticket_data = {
-            "Subject": f"Voice Agent Call - {sentiment}",
-            "Description": summary,
-            "Transcript": transcript,
-            "Priority": "High" if sentiment == "Negative" else "Normal",
-            "CallId": call_id
+            "call_id": call_id_str,
+            "title": final_title,
+            "description": summary,
+            "status": "OPEN",
+            "priority": priority,
+            "metadata": enhanced_metadata
         }
         
         try:
-            # 2. ATTEMPT CREATION WITH RETRY LOGIC
-            ticket_id = await self._send_request_safe(ticket_data)
+            # 2. ATTEMPT CREATION WITH RETRY LOGIC (Pillar 2: Reliability)
+            # Reverting to simplified endpoint for dummy CRM
+            ticket_id = await self._send_request_safe(
+                endpoint="tickets", 
+                data=ticket_data, 
+                idempotency_key=idempotency_key
+            )
             
-            # Success: Cache the ID
-            if call_id:
-                self.processed_calls[call_id] = ticket_id
+            # Success: Cache the ID (RAM-only, reconciler uses DLQ id for persistence)
+            if idempotency_key:
+                self.processed_calls[idempotency_key] = ticket_id
                 
             logger.info(f"[CRM] Ticket logged successfully: {ticket_id}")
             
@@ -75,64 +241,137 @@ class CRMClient(CRMEngine):
         except Exception as e:
             # 3. DEAD LETTER QUEUE (Persistence)
             logger.error(f"[CRM] All retries failed. saving to DLQ. Error: {e}")
+            # The entry_id (UUID) in the DLQ will become the PERMANENT idempotency key for this ticket
             self._save_to_dlq(ticket_data, str(e))
-            
             return {"status": "queued", "ticket_id": "DLQ-SAVED", "message": "Saved to Dead Letter Queue"}
 
-    # RETRY CONFIGURATION: 3 Attempts, Exponential Backoff (1s -> 2s -> 4s)
+    # RETRY CONFIGURATION
+    # [PRD] stop=stop_after_attempt(3), wait=wait_fixed(0.25) — aggressive retry for production
+    # [DEV] stop=stop_after_attempt(2), wait=wait_fixed(0.5)  — fail faster, less log spam when CRM offline
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(2),
+        wait=wait_fixed(0.5),
         retry=retry_if_exception_type(CRMConnectionError),
-        before_sleep=before_sleep_log(logger, logging.WARNING)
+        before_sleep=before_sleep_log(logger, logging.DEBUG)
     )
-    async def _send_request_safe(self, data):
+    async def _send_request_safe(self, endpoint, data, idempotency_key: str = None):
         """
-        Internal method that simulates the API call.
-        To test resilience, we can inject failures here testing.
+        Internal method that performs the actual API call.
+        PRD: Requires X-Idempotency-Key support to prevent duplicate tickets.
         """
-        # MOCK IMPLEMENTATION FOR DEMO
-        # In real prod: await httpx.post(url, json=data)
+        url = f"{self.base_url}/{endpoint}"
         
-        # SIMULATION HOOK: If description contains "503", throw error
-        if "503" in data.get("Transcript", "") or "503" in data.get("Description", "") or "503" in data.get("Subject", ""):
-            # Verify if this hook is reachable by the test script
-            raise CRMConnectionError("Simulated 503 Service Unavailable")
+        headers = dict(self.headers)
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = idempotency_key
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                # [PRD] timeout=5.0  — 5s to allow for LeadSquared slow responses
+                # [DEV] timeout=2.0  — fail fast when dummy CRM is offline
+                response = await client.post(url, headers=headers, json=data, timeout=2.0)
+                
+            if response.status_code >= 500:
+                raise CRMConnectionError(f"Server Error {response.status_code}")
+                
+            if response.status_code not in [200, 201]:
+                # PILLAR 3: Scrub HTML from terminal logs
+                err_text = scrub_html(response.text)
+                if not err_text:
+                    err_text = f"Empty Response Body (Status {response.status_code})"
+                
+                error_msg = f"API Error {response.status_code}: {err_text}"
+                
+                # Special handling for 401 in Dev Mode with default key
+                if response.status_code == 401 and not self.is_configured:
+                    logger.debug(f"[CRM] 401 Unauthorized expected in Dev Mode (using default key).")
+                else:
+                    logger.error(error_msg)
+                
+                raise CRMConnectionError(error_msg)
+                
+            resp_json = response.json()
+            # Return ID from response
+            return resp_json.get("id") or resp_json.get("ticket_id") or "UNKNOWN_ID"
             
-        # Normal Success
-        return "MOCK-12345"
+        except httpx.RequestError as e:
+            # Downgrade to DEBUG when CRM is known offline (dev mode)
+            if self.app_env in ["dev", "development", "test"]:
+                logger.debug(f"[CRM] Connection failed (CRM offline in dev mode): {type(e).__name__}")
+            else:
+                logger.warning(f"[CRM] Network Error: {e}")
+            raise CRMConnectionError(f"Network Error: {e}")
 
     def _save_to_dlq(self, payload, error_msg):
         """
-        Appends the failed payload to a persistent JSON file.
+        PRD Section 5: Robust Failover Queue.
+        1. PERSIST LOCALLY: Prevents data loss on pod restart/S3 failure.
+        2. UPLOAD TO S3: ca-central-1 (Durable long-term recovery).
         """
+        import uuid
+        entry_id = str(uuid.uuid4())
+        
+        # Consistent status marker required by PRD
         entry = {
-            "timestamp": datetime.datetime.now().isoformat(),
+            "ticket_id": entry_id,
+            "created_at": datetime.datetime.now().isoformat(),
             "payload": payload,
             "error": error_msg,
-            "status": "failed"
+            "status": "Pending CRM Sync",
+            "retry_count": 0
+        }
+        
+        # 1. ATTEMPT S3 UPLOAD FIRST (ca-central-1)
+        # CRITICAL-P3-04: Local disk is only for buffer/dead-end
+        s3_key = f"dlq_tickets/{entry_id}.json"
+        s3_success = self.s3_queue.upload_json(entry, s3_key)
+        
+        if s3_success:
+            logger.info(f"[CRM] Payload synced directly to S3 DLQ: {entry_id}")
+            return
+
+        # 2. LOCAL PERSISTENCE ONLY IF S3 FAILS (Pillar 2: Reliability)
+        # NOTE: For true crash-resilience in K8s, logs/ must be a PersistentVolume.
+        dlq_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "crm_dlq")
+        os.makedirs(dlq_dir, exist_ok=True)
+        local_file = os.path.join(dlq_dir, f"{entry_id}.json")
+        
+        try:
+            with open(local_file, "w", encoding="utf-8") as f:
+                json.dump(entry, f, indent=2)
+            logger.warning(f"[CRM] S3 Failed. Saved to local DLQ buffer: {local_file}")
+        except Exception as e:
+            logger.critical(f"[CRM] FATAL: S3 and Local Disk both failed! {e}")
+
+
+
+    async def create_callback(self, ticket_id: str, phone_number: str, reason: str, preferred_time: str = "ASAP"):
+        """
+        Creates a callback request in the CRM.
+        Used for escalations or missing information follow-ups.
+        """
+        payload = {
+            "ticket_id": ticket_id,
+            "requested_phone": phone_number,
+            "reason": reason,
+            "preferred_time": preferred_time
         }
         
         try:
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.dlq_path), exist_ok=True)
-            
-            # Atomic Append (Read-Modify-Write is risky but acceptable for low-volume DLQ)
-            # Better approach for logs: Append Line with JSON (jsonl style)
-            with open(self.dlq_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-                
-            logger.info(f"[CRM] Payload saved to DLQ: {self.dlq_path}")
+            callback_id = await self._send_request_safe(
+                endpoint="callbacks",
+                data=payload
+            )
+            logger.info(f"[CRM] Callback created: {callback_id}")
+            return callback_id
         except Exception as e:
-            logger.critical(f"[CRM] CRITICAL: Failed to write to DLQ! Data loss imminent. {e}")
-
-    async def schedule_callback(self, phone_number: str):
-        logger.info(f"Callback Requested: {phone_number}")
-        logger.info(f"[CRM] Callback requested for {phone_number}")
-        return True
+            logger.error(f"[CRM] Failed to create callback: {e}")
+            return None
 
     async def get_ticket_status(self, ticket_id: str):
-        return {"status": "Mock", "details": "Not implemented"}
+        # GET /tickets
+        # We can implement a simple fetch
+        return {"status": "Mock", "details": "Not implemented completely"}
 
     async def get_ticket_by_phone(self, phone_number: str):
         return None
