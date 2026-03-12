@@ -1,6 +1,26 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cila-postgres
+    environment:
+      POSTGRES_USER: cila_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: cila_staging
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cila_user -d cila_staging"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cila-network
+
   redis:
     image: redis:7-alpine
     container_name: cila-redis
@@ -30,6 +50,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 30s
@@ -49,3 +71,6 @@ services:
 networks:
   cila-network:
     driver: bridge
+
+volumes:
+  pgdata:
