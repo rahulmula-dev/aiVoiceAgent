@@ -73,9 +73,22 @@ class CRMClient(CRMEngine):
 
     @property
     def is_configured(self) -> bool:
-        """Checks if the CRM API key is set to a non-default value."""
+        """
+        Checks if the CRM client has been configured with valid external targets.
+        Used to prevent log spam and sync loops in local production defaults.
+        """
         default_key = "crm_test_key_123"
-        return self.api_key and self.api_key != default_key
+        default_url = "https://api.leadsquared.com"
+        
+        # We are 'configured' if:
+        # 1. The key is not the default
+        # 2. OR the URL is not the default (user is pointing to a specific test endpoint)
+        # 3. OR the environment is explicitly set to dev/test (user intent to test)
+        is_custom_key = self.api_key and self.api_key != default_key
+        is_custom_url = self.base_url and self.base_url != default_url
+        is_explicit_dev = self.app_env in ["dev", "development", "test"]
+        
+        return is_custom_key or is_custom_url or is_explicit_dev
 
     async def check_health(self) -> bool:
         """Verifies CRM API reachability for readiness probe."""
