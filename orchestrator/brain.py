@@ -134,8 +134,8 @@ class Brain(LLMEngine):
         """
         import json
         
-        # 🟢 PINNED TIMEOUT FOR BARGE-IN (Sub-second target, 1.5s absolute ceiling)
-        BARGE_IN_TIMEOUT = 1.5
+        # 🟢 PINNED TIMEOUT FOR BARGE-IN (Sub-second target, 3.0s absolute ceiling)
+        BARGE_IN_TIMEOUT = 3.0
         
         context_block = f"\n[KNOWLEDGE BASE CONTEXT]\n{context_text}\nUse this context to accurately answer if relevant." if context_text else ""
 
@@ -233,7 +233,7 @@ class Brain(LLMEngine):
 
                         # KB returns (content, top_score, category, kb_version, chunk_ids)
                         context_text, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
-                            asyncio.to_thread(self.kb.search, search_query, self.call_logger, 3, trace_id),
+                            self.kb.search(search_query, self.call_logger, 3, trace_id),
                             timeout=RAG_TIMEOUT
                         )
                     
@@ -559,7 +559,7 @@ class Brain(LLMEngine):
             yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
         except ResourceExhausted:
             logger.warning("Gemini Quota Exceeded during streaming.")
-            yield PRDScripts.APOLOGY_CAPACITY
+            yield (PRDScripts.APOLOGY_CAPACITY, {"error": "quota_exhausted"})
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
@@ -569,11 +569,11 @@ class Brain(LLMEngine):
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
-                yield (PRDScripts.APOLOGY_OVERLOADED, {"error": True})
+                yield (PRDScripts.APOLOGY_OVERLOADED, {"error": "quota_error_msg"})
             elif "404" in str(e):
-                yield PRDScripts.APOLOGY_STRUCTURAL_UPDATE
+                yield (PRDScripts.APOLOGY_STRUCTURAL_UPDATE, {"error": "model_not_found"})
             else:
-                yield PRDScripts.APOLOGY_INTERNAL_ERROR
+                yield (PRDScripts.APOLOGY_INTERNAL_ERROR, {"error": "unknown_stream_err"})
 
     async def generate_response(self, text, history=None, trace_id=None):
         """

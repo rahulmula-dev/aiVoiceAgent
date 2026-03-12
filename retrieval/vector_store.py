@@ -122,6 +122,12 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 # 2. Query PGVector using <=> (cosine distance)
                 # Results sorted by distance ascending
                 logger.info(f"RAG-TRACE: Querying with embedding prefix: {query_embedding[:5]}...")
+                
+                # SPREAD BUG FIX: In local_test mode, embeddings are mocked (all 1s).
+                # To avoid missing the relevant chunk because it didn't random-seed into the top_k,
+                # we fetch 100 rows (the whole DB currently) for keyword re-ranking.
+                fetch_limit = 100 if self.local_test else top_k
+                
                 rows = await conn.fetch(
                     """
                     SELECT 
@@ -137,7 +143,7 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     ORDER BY e.embedding <=> $1::vector ASC
                     LIMIT $2;
                     """,
-                    str(query_embedding), top_k
+                    str(query_embedding), fetch_limit
                 )
                 
                 logger.info(f"RAG-TRACE: Found {len(rows)} raw rows from PGVector.")
@@ -176,6 +182,31 @@ class KnowledgeBase(KnowledgeBaseEngine):
                     if call_logger:
                         call_logger.log_event("retrieval", "rag_search_complete", meta={"matches": 0, "top_score": 0}, trace_id=trace_id)
                     return "LOW_CONFIDENCE_FALLBACK", 0.0, "General", "unknown", []
+
+                # --- 🟢 LOCAL SEARCH OPTIMIZATION 🟢 ---
+                # If we are in local test mode, embeddings are mocked (all 1s).
+                # To ensure the user gets relevant answers for "fee", "location", etc.,
+                # we perform a simple keyword-based filter/ranking on the top candidate chunks.
+                if self.local_test:
+                    logger.info("[LOCAL-RAG] Performing keyword-boost for relevance...")
+                    query_words = set(query.lower().replace("?", "").replace(".", "").split())
+                    
+                    # Score each chunk by intersection count
+                    ranked_chunks = []
+                    for content in valid_chunks:
+                        content_words = set(content.lower().split())
+                        overlap = len(query_words.intersection(content_words))
+                        if overlap > 0:
+                            ranked_chunks.append((overlap, content))
+                    
+                    # Sort by overlap descending
+                    ranked_chunks.sort(key=lambda x: x[0], reverse=True)
+                    
+                    if ranked_chunks:
+                        # Take top 5 boosters for context
+                        selected = [c[1] for c in ranked_chunks[:5]]
+                        logger.info(f"[LOCAL-RAG] Returning {len(selected)} chunks based on keyword overlap.")
+                        return "\n\n".join(selected), 1.0, final_category, "pgvector-local-boost", chunk_ids
 
                 top_score = max(scores) if scores else 0.0
                 logger.info(f"RAG Search: Found {len(valid_chunks)} verified chunks (Top Score: {top_score:.2f})")

@@ -89,6 +89,7 @@ class PGVectorMigrator:
         await conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS checksum TEXT UNIQUE;")
         
         await conn.execute("""
+            DROP TABLE IF EXISTS embeddings;
             CREATE TABLE IF NOT EXISTS embeddings (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 chunk_id UUID REFERENCES chunks(id),
@@ -105,6 +106,10 @@ class PGVectorMigrator:
                 topic_tags TEXT[]
             );
         """)
+
+        # 🟢 CLEAN SLATE: Truncate existing data to avoid partial migration artifacts
+        logger.info("Clearing existing RAG data for clean migration...")
+        await conn.execute("TRUNCATE TABLE governance_metadata, embeddings, chunks, documents CASCADE;")
 
     def generate_checksum(self, text: str) -> str:
         """Generate SHA-256 checksum for content."""

@@ -71,6 +71,12 @@ class CRMClient(CRMEngine):
         from utils.s3_storage import S3Storage
         self.s3_queue = S3Storage(bucket_name="crm-failover-queue")
 
+    @property
+    def is_configured(self) -> bool:
+        """Checks if the CRM API key is set to a non-default value."""
+        default_key = "crm_test_key_123"
+        return self.api_key and self.api_key != default_key
+
     async def check_health(self) -> bool:
         """Verifies CRM API reachability for readiness probe."""
         url = f"{self.base_url}/health" # Standard health endpoint
@@ -275,7 +281,13 @@ class CRMClient(CRMEngine):
                     err_text = f"Empty Response Body (Status {response.status_code})"
                 
                 error_msg = f"API Error {response.status_code}: {err_text}"
-                logger.error(error_msg)
+                
+                # Special handling for 401 in Dev Mode with default key
+                if response.status_code == 401 and not self.is_configured:
+                    logger.debug(f"[CRM] 401 Unauthorized expected in Dev Mode (using default key).")
+                else:
+                    logger.error(error_msg)
+                
                 raise CRMConnectionError(error_msg)
                 
             resp_json = response.json()

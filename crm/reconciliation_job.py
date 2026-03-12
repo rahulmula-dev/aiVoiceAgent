@@ -81,6 +81,11 @@ class CRMReconciler:
         pass
 
     async def run_sync_cycle(self):
+        # 0. Check Configuration (CRITICAL: Stop log spam in Dev)
+        if not self.crm_client.is_configured:
+            logger.debug("CRM Reconciler: Skipping sync cycle (CRM_API_KEY is using default/test value).")
+            return
+
         logger.info("Starting CRM DLQ Reconciliation Check...")
         try:
             # 1. Migrate Local Storage entries FIRST (Only if NOT local-only)

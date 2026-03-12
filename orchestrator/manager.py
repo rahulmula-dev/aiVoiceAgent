@@ -687,11 +687,12 @@ class VoiceOrchestrator:
         
         logger.info(f"Barge-in detected ({'Short' if is_short_input else 'Full'} input). Grounding...")
         context_text = ""
+        rag_result, rag_score, rag_topic, kb_v, c_ids = None, 0.0, "General", "unknown", []
         
         if not is_short_input:
             try:
                 rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
-                    self.brain.kb.search(caller_input, self.call_logger, 3, trace_id),
+                    self.brain.kb.search(caller_input, self.call_logger, 10, trace_id),
                     timeout=3.0
                 )
             
