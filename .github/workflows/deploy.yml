@@ -10,9 +10,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -21,6 +18,18 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             cd ~/ai-voice-agent
+
+            echo "Pulling latest code"
             git pull origin main
-            docker-compose down
-            docker-compose up -d --build
+
+            echo "Rebuilding containers"
+            docker-compose build
+
+            echo "Restarting services"
+            docker-compose up -d
+
+            echo "Waiting for server to start"
+            sleep 10
+
+            echo "Checking health"
+            curl http://localhost:8000/readyz
