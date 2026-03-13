@@ -1,54 +1,55 @@
 name: Deploy AI Voice Agent
 
 on:
-push:
-branches:
-- main
+  push:
+    branches:
+      - main
 
 jobs:
-deploy:
-runs-on: ubuntu-latest
-timeout-minutes: 10
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-```
-steps:
-  - name: Deploy to EC2
-    uses: appleboy/ssh-action@v1.0.3
-    with:
-      host: ${{ secrets.EC2_HOST }}
-      username: ubuntu
-      key: ${{ secrets.EC2_SSH_KEY }}
-      script_stop: true
-      script: |
-        set -e
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        echo "Starting deployment..."
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
 
-        cd ~/ai-voice-agent
+            echo "Starting deployment..."
 
-        echo "Pulling latest code"
-        git pull origin main
+            cd ~/ai-voice-agent
 
-        echo "Pulling base images"
-        docker-compose pull || true
+            echo "Pulling latest code"
+            git pull origin main
 
-        echo "Building containers"
-        docker-compose build
+            echo "Pulling base images"
+            docker-compose pull || true
 
-        echo "Stopping old containers"
-        docker-compose down
+            echo "Building containers"
+            docker-compose build
 
-        echo "Starting services"
-        docker-compose up -d
+            echo "Stopping old containers"
+            docker-compose down
 
-        echo "Waiting for startup"
-        sleep 15
+            echo "Starting services"
+            docker-compose up -d
 
-        echo "Checking service health"
-        curl -f http://localhost:8000/readyz
+            echo "Waiting for startup"
+            sleep 15
 
-        echo "Cleaning old Docker images"
-        docker system prune -f
+            echo "Checking service health"
+            curl -f http://localhost:8000/readyz
 
-        echo "Deployment successful"
-```
+            echo "Cleaning old Docker images"
+            docker system prune -f
+
+            echo "Deployment successful"
