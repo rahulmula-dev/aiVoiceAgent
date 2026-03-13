@@ -22,14 +22,17 @@ jobs:
             echo "Pulling latest code"
             git pull origin main
 
-            echo "Rebuilding containers"
+            echo "Building containers"
             docker-compose build
 
             echo "Restarting services"
             docker-compose up -d
 
-            echo "Waiting for server to start"
+            echo "Waiting for server startup"
             sleep 10
 
-            echo "Checking health"
+            echo "Running health check"
             curl http://localhost:8000/readyz
+
+            echo "Cleaning unused Docker images"
+            docker system prune -f
