@@ -48,5 +48,6 @@ jobs:
           docker run -d -p 8000:8000 --name test-agent cila-ai-agent:test
           sleep 10
           docker logs test-agent
-          curl -f http://localhost:8000/healthz || exit 1
+          curl -f http://localhost:8000/readyz
           docker stop test-agent
+          docker rm test-agent
