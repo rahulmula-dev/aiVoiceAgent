@@ -4,17 +4,20 @@ on:
   pull_request:
     branches:
       - dev
+      - staging
+      - main
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
@@ -31,3 +34,19 @@ jobs:
       - name: Verify FastAPI import
         run: |
           python -c "import fastapi, uvicorn"
+
+      - name: Check Python compilation
+        run: |
+          python -m compileall .
+
+      - name: Build Docker image
+        run: |
+          docker build -t cila-ai-agent:test .
+
+      - name: Test container startup
+        run: |
+          docker run -d -p 8000:8000 --name test-agent cila-ai-agent:test
+          sleep 10
+          docker logs test-agent
+          curl -f http://localhost:8000/healthz || exit 1
+          docker stop test-agent
