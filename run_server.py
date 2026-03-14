@@ -20,4 +20,9 @@ if __name__ == "__main__":
     print(f"\n>>> Starting AI Voice Agent Server at http://localhost:{PORT}")
     print(f">>> TEST CHAT UI AVAILABLE AT: http://localhost:{PORT}/chat-ui")
     print(f">>> Root Directory: {ROOT_DIR}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=PORT)
+    except Exception as e:
+        print(f"\nCRITICAL: Uvicorn failed to start: {e}")
+        import traceback
+        traceback.print_exc()

@@ -22,13 +22,13 @@ class PRDScripts:
     REFUSAL_LANGUAGE_1 = "I am currently designed to support English only. Please continue in English."
     REFUSAL_LANGUAGE_2 = "I can only understand English. If the next input is not in English, I will have to end the call."
     REFUSAL_LANGUAGE_3 = "I am ending the call now as I can only assist in English. Goodbye."
-    REFUSAL_KB_MISS = "I do not have that information. A member of the GD College admissions team will follow up."
+    REFUSAL_KB_MISS = "As the CILA Reliability & Compliance Engine, I do not have that specific information in my knowledge base. A member of the GD College admissions team will follow up with you shortly."
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
     
     # Apologies
     APOLOGY_CLARIFICATION = "I didn't quite catch that. Could you please repeat?"
     APOLOGY_OVERLOADED = "I am currently overloaded with requests. Please try again in a few seconds."
-    APOLOGY_CAPACITY = "All our lines are busy at the moment, but I will arrange a callback."
+    APOLOGY_CAPACITY = "All our lines are currently busy. As a Reliability Guard, I will ensure a team member calls you back as soon as possible."
     APOLOGY_FATAL = "I am having technical trouble. Please wait while reconnecting or try calling back later. Goodbye."
     APOLOGY_INTERNAL_ERROR = "I am having a moment of silence. Please try again later."
     APOLOGY_STRUCTURAL_UPDATE = "I am currently undergoing a structural update. Check back in a few minutes!"

@@ -10,10 +10,20 @@ from orchestrator.manager import VoiceOrchestrator
 from orchestrator.session_manager import SessionManager
 from agent_logging import CallLogger
 from typing import Optional
+import logging
+import random
+import asyncio
+
+logger = logging.getLogger("OrchestratorFactory")
 
 
-async def create_default_orchestrator(call_logger: Optional[CallLogger] = None, 
-                                session_manager: Optional[SessionManager] = None) -> VoiceOrchestrator:
+async def create_default_orchestrator(
+    session_id: str,
+    call_logger: Optional[CallLogger] = None, 
+    session_manager: Optional[SessionManager] = None,
+    websocket: Optional[any] = None,
+    session_metadata: Optional[dict] = None
+) -> VoiceOrchestrator:
     """
     Factory method to create a VoiceOrchestrator with pre-warmed pool providers.
     
@@ -33,21 +43,30 @@ async def create_default_orchestrator(call_logger: Optional[CallLogger] = None,
     from tts.elevenlabs_pool import elevenlabs_pool, PooledTTSEngine
 
     # 1. Acquire STT (Deepgram Websockets)
-    stt_timeout = 10.0 # Strict timeout for POOLED acquisition
+    stt_timeout = 0.5 # Strict timeout for POOLED acquisition (PRD §5)
     try:
         raw_stt = await stt_pool.acquire(timeout=stt_timeout)
     except Exception as e:
-        import logging
-        logger = logging.getLogger("OrchestratorFactory")
         logger.warning(f"STT Pool Acquisition Failed: {e}. Falling back to fresh connection (Latency risk).")
-        # PRD §5 Fallback: If pool is exhausted/latency-spiked, open a fresh socket to SAVE the call.
+        # Safety Valve: Jitter to prevent "Thundering Herd" (CRITICAL-WS-01)
+        await asyncio.sleep(random.uniform(0.1, 0.5))
+        
         from stt.stt_pool import create_transcriber
-        raw_stt = await create_transcriber()
-        if not raw_stt:
-            logger.error("STT Fallback also failed.")
+        try:
+            # CTO Polish: Longer timeout for fresh fallback attempt (Hail Mary)
+            raw_stt = await asyncio.wait_for(create_transcriber(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.error("STT Fallback (Fresh Connection) timed out after 2.0s.")
+            raise e
+        except Exception as fe:
+            logger.error(f"STT Fallback failed: {fe}")
             raise e
     logger.info(f"Orchestrator Factory: STT provider ready (session={session_id})")
     stt_provider = PooledTranscriber(stt_pool, raw_stt)
+    
+    # Pillar 2: Residency Guard - ensure provider knows the session context
+    if hasattr(raw_stt, 'session_metadata'):
+        raw_stt.session_metadata = session_metadata or {}
 
     # 2. Acquire TTS
     tts_provider_name = os.getenv("TTS_PROVIDER", "deepgram").lower()
@@ -56,6 +75,21 @@ async def create_default_orchestrator(call_logger: Optional[CallLogger] = None,
         try:
             raw_tts = await elevenlabs_pool.acquire(timeout=tts_timeout)
         except Exception as e:
+            # WS-02: CRM Fallback & Soft Landing (CRITICAL Audit Point)
+            logger.error(f"TTS Pool Exhausted: {e}. Triggering CRM Ticket & Fallback Audio.")
+            from crm.client import crm_client
+            asyncio.create_task(crm_client.create_ticket(
+                title="Dropped Call - Resource Exhaustion",
+                description=f"TTS Pool Exhaustion for session {session_id}. Error: {e}",
+                priority="HIGH"
+            ))
+            
+            # trigger a play_fallback_audio (or equivalent) before the exception is raised
+            if websocket:
+                from tts.synthesizer import Synthesizer
+                temp_synth = Synthesizer()
+                await temp_synth.play_fallback_audio(websocket)
+            
             # If TTS checkout fails, release STT back to pool
             await stt_provider.close()
             raise e

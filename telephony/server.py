@@ -41,26 +41,31 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.on_event("startup")
 async def startup_event():
     """Start-time background workers."""
-    default_session_manager.start_collector()
-    
-    # S4-7 Additions: Reset active concurrency tracking on startup
-    from telephony.concurrency import reset_active_calls
-    reset_active_calls()
+    try:
+        default_session_manager.start_collector()
+        
+        # S4-7 Additions: Reset active concurrency tracking on startup
+        from telephony.concurrency import reset_active_calls
+        reset_active_calls()
 
-    # S5-1: Initialize Connection Pools synchronously before accepting calls
-    from stt.stt_pool import stt_pool
-    from tts.elevenlabs_pool import elevenlabs_pool
-    
-    logger.info("Initializing pre-warmed WebSocket pools...")
-    # S5-1: strict raise instead of swallowing
-    await stt_pool.initialize()
+        # S5-1: Initialize Connection Pools synchronously before accepting calls
+        from stt.stt_pool import stt_pool
+        from tts.elevenlabs_pool import elevenlabs_pool
+        
+        logger.info("Initializing pre-warmed WebSocket pools...")
+        # S5-1: strict raise instead of swallowing
+        await stt_pool.initialize()
 
-    if os.getenv("TTS_PROVIDER", "deepgram").lower() == "elevenlabs":
-        await elevenlabs_pool.initialize()
-    
-    # [HIGH-P3-04] Activate CRM Failover Reconciliation Worker
-    from crm.reconciliation_job import start_background_worker
-    start_background_worker()
+        if os.getenv("TTS_PROVIDER", "deepgram").lower() == "elevenlabs":
+            await elevenlabs_pool.initialize()
+        
+        # [HIGH-P3-04] Activate CRM Failover Reconciliation Worker
+        from crm.reconciliation_job import start_background_worker
+        start_background_worker()
+    except Exception as e:
+        logger.error(f"CRITICAL: Application startup failed: {e}", exc_info=True)
+        # Re-raise to ensure uvicorn reports the failure
+        raise e
 
 @app.middleware("http")
 async def audit_middleware(request: Request, call_next):
@@ -444,8 +449,24 @@ async def handle_media_stream(websocket: WebSocket):
     try:
         await websocket.accept()
         
-        # Use factory with shared session manager
-        manager = await create_default_orchestrator(call_logger=call_logger, session_manager=default_session_manager)
+        # 2. Use factory with shared session manager (Fixed WS-01)
+        # S4 Audit: Passing websocket and metadata for Fallback and Compliance
+        session_metadata = {"region": query_params.get("region", "US")}
+        try:
+            manager = await create_default_orchestrator(
+                session_id=session_id,
+                call_logger=call_logger, 
+                session_manager=default_session_manager,
+                websocket=websocket,
+                session_metadata=session_metadata
+            )
+        except Exception as e:
+            logger.error(f"FATAL: Failed to create orchestrator for {session_id}: {e}")
+            # WS-02: User Experience Fallback
+            # We don't have a manager yet, but we can play audio via a temporary synthesizer
+            temp_synth = Synthesizer() 
+            await temp_synth.play_fallback_audio(websocket, streamSid=call_sid)
+            raise e
         
         # Register for zombie recovery access
         default_session_manager.register_orchestrator(session_id, manager)

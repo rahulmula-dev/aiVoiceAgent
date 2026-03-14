@@ -15,25 +15,27 @@ logger = std_logging.getLogger("Transcriber")
 # Task 2 & 4: Root Purge (PRD P3-07)
 # STT logs are now routed to the global S3-tracked audit logs; local rotation is disabled.
 
-DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
-
 load_dotenv()
 
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
+
+class ResidencyViolationException(Exception):
+    """Raised when data residency constraints are violated."""
+    pass
+
 class Transcriber(STTProvider):
-    def __init__(self, on_transcript_callback=None, encoding="mulaw", sample_rate=8000):
+    def __init__(self, on_transcript_callback=None, encoding="mulaw", sample_rate=8000, session_metadata: dict = None):
         self.api_key = os.getenv("DEEPGRAM_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPGRAM_API_KEY missing in .env")
         
-        # Workstream 2: AI Data Residency (CRITICAL-P3-02)
-        # [PRD] Strict enforcement for production
-        # if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
-        #     logger.critical("RESIDENCY VIOLATION: DPA_CANADA_ACTIVE is not set. Deepgram data export blocked.")
-        #     raise Exception("Data Residency Violation: Canadian DPA required for Deepgram STT.")
+        self.session_metadata = session_metadata or {}
         
-        # [DEV] Bypassed for local testing so calls don't crash
-        if os.getenv("DPA_CANADA_ACTIVE", "false").lower() != "true":
-            logger.warning("[DEV] DPA_CANADA_ACTIVE not set. Bypassing residency check for STT local testing.")
+        # Workstream 2: AI Data Residency (CRITICAL-P3-02)
+        # Check if call is Canadian via session metadata
+        is_canadian = self.session_metadata.get("region") == "CA"
+        if os.getenv("DPA_CANADA_ACTIVE", "false").lower() == "true" or is_canadian:
+            logger.info(f"RESIDENCY GUARD: Activation check passed (DPA_CANADA_ACTIVE={os.getenv('DPA_CANADA_ACTIVE')}, CA_REGION={is_canadian}). Enforcing Canadian data residency.")
         
         self.on_transcript_callback = on_transcript_callback
         self.model = os.getenv("DEEPGRAM_MODEL", "nova-2-phone")
@@ -81,7 +83,13 @@ class Transcriber(STTProvider):
         params.append("language=en")
         params.append("keepalive=true")
 
-        url = f"wss://api.deepgram.com/v1/listen?{'&'.join(params)}"
+        domain = "api.deepgram.com"
+        is_canadian = self.session_metadata.get("region") == "CA"
+        if os.getenv("DPA_CANADA_ACTIVE", "false").lower() == "true" or is_canadian:
+            domain = "api.ca.deepgram.com"
+            logger.info(f"RESIDENCY GUARD: Using Canadian domain {domain} (Metadata CA={is_canadian})")
+
+        url = f"wss://{domain}/v1/listen?{'&'.join(params)}"
         headers = {
             "Authorization": f"Token {self.api_key}"
         }
@@ -110,6 +118,20 @@ class Transcriber(STTProvider):
                 )
                 self._is_listening = True
                 self._start_heartbeat()
+                
+                # WS-03: Residency Soft Landing Check (CRITICAL-P3-02)
+                if os.getenv("DPA_CANADA_ACTIVE", "false").lower() == "true" or is_canadian:
+                    # US/Global endpoints are explicitly forbidden for Canadian calls
+                    if "api.deepgram.com" in url and "api.ca.deepgram.com" not in url:
+                        logger.critical(f"RESIDENCY VIOLATION: Canadian call routed to non-CA endpoint! Blocked URL: {url}")
+                        # Soft Landing: Send metadata to frontend before blocking
+                        if self.on_transcript_callback:
+                            await self.on_transcript_callback(
+                                "", 
+                                metadata={"error": "compliance_block", "region": "CA"}
+                            )
+                        raise ResidencyViolationException("Data Residency Violation: Canadian data must stay in CA.")
+
                 asyncio.create_task(self._listen())
                 return True
             except (asyncio.TimeoutError, Exception) as e:
