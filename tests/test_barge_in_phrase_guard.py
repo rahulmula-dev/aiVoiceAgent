@@ -1,8 +1,9 @@
 import unittest
+import asyncio
 from contracts.policy import PRDScripts, ResponsePolicyEngine
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
-class TestBargeInPhraseGuard(unittest.TestCase):
+class TestBargeInPhraseGuard(unittest.IsolatedAsyncioTestCase):
     def test_interruption_constant_metadata_removed(self):
         """
         [CRITICAL-P5-01] Ensure the Forbidden Phrase constant is strictly undefined.
@@ -43,6 +44,34 @@ class TestBargeInPhraseGuard(unittest.TestCase):
         self.assertEqual(policy.classify_intent("i need visastatus info"), "HARD_REFUSAL_IMMIGRATION")
         self.assertEqual(policy.classify_intent("the salarypayment is wrong"), "HARD_REFUSAL_INTERNAL_STAFF")
         print("PASS: Partial match logic prevents simple character-level bypass.")
+
+    async def test_llm_timeout_fallback(self):
+        """
+        [LOW-L1] Ensure the brain returns the 'I'm listening' fallback on LLM timeout.
+        """
+        print("\n--- Testing LLM Timeout Fallback ---")
+        from orchestrator.brain import Brain
+        from unittest.mock import AsyncMock
+        
+        # Mock the entire generative model to trigger a timeout
+        mock_model = MagicMock()
+        mock_model.generate_content_async = AsyncMock(side_effect=asyncio.TimeoutError("LLM Timed Out"))
+        
+        brain = Brain()
+        brain.model = mock_model
+        brain.fast_model = mock_model # Both fail
+        
+        mock_session = MagicMock()
+        mock_session.conversation_history = []
+        
+        classification, response, multi_step, topic, _, _ = await brain.generate_with_classification(
+            session=mock_session,
+            caller_input="hello?"
+        )
+        
+        self.assertEqual(classification, "AMBIGUOUS")
+        self.assertIn("I'm listening", response)
+        print(f"PASS: Fallback triggered on timeout. Response: '{response}'")
 
 if __name__ == "__main__":
     unittest.main()

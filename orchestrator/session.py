@@ -1,8 +1,9 @@
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field
 from datetime import datetime
 from contracts.schemas import CallContext
+from models.schemas import StandardTurn, BargeInTurn
 
 class SessionState(str, Enum):
     NEW = "NEW"
@@ -40,7 +41,7 @@ class Session(BaseModel):
     
     # Barge-In Snapshot (Pillar 1)
     interruption_snapshot: Optional[Dict[str, Any]] = None
-    structured_turns: List[Dict[str, Any]] = []
+    structured_turns: List[Union[StandardTurn, BargeInTurn]] = []
     current_speaking_turn_id: Optional[int] = None
 
     # Resilience Tracking (Pillar 2 & 3)
@@ -50,6 +51,9 @@ class Session(BaseModel):
 
     # Governance: persist language warnings across the call (Phase 1 English-only)
     language_warning_count: int = 0
+
+    # Phase 6: Session-Persistent State (Story S4-11)
+    continuation_offered: bool = False
 
     # Stream Buffering (Task 10-11): Pre-fetch RAG context tasks (Exclude from persistence)
     prefetched_context_task: Optional[Any] = Field(None, exclude=True)

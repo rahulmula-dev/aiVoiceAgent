@@ -19,6 +19,7 @@ from agent_logging import CallLogger
 from .session_manager import SessionManager, SessionState
 from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
+from models.schemas import StandardTurn, BargeInTurn
 
 # Task 4 & 5: Latency Management
 class LatencyBreachError(Exception):
@@ -247,7 +248,7 @@ class VoiceOrchestrator:
                     logger.warning("[GOVERNANCE] Strike 3 — initiating graceful termination flow.")
                     self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
                 else:
-                    self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+                    self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
                 
                 return # CRITICAL: Return so it never hits the LLM
         
@@ -375,7 +376,7 @@ class VoiceOrchestrator:
                             logger.warning("[GOVERNANCE] Strike 3 (phoneme path) — initiating graceful termination flow.")
                             self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
                         else:
-                            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+                            self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
                     
                 # COORDINATION: Do NOT update last_interaction_time for empty frames.
                 # 
@@ -440,7 +441,7 @@ class VoiceOrchestrator:
             
             self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
             self.response_task = asyncio.create_task(
-                self.speak_refusal(PRDScripts.APOLOGY_CLARIFICATION, trace_id=trace_id)
+                self.speak_immediate_response(PRDScripts.APOLOGY_CLARIFICATION, trace_id=trace_id)
             )
             return
         
@@ -733,96 +734,92 @@ class VoiceOrchestrator:
 
         # STEP D — Update Interrupted Turn
         if classification == "NEW_TOPIC" and prev_turn:
-            prev_turn["agent_response_status"] = "abandoned"
+            prev_turn.agent_response_status = "abandoned"
             
         if prev_turn:
-            prev_turn["barge_in_classification"] = classification
+            prev_turn.barge_in_classification = classification
             
-        # Phase 6: Soft Continuation Logic
-        if prev_turn and prev_turn.get("is_multi_step") and classification == "NEW_TOPIC" and not prev_turn.get("continuation_offered"):
+        # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+        if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
             # Append soft offer to the end of the new response
             if response and not response.endswith(("?", ".")): response += "."
             response += " I can also finish walking you through the remaining steps if that's helpful."
-            prev_turn["continuation_offered"] = True
+            self.session.continuation_offered = True
 
         # STEP D — Create New Turn Entry
         new_id = len(self.session.structured_turns) + 1
-        new_turn = {
-            "turn_id": new_id,
-            "caller_input": caller_input,
-            "topic": topic,
-            "agent_response_status": "completed",
-            "agent_partial_response": None,
-            "barge_in_classification": None,
-            "is_multi_step": is_multi_step,
-            "continuation_offered": False,
-            "timestamp": datetime.now().isoformat()
-        }
+        new_turn = BargeInTurn(
+            turn_id=new_id,
+            caller_input=caller_input,
+            topic=topic,
+            agent_response_status="completed",
+            agent_partial_response=None,
+            barge_in_classification=None,
+            is_multi_step=is_multi_step,
+            continuation_offered=False
+        )
         self.session.structured_turns.append(new_turn)
         self.session.current_speaking_turn_id = new_id
         if hasattr(self, 'session_manager') and self.session_manager:
             self.session_manager.save_session(self.session)
 
         # Speak it
-        await self.speak_refusal(response, trace_id=trace_id)
+        await self.speak_immediate_response(response, trace_id=trace_id)
 
-    async def speak_refusal(self, text, trace_id=None):
+    async def speak_immediate_response(self, text, trace_id=None):
         """
-        Helper to speak a static refusal message without using the Brain.
+        Helper to speak an immediate response message without using the Brain.
+        Formerly speak_refusal().
         """
-        logger.debug(f"Starting Speak Refusal: '{text}'")
+        logger.debug(f"Starting Speak Immediate Response: '{text}'")
         # CRITICAL: Reset empty frame counter when agent speaks
         if self.consecutive_empty_frames > 0:
             logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
             self.consecutive_empty_frames = 0
             self.non_english_run_start = time.time()
+        
         # Only transition to SPEAKING if we are NOT already terminating.
         if self.state.get_state() == CallState.SPEAKING:
-            # Force clear if already speaking to allow new refusal to take over immediately
-            self._create_task_with_log(self._send_clear_message())
+            # Force clear if already speaking to allow new response to take over immediately
+            await self._send_clear_message()
 
-        # Skipping this when in CALL_END prevents the state violation that would
-        # trigger a SYSTEM_ERROR CRM ticket and block the goodbye message.
+        # Skipping this when in CALL_END prevents the state violation
         if self.state.get_state() != CallState.CALL_END:
             self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
         
         is_cancelled = False
         try:
-            # Add to history so LLM knows it refused
+            # Add to history so LLM knows it spoke
             if self.session:
                 self.session.conversation_history.append({"role": "model", "parts": [text]})
 
             # Speak it with a safety timeout to prevent "dead silence"
             chunks_sent = 0
-            async with asyncio.timeout(10.0): # 10s max for refusal tts
+            async with asyncio.timeout(10.0): # 10s max for immediate response tts
                 async for chunk in self.synthesizer.speak(text, call_id=self.sid):
                     await self._send_response_chunk(chunk)
                     chunks_sent += 1
             
-            logger.info(f"AI (Refusal): {text} (Sent {chunks_sent} audio chunks)")
-            if self.session:
-                pass
+            logger.info(f"AI (Immediate): {text} (Sent {chunks_sent} audio chunks)")
             
             # Typical Pattern: Wait for the agent to finish speaking before allowing more input
             if self.mode == "audio":
-                # Estimate how long it will take to speak the text (Approx 15 chars/sec)
                 duration = len(text) / 15.0
-                logger.debug(f"Refusal streamed to client. Sleeping {duration:.1f}s to align with client playback.")
-                # We sleep in small chunks so it can be cancelled instantly without clinging to a long timer
+                logger.debug(f"Response streamed to client. Sleeping {duration:.1f}s to align with client playback.")
                 for _ in range(int(duration * 10)):
                     await asyncio.sleep(0.1)
 
-            # LOGGING: Record the refusal in JSON logs
+            # LOGGING: Record the response in JSON logs
             if self.call_logger:
-                self.call_logger.log_event("brain", "refusal_spoken", meta={"text": text, "chunks": chunks_sent}, trace_id=trace_id)
+                self.call_logger.log_event("brain", "interrupt_response_spoken", meta={"text": text, "chunks": chunks_sent}, trace_id=trace_id)
         except asyncio.CancelledError:
             is_cancelled = True
-            logger.info("Speak-refusal task cancelled by user interruption.")
+            logger.info("Speak-immediate task cancelled by user interruption.")
             raise
         except asyncio.TimeoutError:
-            logger.error(f"Refusal TTS Timed Out for text: {text}")
+            logger.error(f"Immediate Response TTS Timed Out for text: {text}")
         except Exception as e:
-            logger.error(f"Error in speak_refusal: {e}")
+            logger.error(f"Error in speak_immediate_response: {e}")
         finally:
             # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
             if not is_cancelled and self.state.get_state() != CallState.CALL_END:
@@ -1072,13 +1069,14 @@ class VoiceOrchestrator:
                             if current_state == CallState.SPEAKING:
                                 logger.info(">>> IMMEDIATE STOP: Interrupted by Telephony VAD signal.")
                                 self.synthesizer.stop_current_speech(self.sid)
-                                self._create_task_with_log(self._send_clear_message())
+                                await self._send_clear_message() # M1: Await clear message confirmed
                                 self.state.transition_to(CallState.INTERRUPTED)
                                 
                                 # Latency Enforcement Check (Task Requirement)
+                                # M1: Capturing 'True-Halt' latency with 20ms network overhead buffer
                                 audio_output_halt = asyncio.get_event_loop().time()
-                                halt_latency = (audio_output_halt - telephony_speech_start) * 1000
-                                logger.info(f"[LATENCY] Telephony VAD Halt: {halt_latency:.1f}ms (Ceiling: 300ms)")
+                                halt_latency = ((audio_output_halt - telephony_speech_start) * 1000) + 20.0
+                                logger.info(f"[LATENCY] Telephony VAD Halt: {halt_latency:.1f}ms (Ceiling: 300ms, includes 20ms network overhead)")
                                 
                                 if halt_latency > 300:
                                     logger.warning(f"[LATENCY_BREACH] Telephony halt exceeded 300ms budget: {halt_latency:.1f}ms")
@@ -1179,17 +1177,15 @@ class VoiceOrchestrator:
             # 1. Append structured_turns
             if self.session:
                 new_id = len(self.session.structured_turns) + 1
-                turn = {
-                    "turn_id": new_id,
-                    "caller_input": text,
-                    "topic": intent, 
-                    "agent_response_status": "completed",
-                    "agent_partial_response": None,
-                    "barge_in_classification": None,
-                    "is_multi_step": False,
-                    "continuation_offered": False,
-                    "timestamp": datetime.now().isoformat()
-                }
+                turn = StandardTurn(
+                    turn_id=new_id,
+                    caller_input=text,
+                    topic=intent, 
+                    agent_response_status="completed",
+                    agent_partial_response=None,
+                    barge_in_classification=None,
+                    is_multi_step=False
+                )
                 self.session.structured_turns.append(turn)
                 self.session.current_speaking_turn_id = new_id
             
@@ -1536,8 +1532,8 @@ class VoiceOrchestrator:
                 
                 # [S4-11 FIX]: Evaluate multi-step even on partial interruption
                 if 'turn' in locals() and turn and 'full_ai_text' in locals():
-                    turn["is_multi_step"] = self._is_multi_step(full_ai_text)
-                    logger.debug(f"[S4-11] Partial turn evaluated as MULTI-STEP: {turn['is_multi_step']}")
+                    turn.is_multi_step = self._is_multi_step(full_ai_text)
+                    logger.debug(f"[S4-11] Partial turn evaluated as MULTI-STEP: {turn.is_multi_step}")
                     
                 # [S4-11 FIX]: Push partial text to history so AI remembers what it said before barge-in
                 if 'full_ai_text' in locals() and full_ai_text.strip():
@@ -1773,8 +1769,8 @@ class VoiceOrchestrator:
         try:
             # 1. Trigger Fallback TTS FIRST (Ensures user hears it before closure)
             msg = PRDScripts.LATENCY_FALLBACK
-            # Speak refusal handles the TTS stream
-            await self.speak_refusal(msg)
+            # speak_immediate_response handles the TTS stream
+            await self.speak_immediate_response(msg)
             
             # 2. Transition State AFTER audio is sent
             self.state.transition_to(CallState.CALL_END)
@@ -1856,7 +1852,7 @@ class VoiceOrchestrator:
 
                     # Speak wrap-up script to caller
                     try:
-                        await self.speak_refusal(PRDScripts.WRAP_UP)
+                        await self.speak_immediate_response(PRDScripts.WRAP_UP)
                     except Exception as e:
                         logger.error(f"Error speaking WRAP_UP prompt: {e}")
 
@@ -1868,7 +1864,7 @@ class VoiceOrchestrator:
                     
                     # Speak termination script first
                     try:
-                        await self.speak_refusal(PRDScripts.WRAP_UP_TERMINATION)
+                        await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
                     except Exception as e:
                         logger.error(f"Error speaking WRAP_UP_TERMINATION prompt: {e}")
                         
@@ -1931,7 +1927,7 @@ class VoiceOrchestrator:
         except: pass
         
         goodbye = PRDScripts.SILENCE_TERMINATION
-        await self.speak_refusal(goodbye)
+        await self.speak_immediate_response(goodbye)
 
     async def _language_termination_flow(self, refusal_text, trace_id):
         """
