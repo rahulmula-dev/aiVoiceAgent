@@ -61,13 +61,38 @@ else
 end
 """
 
+# Lua script for atomic capacity check:
+# KEYS[1]: counter key
+# KEYS[2]: set of active SIDs
+# ARGV[1]: call_sid
+# ARGV[2]: max capacity
+# Returns: 1 if rejected (over cap), 0 if allowed
+LUA_CHECK_CAPACITY_ATOMIC = """
+local is_member = redis.call('SISMEMBER', KEYS[2], ARGV[1])
+local current = redis.call('GET', KEYS[1])
+local count = current and tonumber(current) or 0
+if (is_member == 0 and count >= tonumber(ARGV[2])) then
+    return 1 -- Reject: Not tracked and at/over cap
+end
+if (count > tonumber(ARGV[2])) then
+    return 1 -- Reject: Extreme overflow (leak)
+end
+return 0 -- Safe
+"""
+
 # Fallback for local testing without redis
 _local_counter = 0
 _local_sids = set()
-_local_lock = asyncio.Lock() if 'asyncio' in globals() else None
+_local_lock = None
 
 import asyncio
-_local_lock = asyncio.Lock()
+
+def _get_lock() -> asyncio.Lock:
+    """Lazy initializer for the local fallback lock."""
+    global _local_lock
+    if _local_lock is None:
+        _local_lock = asyncio.Lock()
+    return _local_lock
 
 def check_redis_health() -> bool:
     """Verifies Redis connectivity for the readiness probe."""
@@ -105,7 +130,13 @@ def get_active_call_count() -> int:
         logger.error(f"Redis get error: {e}")
         return max(0, _local_counter)
 
-def increment_active_calls(call_sid: str = "unknown") -> int:
+def _debug_force_increment(call_sid: str = "unknown") -> int:
+    """
+    WARNING: Internal testing helper only.
+    This function bypasses the atomic admission control (Lua) and MUST NOT 
+    be used in production admission paths. 
+    Production code must use increment_if_under_cap().
+    """
     global _local_counter, _local_sids
     if not redis_client:
         if call_sid not in _local_sids:
@@ -133,7 +164,7 @@ async def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tup
     global _local_counter, _local_sids
     
     if not redis_client:
-        async with _local_lock:
+        async with _get_lock():
             if call_sid in _local_sids:
                 return True, _local_counter
             if _local_counter >= max_cap:
@@ -158,7 +189,7 @@ async def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tup
     except Exception as e:
         logger.error(f"Redis increment_if_under_cap error: {e}")
         # Fallback to local
-        async with _local_lock:
+        async with _get_lock():
             if _local_counter >= max_cap:
                 return False, _local_counter
             _local_counter += 1
@@ -168,7 +199,7 @@ async def increment_if_under_cap(max_cap: int, call_sid: str = "unknown") -> tup
 async def decrement_active_calls(call_sid: str = "unknown") -> int:
     global _local_counter, _local_sids
     if not redis_client:
-        async with _local_lock:
+        async with _get_lock():
             if call_sid in _local_sids:
                 _local_sids.remove(call_sid)
                 _local_counter = max(0, _local_counter - 1)
@@ -181,8 +212,39 @@ async def decrement_active_calls(call_sid: str = "unknown") -> int:
         return int(result)
     except Exception as e:
         logger.error(f"Redis decr error: {e}")
-        async with _local_lock:
+        async with _get_lock():
             if call_sid in _local_sids:
                 _local_sids.remove(call_sid)
                 _local_counter = max(0, _local_counter - 1)
             return _local_counter
+
+async def is_over_capacity_atomic(max_cap: int, call_sid: str = "unknown") -> bool:
+    """
+    Atomically checks if the current SID is already tracked or if we are at capacity.
+    Resolves M1 TOCTOU race condition using Lua compare-and-act.
+    Returns: True if over capacity (should reject), False if safe.
+    """
+    global _local_counter, _local_sids
+    
+    if not redis_client:
+        async with _get_lock():
+            is_member = call_sid in _local_sids
+            if not is_member and _local_counter >= max_cap:
+                return True
+            if _local_counter > max_cap:
+                return True
+            return False
+            
+    try:
+        result = redis_client.eval(LUA_CHECK_CAPACITY_ATOMIC, 2, COUNTER_KEY, ACTIVE_SIDS_KEY, call_sid, max_cap)
+        return bool(result)
+    except Exception as e:
+        logger.error(f"Redis is_over_capacity_atomic error: {e}")
+        # Fallback to local
+        async with _get_lock():
+            is_member = call_sid in _local_sids
+            if not is_member and _local_counter >= max_cap:
+                return True
+            if _local_counter > max_cap:
+                return True
+            return False

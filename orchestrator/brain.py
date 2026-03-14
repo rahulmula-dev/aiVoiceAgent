@@ -25,8 +25,8 @@ from contracts.policy import PRDScripts
 
 # [LOCAL TESTING TIMERS]
 # Relaxed to account for long physical distances, Ngrok routing, and local network latency:
-LLM_TIMEOUT = 2.0  # Increased for local testing stability
-RAG_TIMEOUT = 10.0  # Increased for local testing stability
+LLM_TIMEOUT = 1.0  # Reduced to keep closer to 0.5s PRD
+RAG_TIMEOUT = 5.0   # Reverted from 10.0 (H4 fix: match Sprint 4 ceiling)
 # ----------------------------------------
 
 class Brain(LLMEngine):
@@ -46,20 +46,17 @@ class Brain(LLMEngine):
         try:
             # 2. Define Instructions (Injecting the Constant) - Fixed for WS-03
             self.system_instruction = f"""
-            You are the CILA Reliability & Compliance Engine—the intelligent heartbeat and safety-guard for all GD College communication.
-            Beyond answering student queries, you have three critical 'Compliance & Reliability Guard' duties:
-            1. **Residency Guard**: Ensure all processing stays compliant with local regulations. If a residency violation is detected, follow the 'soft landing' protocol.
-            2. **CRM Reliability**: Every dropped call is a lost opportunity. Log resource exhaustion events immediately and create high-priority follow-up tickets.
-            3. **Leak Prevention**: Maintain healthy connections and ensure zero-waste of college resources.
+            You are CILA, a friendly and professional voice assistant for GD College.
+            Your role is to help prospective students with information about programs, admissions, campus, and schedules.
 
-            MANDATORY RESPONSE PATTERN:
-            1. ACKNOWLEDGE: Start EVERY response by acknowledging the user's topic (e.g., "I understand you are asking about [TOPIC]").
-            2. RETRIEVE: Use the provided [CONTEXT] for deterministic accuracy.
-            3. GUARD:
-               - If KB context is missing: "{self.KB_MISS_SCRIPT}"
-               - LANGUAGE GUARD: English-only. Non-English detected: "{PRDScripts.REFUSAL_LANGUAGE}"
-            
-            CONVERSATIONAL RULES: Professional, friendly, concise (1-2 sentences), numbered lists for steps, rapport protocol.
+            RESPONSE RULES:
+            - Always answer directly and naturally. Never start your response with labels like 'RETRIEVE:', 'GUARD:', 'N/A', or any internal tags.
+            - Base your answers on the provided [KB CONTEXT].
+            - If the context does not contain the answer, politely inform the user you don't have that specific detail yet and offer to help with other topics (programs, location, etc.). 
+            - Use the script ONLY if the query is totally unrelated or invalid: "{self.KB_MISS_SCRIPT}"
+            - Only speak English. If a non-English query is detected, say: "{PRDScripts.REFUSAL_LANGUAGE}"
+            - Keep responses concise (1-2 sentences maximum), professional, and warm.
+            - Use the caller's name if you know it, to make the conversation feel personal.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -566,7 +563,10 @@ class Brain(LLMEngine):
                                 parts = sentence_buffer.replace("\n", ". ").split(". ")
                                 for i in range(len(parts) - 1):
                                     sentence = parts[i].strip()
-                                    if sentence:
+                                    # [FIX] Strip internal label leakage from LLM output
+                                    import re as _re
+                                    sentence = _re.sub(r'^(RETRIEVE|GUARD|N/A)[:\s]*', '', sentence, flags=_re.IGNORECASE).strip()
+                                    if sentence and sentence.upper() not in ('N/A', 'NA', 'NONE'):
                                         full_ai_text += sentence + ". "
                                         yield (sentence + ".", sent_metadata)
                                 sentence_buffer = parts[-1]

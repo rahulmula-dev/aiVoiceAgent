@@ -10,3 +10,4 @@ pydantic
 redis
 boto3>=1.34.0
 tenacity>=8.2.0
+langdetect

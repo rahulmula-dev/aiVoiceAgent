@@ -24,7 +24,7 @@ class TTSEngine(Protocol):
 class KnowledgeBaseEngine(Protocol):
     """
     Contract for RAG/Knowledge Retrieval.
-    (Supported: Pinecone, Weaviate, FAISS)
+    (Supported: PGVector/PostgreSQL)
     """
     def search(self, query: str, top_k: int = 2) -> tuple[str, float]: ...
 

@@ -10,6 +10,7 @@ class BaseTurn(BaseModel):
     agent_partial_response: Optional[str] = None
     barge_in_classification: Optional[str] = None
     is_multi_step: bool = False
+    continuation_offered: bool = False
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 class StandardTurn(BaseTurn):

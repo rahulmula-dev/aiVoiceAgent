@@ -371,7 +371,8 @@ async def handle_incoming_call(request: Request):
         
         import datetime
         timestamp = datetime.datetime.now().isoformat()
-        summary = f"Caller number: {from_number}, reason = OVER_CAPACITY, timestamp: {timestamp}"
+        masked_number = mask_phone_number(from_number)
+        summary = f"Caller number: {masked_number}, reason = OVER_CAPACITY, timestamp: {timestamp}"
         
         # Fire and forget ticket creation
         asyncio.create_task(crm_client.create_ticket(
@@ -388,15 +389,22 @@ async def handle_incoming_call(request: Request):
     logging.getLogger("Server").info(f"[Concurrency] Call connected. Active calls: {new_count}/{MAX_INBOUND_CALLS} (SID: {call_sid})")
 
     # Determine public ngrok URL (from environment variable)
+    # Determine public ngrok URL (from environment variable)
     public_url = os.getenv("NGROK_URL")
     if public_url:
         host = public_url.replace("https://", "").replace("http://", "")
     else:
         host = request.headers.get("host")
 
+    # Determine protocol (ws or wss) based on NGROK_URL scheme
+    protocol = "wss"
+    if public_url and public_url.startswith("http://"):
+        protocol = "ws"
+        logger.info(f"[Twilio] Using insecure WebSocket (ws://) for raw IP/HTTP testing.")
+
     # Pass statusCallback on the stream/stream wrapper isn't natively standard for Stream cleanup, 
     # instead we will monitor standard Twilio Call Status Webhook callbacks for the Number itself.
-    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="{protocol}://{host}/media-stream?sid={call_sid}&amp;from={from_number}" /></Connect></Response>'
     return Response(content=twiml, media_type="application/xml")
 
 @app.post("/api/call-status")
@@ -487,7 +495,7 @@ async def handle_media_stream(websocket: WebSocket):
                 asyncio.create_task(
                     crm_client.create_ticket(
                         transcript="System capacity reached. Call politely rejected.",
-                        summary=f"Call rejected gracefully for {from_number} due to connection pool exhaustion (Concurrency Cap Reached).",
+                        summary=f"Call rejected gracefully for {mask_phone_number(from_number)} due to connection pool exhaustion (Concurrency Cap Reached).",
                         sentiment="negative"
                     )
                 )

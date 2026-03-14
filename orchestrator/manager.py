@@ -86,6 +86,11 @@ class VoiceOrchestrator:
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
         self.last_response_was_question = False
+        self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
+        self._vad_safety_task = None     # Tracker for Echo Trap recovery
+        self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
+        self._watchdog_check_time = time.time()  # Throttler for watchdog 
+
 
     def _create_task_with_log(self, coro):
         """
@@ -122,41 +127,46 @@ class VoiceOrchestrator:
         
         return False
 
-    def _on_stt_listener_error(self, err: Exception):
-        """Called when the Deepgram _listen loop crashes. Triggers fatal fallback and cleanup."""
-        if not self.crm:
+    async def _on_stt_listener_error(self, err: Exception):
+        """Called when the Deepgram _listen loop crashes. Performs Hot-Swap STT."""
+        logger.error(f"[RECOVERY] STT Listener Dropout: {err}. Triggering Hot-Swap...")
+        
+        # 🟢 CRITICAL: Unstick the state machine. If we were waiting for a result, 
+        # we aren't getting one from a dead connection. Force back to LISTENING.
+        current_state = self.state.get_state()
+        if current_state in [CallState.TRANSCRIBING, CallState.INTENT_EVAL, CallState.RETRIEVAL, CallState.INTERRUPTED]:
+            logger.warning(f"[RECOVERY] Unsticking state {current_state} -> LISTENING")
+            self.state.transition_to(CallState.LISTENING)
+
+        if self._stt_recovery_lock:
+            logger.debug("[RECOVERY] Recovery already in progress. Skipping redundant request.")
             return
-        
-        logger.error(f"[FATAL] STT Listener Crash: {err}")
-        
-        # 1. Create forensic ticket
-        call_id = (self.session.crm_call_id or self.session.session_id) if self.session else getattr(self, '_early_sid', 'unknown')
-        self._create_task_with_log(self.crm.create_ticket(
-            transcript=f"[SYSTEM_EVENT] STT Listener (Deepgram WebSocket) crashed mid-call: {err}",
-            summary="System Alert: STT Listener Failure (Fatal)",
-            sentiment="Negative",
-            call_logger=self.call_logger,
-            call_id=call_id,
-            title="System Alert: STT Listener Failure",
-            session_obj=self.session
-        ))
 
-        # 2. Trigger No-Silence Guarantee (PRD §7)
-        async def _fatal_fallback():
-            try:
-                # Play apology before hanging up
-                async for chunk in self.synthesizer.speak(PRDScripts.APOLOGY_FATAL):
-                    await self._send_response_chunk(chunk)
-                await asyncio.sleep(2.0)
-            except: pass
-            await self.cleanup()
-
-        self._create_task_with_log(_fatal_fallback())
+        try:
+            self._stt_recovery_lock = True
+            from stt.stt_pool import stt_pool, PooledTranscriber
+            raw_stt = await stt_pool.acquire(timeout=2.0)
+            if raw_stt:
+                old_stt = self.transcriber
+                self.transcriber = PooledTranscriber(stt_pool, raw_stt)
+                self.transcriber.set_callback(self._on_transcript)
+                self.transcriber.set_listener_error_callback(self._on_stt_listener_error)
+                
+                # Cleanup old connection in background
+                asyncio.create_task(old_stt.close())
+                logger.info("[FAILOVER] STT Provider hot-swapped successfully.")
+            else:
+                logger.error("[RECOVERY] Pool exhausted during STT hot-swap.")
+        except Exception as e:
+            logger.critical(f"[FAILOVER] STT Hot-Swap FAILED: {e}")
+        finally:
+            self._stt_recovery_lock = False
 
     async def _on_transcript(self, text: str, confidence: float, stt_latency: float = 0.0, is_final: bool = False, detected_lang: str = None):
         """
         [GOVERNANCE] Expert Debugger Entry Point.
         """
+        self._last_stt_packet_time = time.time()  # [CALL-CPR] Reset watchdog
         raw_text = text.strip() if text else ""
         
         # 1. AGGRESSIVE LOGGING: We must see what the STT actually heard
@@ -177,7 +187,8 @@ class VoiceOrchestrator:
                 # 🛡️ SECURITY GATE: Prevent policy-violating partial transcripts from hitting external Vector DB
                 intent = self.policy.classify_intent(raw_text, detected_lang=detected_lang)
                 if intent == "PROCEED":
-                    if not hasattr(self.session, 'prefetched_context_task') or self.session.prefetched_context_task.done():
+                    prefetched_task = getattr(self.session, 'prefetched_context_task', None)
+                    if prefetched_task is None or prefetched_task.done():
                         logger.debug(f"[STREAM BUFFER] Starting proactive KB lookup for: '{raw_text}'")
                         # Fire and forget KB search
                         self.session.prefetched_context_task = asyncio.create_task(
@@ -312,6 +323,9 @@ class VoiceOrchestrator:
                         # ───────────────────────────────────────────────────────────────────────
                         current_time = time.time()
                         if current_time - self.last_refusal_time < 10:
+                            # Still ensure state is reset before silent return
+                            if self.state.get_state() in [CallState.TRANSCRIBING, CallState.RESPONSE_VALIDATION]:
+                                self.state.transition_to(CallState.LISTENING)
                             return
 
                         self.language_strike_count += 1
@@ -430,8 +444,9 @@ class VoiceOrchestrator:
         
         # LOW-QUALITY DETECTION: Catch mumbled/garbled non-English input
         # Only trigger on NON-EMPTY low-confidence text (avoids feedback loop)
-        # Deepgram Nova-2 often returns ~0.7 to ~0.75 for accurate but fast/quiet speech
-        if confidence < 0.50:
+        # [TESTING] Threshold reduced from 0.50 to 0.35 to prevent false-blocking of valid quiet speech
+        # Deepgram Nova-2 often returns ~0.5-0.75 for accurate but quiet/fast speech over phone
+        if confidence < 0.35:
             logger.warning(f"[LOW-CONFIDENCE] Text: '{text}' (Conf: {confidence:.2f}) - triggering clarification")
             
             # 🟢 S4 Hardening: Hard LLM Bypass
@@ -590,14 +605,15 @@ class VoiceOrchestrator:
                 self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
                 return
 
-            self.response_task = asyncio.create_task(self.speak_refusal(refusal_text, trace_id=trace_id))
+            self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
             return # SHORT-CIRCUIT
         # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
         if self.response_task and not self.response_task.done():
             # [S4-11 FIX]: Check both SPEAKING and INTERRUPTED states
             # Because a partial transcript might have already flipped the state to INTERRUPTED
             current_state = self.state.get_state()
-            is_speaking = current_state in [CallState.SPEAKING, CallState.INTERRUPTED, CallState.TRANSCRIBING]
+            # [STATE FIX]: TRANSCRIBING is USER speaking. SPEAKING/INTERRUPTED is AI.
+            is_speaking = current_state in [CallState.SPEAKING, CallState.INTERRUPTED]
             
             logger.debug(f">>> BARGE-IN DETECTED: state={current_state}, speaking={is_speaking}")
             
@@ -624,10 +640,9 @@ class VoiceOrchestrator:
                 partial_text = self.synthesizer.stop_current_speech(self.sid)
                 self._create_task_with_log(self._send_clear_message())
                 
-                # [P5-03]: Save before transition to INTERRUPTED
+                # [P5-03]: Save before barge-in
                 self.session_manager.save_session(self.session)
-                self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
-
+                
                 logger.debug("AI was speaking. triggering barge-in handler.")
                 self.response_task = asyncio.create_task(
                     self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
@@ -665,106 +680,121 @@ class VoiceOrchestrator:
 
     async def handle_barge_in(self, call_id: str, caller_input: str, trace_id: str = None, partial_text: str = None):
         """
-        Story S4-11: Core Barge-in logic.
+        Story S4-11: Core Barge-in logic. Robustified to prevent deadlocks.
         """
         if not self.session: return
 
-        # STEP A — Stop TTS + Mark Interrupted
-        if partial_text is None:
-            partial_text = self.synthesizer.stop_current_speech(call_id)
-            self._create_task_with_log(self._send_clear_message())
+        # Prevent redundant RAG searches for the same barge-in turn
+        if hasattr(self, '_rag_lock') and self._rag_lock:
+            logger.debug("RAG search already in progress for this barge-in. Waiting...")
+            return
+
+        try:
+            self._rag_lock = True
+            # STEP A — Stop TTS + Mark Interrupted
+            # We perform these synchronously in the task to ensure the state machine flips ASAP.
+            if partial_text is None:
+                partial_text = self.synthesizer.stop_current_speech(call_id)
+                self._create_task_with_log(self._send_clear_message())
+            
             self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
-        
-        # Identify the turn being interrupted
-        prev_turn = None
-        if self.session.structured_turns:
-            prev_turn = self.session.structured_turns[-1]
-            prev_turn["agent_response_status"] = "interrupted"
-            prev_turn["agent_partial_response"] = partial_text
-        
-        # STEP B — Inject RAG Context for PRD Compliance
-        # FAST-PATH: If the input is extremely short (filler/command), skip RAG to reduce latency.
-        is_short_input = len(caller_input.split()) <= 2
-        
-        logger.info(f"Barge-in detected ({'Short' if is_short_input else 'Full'} input). Grounding...")
-        context_text = ""
-        rag_result, rag_score, rag_topic, kb_v, c_ids = None, 0.0, "General", "unknown", []
-        
-        if not is_short_input:
-            try:
-                rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
-                    self.brain.kb.search(caller_input, self.call_logger, 10, trace_id),
-                    timeout=3.0
-                )
             
-                invalid_contexts = [
-                    "No specific documents found.",
-                    "No specific documents found due to timeout.",
-                    "No specific documents found due to an internal knowledge base error.",
-                    "LOW_CONFIDENCE_FALLBACK",
-                    "BLOCKED_BY_SAFETY_GUARDRAIL",
-                    "RAG Disabled by manual override."
-                ]
+            # Identify the turn being interrupted
+            prev_turn = None
+            if self.session.structured_turns:
+                prev_turn = self.session.structured_turns[-1]
+                prev_turn.agent_response_status = "interrupted"
+                prev_turn.agent_partial_response = partial_text
+            
+            # STEP B — Inject RAG Context for PRD Compliance
+            # FAST-PATH: If the input is extremely short (filler/command), skip RAG to reduce latency.
+            is_short_input = len(caller_input.split()) <= 2
+            
+            logger.info(f"Barge-in detected ({'Short' if is_short_input else 'Full'} input). Grounding...")
+            context_text = ""
+            rag_result, rag_score, rag_topic, kb_v, c_ids = None, 0.0, "General", "unknown", []
+            
+            if not is_short_input:
+                try:
+                    rag_result, rag_score, rag_topic, kb_v, c_ids = await asyncio.wait_for(
+                        self.brain.kb.search(caller_input, self.call_logger, 10, trace_id),
+                        timeout=3.0
+                    )
                 
-                if rag_result and rag_result not in invalid_contexts:
-                    context_text = rag_result
-                    logger.info(f"RAG context found for barge-in (Score: {rag_score:.2f}).")
-            except Exception as e:
-                logger.warning(f"RAG failed during barge-in: {e}")
+                    invalid_contexts = [
+                        "No specific documents found.",
+                        "No specific documents found due to timeout.",
+                        "No specific documents found due to an internal knowledge base error.",
+                        "LOW_CONFIDENCE_FALLBACK",
+                        "BLOCKED_BY_SAFETY_GUARDRAIL",
+                        "RAG Disabled by manual override."
+                    ]
+                    
+                    if rag_result and rag_result not in invalid_contexts:
+                        context_text = rag_result
+                        logger.info(f"RAG context found for barge-in (Score: {rag_score:.2f}).")
+                except Exception as e:
+                    logger.warning(f"RAG failed during barge-in: {e}")
 
-        # STEP C — Classify + Respond (Call Brain)
-        classification, response, is_multi_step, topic, kb_v_brain, c_ids_brain = await self.brain.generate_with_classification(
-            session=self.session,
-            caller_input=caller_input,
-            context_text=context_text,
-            trace_id=trace_id
-        )
-        logger.info(f"[AUDIT] Grounded Barge-In generated (Classification: {classification}). Trace: {trace_id}")
-        
-        # Aggregate any metadata from barge-in classification too
-        if self.session:
-            if kb_v and kb_v != "unknown" and not self.session.call_context.kb_version_id:
-                self.session.call_context.kb_version_id = kb_v
-            if c_ids:
-                for cid in c_ids:
-                    if cid and cid != "unknown" and cid not in self.session.call_context.chunk_ids_used:
-                        self.session.call_context.chunk_ids_used.append(cid)
-            if rag_score > 0:
-                self.session.confidence_scores.append(rag_score)
-
-        # STEP D — Update Interrupted Turn
-        if classification == "NEW_TOPIC" and prev_turn:
-            prev_turn.agent_response_status = "abandoned"
+            # STEP C — Classify + Respond (Call Brain)
+            classification, response, is_multi_step, topic, kb_v_brain, c_ids_brain = await self.brain.generate_with_classification(
+                session=self.session,
+                caller_input=caller_input,
+                context_text=context_text,
+                trace_id=trace_id
+            )
+            logger.info(f"[AUDIT] Grounded Barge-In generated (Classification: {classification}). Trace: {trace_id}")
             
-        if prev_turn:
-            prev_turn.barge_in_classification = classification
-            
-        # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
-        if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
-            # Append soft offer to the end of the new response
-            if response and not response.endswith(("?", ".")): response += "."
-            response += " I can also finish walking you through the remaining steps if that's helpful."
-            self.session.continuation_offered = True
+            # Aggregate any metadata from barge-in classification too
+            if self.session:
+                if kb_v and kb_v != "unknown" and not self.session.call_context.kb_version_id:
+                    self.session.call_context.kb_version_id = kb_v
+                if c_ids:
+                    for cid in c_ids:
+                        if cid and cid != "unknown" and cid not in self.session.call_context.chunk_ids_used:
+                            self.session.call_context.chunk_ids_used.append(cid)
+                if rag_score > 0:
+                    self.session.confidence_scores.append(rag_score)
 
-        # STEP D — Create New Turn Entry
-        new_id = len(self.session.structured_turns) + 1
-        new_turn = BargeInTurn(
-            turn_id=new_id,
-            caller_input=caller_input,
-            topic=topic,
-            agent_response_status="completed",
-            agent_partial_response=None,
-            barge_in_classification=None,
-            is_multi_step=is_multi_step,
-            continuation_offered=False
-        )
-        self.session.structured_turns.append(new_turn)
-        self.session.current_speaking_turn_id = new_id
-        if hasattr(self, 'session_manager') and self.session_manager:
-            self.session_manager.save_session(self.session)
+            # STEP D — Update Interrupted Turn
+            if classification == "NEW_TOPIC" and prev_turn:
+                prev_turn.agent_response_status = "abandoned"
+                
+            if prev_turn:
+                prev_turn.barge_in_classification = classification
+                
+            # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+            if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
+                # Append soft offer to the end of the new response
+                if response and not response.endswith(("?", ".")): response += "."
+                response += " I can also finish walking you through the remaining steps if that's helpful."
+                self.session.continuation_offered = True
 
-        # Speak it
-        await self.speak_immediate_response(response, trace_id=trace_id)
+            # STEP D — Create New Turn Entry
+            new_id = len(self.session.structured_turns) + 1
+            new_turn = BargeInTurn(
+                turn_id=new_id,
+                caller_input=caller_input,
+                topic=topic,
+                agent_response_status="completed",
+                agent_partial_response=None,
+                barge_in_classification=None,
+                is_multi_step=is_multi_step,
+                continuation_offered=False
+            )
+            self.session.structured_turns.append(new_turn)
+            self.session.current_speaking_turn_id = new_id
+            if hasattr(self, 'session_manager') and self.session_manager:
+                self.session_manager.save_session(self.session)
+
+            # Speak it
+            await self.speak_immediate_response(response, trace_id=trace_id)
+
+        finally:
+            self._rag_lock = False
+            if self.state.get_state() == CallState.INTERRUPTED:
+                logger.debug("Barge-in task cleanup: Reverting INTERRUPTED -> LISTENING")
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
 
     async def speak_immediate_response(self, text, trace_id=None):
         """
@@ -849,14 +879,15 @@ class VoiceOrchestrator:
         self._early_caller = caller_id or websocket.query_params.get("from", "unknown")
 
         # 0.5. CONCURRENCY SAFETY GATE (S4-7)
-        from telephony.concurrency import get_active_call_count, MAX_INBOUND_CALLS
-        # Defensive Fail-safe: If we see count >= 30 here, it means we are at/over the hard cap.
-        if get_active_call_count() >= MAX_INBOUND_CALLS:
+        from telephony.concurrency import is_over_capacity_atomic, MAX_INBOUND_CALLS
+        # [M1 FIX] Authoritative Secondary Enforcement:
+        # Uses atomic Lua to ensure zero-leak concurrency enforcement during high bursts.
+        if await is_over_capacity_atomic(MAX_INBOUND_CALLS, call_sid=self._early_sid):
             logger.critical("[SAFETY GATE] Concurrent active calls at/exceeded hard cap inside pipeline. Rejection triggered.")
             
             # 1. Release the slot IMMEDIATELY to prevent "clogging" during a burst
             from telephony.concurrency import decrement_active_calls
-            decrement_active_calls(call_sid=self._early_sid)
+            await decrement_active_calls(call_sid=self._early_sid)
 
             # 2. Record CRM ticket asynchronously (Pillar 3 Forensic Pillar)
             from datetime import datetime
@@ -928,8 +959,9 @@ class VoiceOrchestrator:
             while True:
                 # 1. Wait for 'start' or first 'media' to get Identity
                 try:
-                    # [FIX]: Increase timeout from 0.3s to 2.0s to allow for network jitter during Twilio handshake
-                    message = await asyncio.wait_for(websocket.receive(), timeout=2.0)
+                    # [TWILIO-HARDENING]: Increase timeout from 2.0s to 5.0s. 
+                    # Twilio can be slow to start the 'media' events over high-latency networks.
+                    message = await asyncio.wait_for(websocket.receive(), timeout=5.0)
                 except asyncio.TimeoutError:
                     if not sid:
                         logger.warning("Identity detection timed out. Using fallback IDs.")
@@ -1004,30 +1036,43 @@ class VoiceOrchestrator:
                 # In PRD, caller_type should dynamically track based on conversation intent.
                 # However, at Call Start, we have no intent yet. 
                 # We start as "unknown_lead", and will update dynamically later based on text.
-                try:
-                    crm_id = await self.crm.log_call(
-                        call_id=self.session.session_id,
-                        caller_phone=self.session.caller_number,
-                        caller_type="unknown_lead",
-                        summary="Incoming Call from Voice Agent",
-                        transcript="[Call Started]", 
-                        sentiment="Neutral"
-                    )
-                    if crm_id:
-                        self.session.crm_call_id = str(crm_id)
-                        # [P5-03]: Add stream SID to metadata for cross-session tracking
-                        if "twilio_metadata" not in self.session.metadata:
-                            self.session.metadata["twilio_metadata"] = {}
-                        self.session.metadata["twilio_metadata"]["stream_sid"] = self.sid
-                        self.session.metadata["twilio_metadata"]["call_sid"] = call_sid
-                        logger.info(f"CRM Call Logged: {crm_id}")
-                except Exception as e:
-                    logger.error(f"Failed to log call to CRM: {e}")
+                # [PRD Rule - Commented]
+                # Stated field log_call is required before greeting to ensure session linking.
+                # crm_id = await self.crm.log_call(...)
+
+                # [TESTING Rule - Active]
+                # Spawn CRM logging as a background task to prevent blocking the GREETING 
+                # especially in high-latency local environments (Ngrok) or when CRM is offline.
+                async def _log_call_bg():
+                    try:
+                        crm_id = await self.crm.log_call(
+                            call_id=self.session.session_id,
+                            caller_phone=self.session.caller_number,
+                            caller_type="unknown_lead",
+                            summary="Incoming Call from Voice Agent",
+                            transcript="[Call Started]", 
+                            sentiment="Neutral"
+                        )
+                        if crm_id:
+                            self.session.crm_call_id = str(crm_id)
+                            if "twilio_metadata" not in self.session.metadata:
+                                self.session.metadata["twilio_metadata"] = {}
+                            self.session.metadata["twilio_metadata"]["stream_sid"] = self.sid
+                            self.session.metadata["twilio_metadata"]["call_sid"] = call_sid
+                            logger.info(f"CRM Call Logged: {crm_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to log call to CRM: {e}")
+                
+                self._create_task_with_log(_log_call_bg())
 
                 # Initial Greeting
                 # [P5-03]: Explicit save BEFORE update_state to prevent Redis overwrite of caller_type/crm_id
                 self.session_manager.save_session(self.session)
                 self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
+                
+                # Warm-up delay to allow browser AudioContext to stabilize
+                await asyncio.sleep(0.5)
+                
                 greeting = PRDScripts.GREETING
                 self.response_task = asyncio.create_task(self.generate_and_speak(greeting, is_greeting=True))
 
@@ -1057,7 +1102,26 @@ class VoiceOrchestrator:
                         payload = base64.b64decode(data['media']['payload'])
                         if self.recorder:
                             self.recorder.write_chunk(payload)
-                        await self.transcriber.send_audio(payload)
+                        try:
+                            await self.transcriber.send_audio(payload)
+                        except Exception as stt_err:
+                            logger.error(f"[FAILOVER] STT send failed: {stt_err}. Attempting recovery...")
+                            # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
+                            try:
+                                from stt.stt_pool import stt_pool, PooledTranscriber
+                                raw_stt = await stt_pool.acquire(timeout=1.0)
+                                old_stt = self.transcriber
+                                self.transcriber = PooledTranscriber(stt_pool, raw_stt)
+                                self.transcriber.set_callback(self._on_transcript)
+                                self.transcriber.set_listener_error_callback(self._on_stt_listener_error)
+                                # Drain old STT
+                                asyncio.create_task(old_stt.close())
+                                logger.info("[FAILOVER] STT provider hot-swapped successfully.")
+                                # Retry the send once
+                                await self.transcriber.send_audio(payload)
+                            except Exception as failover_err:
+                                logger.critical(f"[FATAL] STT Failover failed: {failover_err}")
+                                raise ConnectionError("STT Failover Exhausted")
                         self.session.touch() # Life signal
                     
                     elif data['event'] == 'speech':
@@ -1080,6 +1144,32 @@ class VoiceOrchestrator:
                                 
                                 if halt_latency > 300:
                                     logger.warning(f"[LATENCY_BREACH] Telephony halt exceeded 300ms budget: {halt_latency:.1f}ms")
+                                
+                                # [TWILIO-HARDENING]: Start a safety timer. 
+                                # If we don't get a transcript within 3s of this VAD signal, 
+                                # revert to LISTENING so the AI doesn't stay 'frozen' in INTERRUPTED state.
+                                # Safety: Only log/track if we are actually speaking
+                                if self.synthesizer.is_speaking():
+                                    if self._vad_safety_task: self._vad_safety_task.cancel()
+
+                                    async def _vad_safety_timeout(trace_id):
+                                        await asyncio.sleep(4.0)
+                                        if self.state.get_state() == CallState.INTERRUPTED:
+                                            logger.info("[TELEPHONY VAD] No transcript followed interruption. Reverting to LISTENING.")
+                                            self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                                    
+                                    self._vad_safety_task = self._create_task_with_log(_vad_safety_timeout(None))
+
+                    # [CALL-CPR] Watchdog Check: 7s of absolute silence (no DG heartbeats) = Dead Connection
+                    # We throttle this check to once per second to avoid CPU lag
+                    now = time.time()
+                    if now - self._watchdog_check_time > 1.0:
+                        self._watchdog_check_time = now
+                        if self.state.get_state() == CallState.LISTENING:
+                            if now - self._last_stt_packet_time > 8.0:
+                                logger.warning(f"[CALL-CPR] STT silence watchdog triggered (8s). Forcing Hot-Swap.")
+                                self._last_stt_packet_time = now # Reset to avoid loop
+                                self._create_task_with_log(self._on_stt_listener_error(RuntimeError("Watchdog timeout")))
                     
                     elif data['event'] == 'stop':
                         logger.debug(f"Telephony Stream Stopped: {sid}")
@@ -1089,9 +1179,9 @@ class VoiceOrchestrator:
             if self.session:
                 self.session.termination_reason = "system_failure"
             
-            # Attempt to play goodbye message if socket still open
+            # Attempt to play goodbye message if socket still open and we aren't already closing
             try:
-                if self.websocket:
+                if self.websocket and self.state.get_state() != CallState.CALL_END:
                     goodbye_text = PRDScripts.APOLOGY_FATAL
                     async for chunk in self.synthesizer.speak(goodbye_text):
                         await self.send_audio_response(chunk)
@@ -1398,8 +1488,8 @@ class VoiceOrchestrator:
                         if kb_topic and kb_topic != "General":
                             if self.session and self.session.structured_turns:
                                 current_turn = self.session.structured_turns[-1]
-                                if current_turn.get("topic") in [intent, "General", "unknown"]:
-                                    current_turn["topic"] = kb_topic
+                                if getattr(current_turn, "topic", None) in [intent, "General", "unknown"]:
+                                    current_turn.topic = kb_topic
 
                         if self.call_logger:
                              self.call_logger.log_event("brain", "chunk_generated", meta={
@@ -1458,9 +1548,9 @@ class VoiceOrchestrator:
                 
                 # S4-11: Detect if this turn was a multi-step answer for future continuation offers
                 if turn:
-                    turn["is_multi_step"] = self._is_multi_step(full_ai_text)
-                    if turn["is_multi_step"]:
-                        logger.debug(f"[S4-11] Turn {turn['turn_id']} flagged as MULTI-STEP")
+                    turn.is_multi_step = self._is_multi_step(full_ai_text)
+                    if turn.is_multi_step:
+                        logger.debug(f"[S4-11] Turn {turn.turn_id} flagged as MULTI-STEP")
 
                 # S4-11: Ensure worker task is done before finishing parent task
                 await audio_queue.join()
@@ -1805,22 +1895,26 @@ class VoiceOrchestrator:
         """
         logger.debug("Starting Silence Monitor")
         try:
-            while self.session and self.session.current_state != SessionState.ENDED:
-                await asyncio.sleep(1.0)
+            while not self.stop_event.is_set():
+                await asyncio.sleep(1)
                 
-                # Check session health - stop if session is gone
-                if not self.session:
-                    break
-
-                # DEBUG: Trace silence monitor (Disabled for production)
-                # state = self.state.get_state()
-                # logger.debug(f"Silencer: Gap={time.time() - self.last_interaction_time:.1f}s State={state}")
-
-                # 1. Don't count silence while AI is speaking, buffering, or transcribing
-                # [FIX]: Include INTERRUPTED state to prevent premature 'Are you still there?' prompts
-                if self.state.get_state() in [CallState.SPEAKING, CallState.INTENT_EVAL, CallState.ESCALATION, CallState.TRANSCRIBING, CallState.INTERRUPTED, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
+                # 1. State Guard: DO NOT count silence while AI is busy.
+                # If we are speaking, thinking, or transcribing, the user is 'interacting' or waiting.
+                # Includes INTERRUPTED, RETRIEVAL, and VALIDATION states.
+                current_call_state = self.state.get_state()
+                if current_call_state in [
+                    CallState.SPEAKING, 
+                    CallState.INTENT_EVAL, 
+                    CallState.TRANSCRIBING, 
+                    CallState.ESCALATION, 
+                    CallState.RETRIEVAL, 
+                    CallState.RESPONSE_VALIDATION
+                ]:
+                    # Keep the 'interaction' timestamp fresh so we don't 'timeout' mid-thought.
                     self.last_interaction_time = time.time()
                     continue
+
+                # 2. Maximum Session Limit check (6 minutes)
 
                 # 2. Session Duration / Wrap-up Guard
                 elapsed = None
@@ -1876,29 +1970,35 @@ class VoiceOrchestrator:
                     await self.cleanup()
                     break
 
-                # 3. Check Silence Duration
-                gap = time.time() - self.last_interaction_time
+                # 1.5 Auto-Recovery for False Interruptions
+                if current_call_state == CallState.INTERRUPTED:
+                    if time.time() - self.last_interaction_time > 5.0:
+                        logger.info("[RECOVERY] False interruption or noise detected. Reverting INTERRUPTED -> LISTENING.")
+                        self.state.transition_to(CallState.LISTENING)
+
+                # 2. Silence Stage Logic
+                silence_gap = time.time() - self.last_interaction_time
                 
                 # [SILENCE-ISS-158] Contextual Silence Machine
                 # Stage 0: Normal
-                # Stage 1: Initial Warning (10s+)
-                if gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {gap:.1f}s)")
+                # Stage 1: Initial Warning (20s+) - [FIX] Increased from 15s to reduce frustration
+                if silence_gap > 20.0 and self.silence_stage == 0:
+                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {silence_gap:.1f}s)")
                     self.silence_stage = 1
                     self.last_interaction_time = time.time() # Reset timer for next stage
                     msg = PRDScripts.SILENCE_1
-                    await self.speak_refusal(msg)
+                    await self.speak_immediate_response(msg)
                     
-                # Stage 2: Secondary Warning (20s+)
-                elif gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {gap:.1f}s)")
+                # Stage 2: Secondary Warning (another 20s silence)
+                elif silence_gap > 20.0 and self.silence_stage == 1:
+                    logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {silence_gap:.1f}s)")
                     self.silence_stage = 2
                     self.last_interaction_time = time.time()
                     msg = PRDScripts.SILENCE_2
-                    await self.speak_refusal(msg)
+                    await self.speak_immediate_response(msg)
                         
-                # Stage 3: Termination (30s total)
-                elif gap > 10.0 and self.silence_stage == 2:
+                # Stage 3: Termination
+                elif silence_gap > 20.0 and self.silence_stage == 2:
                     logger.warning(f"Silence Stage 3 (Termination) triggered (Total: 30s)")
                     await self._trigger_silence_termination()
                     break

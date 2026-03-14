@@ -9,13 +9,12 @@ from tts.synthesizer import Synthesizer
 from orchestrator.manager import VoiceOrchestrator
 from orchestrator.session_manager import SessionManager
 from agent_logging import CallLogger
-from typing import Optional
+from typing import Optional, Any
 import logging
 import random
 import asyncio
 
 logger = logging.getLogger("OrchestratorFactory")
-
 
 async def create_default_orchestrator(
     session_id: str,
@@ -54,14 +53,14 @@ async def create_default_orchestrator(
         from stt.stt_pool import create_transcriber
         try:
             # CTO Polish: Longer timeout for fresh fallback attempt (Hail Mary)
-            raw_stt = await asyncio.wait_for(create_transcriber(), timeout=2.0)
+            raw_stt = await asyncio.wait_for(create_transcriber(), timeout=5.0)
         except asyncio.TimeoutError:
-            logger.error("STT Fallback (Fresh Connection) timed out after 2.0s.")
+            logger.error("STT Fallback (Fresh Connection) timed out after 5.0s.")
             raise e
         except Exception as fe:
             logger.error(f"STT Fallback failed: {fe}")
             raise e
-    logger.info(f"Orchestrator Factory: STT provider ready (session={session_id})")
+    logger.info("Orchestrator Factory: STT provider ready")
     stt_provider = PooledTranscriber(stt_pool, raw_stt)
     
     # Pillar 2: Residency Guard - ensure provider knows the session context
@@ -86,7 +85,6 @@ async def create_default_orchestrator(
             
             # trigger a play_fallback_audio (or equivalent) before the exception is raised
             if websocket:
-                from tts.synthesizer import Synthesizer
                 temp_synth = Synthesizer()
                 await temp_synth.play_fallback_audio(websocket)
             

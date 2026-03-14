@@ -202,9 +202,14 @@ class CRMClient(CRMEngine):
              final_title = f"{final_title} | Call-{short_id}"
 
         # Forensic Metadata Enrichment (Task 6)
-        enhanced_metadata = {
-            "structured_turns": structured_turns
-        } if structured_turns else {}
+        enhanced_metadata = {}
+        if structured_turns:
+            # [FIX] Pydantic models are not JSON serializable by default. 
+            # Convert the list of models to a list of dicts.
+            enhanced_metadata["structured_turns"] = [
+                turn.model_dump() if hasattr(turn, 'model_dump') else turn.dict() if hasattr(turn, 'dict') else turn 
+                for turn in structured_turns
+            ]
         
         if session_obj:
             if session_obj.interruption_snapshot:
@@ -337,8 +342,16 @@ class CRMClient(CRMEngine):
         # 1. ATTEMPT S3 UPLOAD FIRST (ca-central-1)
         # CRITICAL-P3-04: Local disk is only for buffer/dead-end
         s3_key = f"dlq_tickets/{entry_id}.json"
-        s3_success = self.s3_queue.upload_json(entry, s3_key)
         
+        # [FIX] Only attempt S3 if credentials are likely to exist to avoid log noise
+        aws_id = os.getenv("AWS_ACCESS_KEY_ID")
+        s3_success = False
+        if aws_id:
+            s3_success = self.s3_queue.upload_json(entry, s3_key)
+        else:
+            logger.debug("[CRM] AWS credentials missing; skipping S3 DLQ upload.")
+            s3_success = False
+            
         if s3_success:
             logger.info(f"[CRM] Payload synced directly to S3 DLQ: {entry_id}")
             return

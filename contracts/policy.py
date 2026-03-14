@@ -3,6 +3,9 @@ import logging
 import re
 from langdetect import detect_langs
 
+# Module-level logger for Policy Engine
+logger = logging.getLogger("Policy")
+
 class PRDScripts:
     # Greetings
     GREETING = "Hello! I am CILA from GD College."
@@ -22,7 +25,7 @@ class PRDScripts:
     REFUSAL_LANGUAGE_1 = "I am currently designed to support English only. Please continue in English."
     REFUSAL_LANGUAGE_2 = "I can only understand English. If the next input is not in English, I will have to end the call."
     REFUSAL_LANGUAGE_3 = "I am ending the call now as I can only assist in English. Goodbye."
-    REFUSAL_KB_MISS = "As the CILA Reliability & Compliance Engine, I do not have that specific information in my knowledge base. A member of the GD College admissions team will follow up with you shortly."
+    REFUSAL_KB_MISS = "I'm sorry, I don't have that specific information right now. Let me have an admissions officer follow up with you to provide more details. I can, however, help with general information about programs and admissions!"
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
     
     # Apologies
@@ -152,7 +155,7 @@ class ResponsePolicyEngine:
         "career", "vocational", "technical", "gd college", "cila agent", "issue", "question",
         "uh", "um", "hmm", "ah", "mhm",
         "continue", "restart", "give", "list", "kill", "people", "common", "india", 
-        "us", "africa", "america", "visa", "status", "so", "yeah"
+        "us", "africa", "america", "visa", "status", "so", "yeah", "thank", "thanks", "wait", "welcome"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -393,6 +396,9 @@ class ResponsePolicyEngine:
         Classifies user intent into: 'PROCEED', 'SENSITIVE', 'HARD_REFUSAL_IMMIGRATION', 'AMBIGUOUS', etc.
         Hardened with multi-layered confidence gates and partial match logic (P5-01).
         """
+        # [AUDIT] L1: Explicit log line at the pre-check entry point to verify ordering.
+        logger.info(f"Policy Pre-Check: Classifying intent for input: '{user_text[:50]}...'")
+        
         lower = user_text.lower().strip()
         
         # 1. Check Sensitive (Highest Priority - Full & Substring match) [SECURITY-P1]
@@ -431,7 +437,7 @@ class ResponsePolicyEngine:
             return "AMBIGUOUS"
         
         # If it's just a single common word without context, it might be ambiguous
-        if len(words) == 1 and words[0] in self.COMMON_ENGLISH_WORDS and words[0] not in ["hello", "hi", "hey", "ok", "okay", "yes", "no", "yup"]:
+        if len(words) == 1 and words[0] in self.COMMON_ENGLISH_WORDS and words[0] not in ["hello", "hi", "hey", "ok", "okay", "yes", "no", "yup", "thank", "thanks", "wait", "welcome"]:
             return "AMBIGUOUS"
 
         return "PROCEED"
