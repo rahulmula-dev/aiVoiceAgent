@@ -74,16 +74,13 @@ class Transcriber(STTProvider):
         headers = {"Authorization": f"Token {self.api_key}"}
 
         # --- [STRICT PRD vs TESTING RULES] ---
-        # 1. PRODUCTION Rule: 1 retry within ≤500ms total.
-        # 2. TESTING Rule: Higher timeout for network jitter over Ngrok/Home WiFi.
-        
-        # [PRD Rule - Commented]
-        # MAX_ATTEMPTS = 1
-        # ATTEMPT_TIMEOUT = 0.5
-        
-        # [TESTING Rule - Active]
-        MAX_ATTEMPTS = 3
-        ATTEMPT_TIMEOUT = 5.0
+        # PRD §5: 1 retry ≤500ms (2 total attempts, 0.5s timeout each).
+        # Testing override: higher timeout for Ngrok/Home WiFi jitter.
+        # [FIX-6] Values are now env-driven so production deploys enforce the PRD budget
+        # without requiring a code change. APP_ENV controls the default.
+        _is_test_env = os.getenv("APP_ENV", "production").lower() in ["development", "staging", "test"]
+        MAX_ATTEMPTS = int(os.getenv("STT_MAX_ATTEMPTS", "3" if _is_test_env else "2"))
+        ATTEMPT_TIMEOUT = float(os.getenv("STT_ATTEMPT_TIMEOUT", "5.0" if _is_test_env else "0.5"))
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):

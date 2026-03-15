@@ -89,7 +89,8 @@ class VoiceOrchestrator:
         self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
         self._vad_safety_task = None     # Tracker for Echo Trap recovery
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
-        self._watchdog_check_time = time.time()  # Throttler for watchdog 
+        self._watchdog_check_time = time.time()  # Throttler for watchdog
+        self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
 
 
     def _create_task_with_log(self, coro):
@@ -1102,6 +1103,12 @@ class VoiceOrchestrator:
                         payload = base64.b64decode(data['media']['payload'])
                         if self.recorder:
                             self.recorder.write_chunk(payload)
+                        # [FIX-7] Gate STT while agent is SPEAKING to prevent Twilio echo/sidetone
+                        # from reaching Deepgram and producing false barge-in transcripts.
+                        # Audio is still recorded (above) but not forwarded to the STT pipeline.
+                        if self.state.get_state() == CallState.SPEAKING:
+                            self.session.touch()  # Life signal still needs to fire
+                            continue
                         try:
                             await self.transcriber.send_audio(payload)
                         except Exception as stt_err:
@@ -1131,6 +1138,17 @@ class VoiceOrchestrator:
                         if self.response_task and not self.response_task.done():
                             current_state = self.state.get_state()
                             if current_state == CallState.SPEAKING:
+                                # [FIX-4] Debounce: require VAD_DEBOUNCE_MS between consecutive speech events
+                                # to filter 8kHz telephony noise, echo, and line artifacts.
+                                # Threshold is config-driven (env var) per PRD constraint.
+                                _vad_now = asyncio.get_event_loop().time()
+                                _vad_last = getattr(self, '_last_speech_event_time', 0.0)
+                                _vad_debounce = float(os.getenv("VAD_DEBOUNCE_MS", "250")) / 1000.0
+                                if _vad_now - _vad_last < _vad_debounce:
+                                    logger.debug(f"[TELEPHONY VAD] Debounced speech event ({(_vad_now - _vad_last)*1000:.0f}ms since last). Ignoring.")
+                                    continue
+                                self._last_speech_event_time = _vad_now
+
                                 logger.info(">>> IMMEDIATE STOP: Interrupted by Telephony VAD signal.")
                                 self.synthesizer.stop_current_speech(self.sid)
                                 await self._send_clear_message() # M1: Await clear message confirmed
@@ -1145,20 +1163,21 @@ class VoiceOrchestrator:
                                 if halt_latency > 300:
                                     logger.warning(f"[LATENCY_BREACH] Telephony halt exceeded 300ms budget: {halt_latency:.1f}ms")
                                 
-                                # [TWILIO-HARDENING]: Start a safety timer. 
-                                # If we don't get a transcript within 3s of this VAD signal, 
-                                # revert to LISTENING so the AI doesn't stay 'frozen' in INTERRUPTED state.
-                                # Safety: Only log/track if we are actually speaking
-                                if self.synthesizer.is_speaking():
-                                    if self._vad_safety_task: self._vad_safety_task.cancel()
+                                # [TWILIO-HARDENING]: Always start a safety timer after VAD-triggered halt.
+                                # If no qualifying transcript arrives within 4s, revert INTERRUPTED -> LISTENING.
+                                # [FIX-2] Removed is_speaking() guard: method does not exist on any TTS class
+                                # and caused AttributeError → orchestrator crash whenever a speech event fired
+                                # while the agent was speaking. The state check inside the timeout is sufficient.
+                                if self._vad_safety_task:
+                                    self._vad_safety_task.cancel()
 
-                                    async def _vad_safety_timeout(trace_id):
-                                        await asyncio.sleep(4.0)
-                                        if self.state.get_state() == CallState.INTERRUPTED:
-                                            logger.info("[TELEPHONY VAD] No transcript followed interruption. Reverting to LISTENING.")
-                                            self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
-                                    
-                                    self._vad_safety_task = self._create_task_with_log(_vad_safety_timeout(None))
+                                async def _vad_safety_timeout(trace_id):
+                                    await asyncio.sleep(4.0)
+                                    if self.state.get_state() == CallState.INTERRUPTED:
+                                        logger.info("[TELEPHONY VAD] No transcript followed interruption. Reverting to LISTENING.")
+                                        self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+
+                                self._vad_safety_task = self._create_task_with_log(_vad_safety_timeout(None))
 
                     # [CALL-CPR] Watchdog Check: 7s of absolute silence (no DG heartbeats) = Dead Connection
                     # We throttle this check to once per second to avoid CPU lag
@@ -1723,6 +1742,10 @@ class VoiceOrchestrator:
             self.state.transition_to(CallState.CALL_END)
         except:
             pass # Swallow errors during cleanup
+
+        # [FIX-5] Signal silence monitor to exit its loop cleanly on call end
+        if hasattr(self, 'stop_event'):
+            self.stop_event.set()
         
         # 🟢 CRITICAL: Wrap in try/except (Pillar 3)
         try:
@@ -2051,7 +2074,7 @@ class VoiceOrchestrator:
             ))
 
             # 2. Speak Final Goodbye (Awaited to ensure audio transmits fully before closure)
-            await self.speak_refusal(refusal_text, trace_id=trace_id)
+            await self.speak_immediate_response(refusal_text, trace_id=trace_id)  # [FIX-3] speak_refusal() was renamed; was NameError on Strike 3
             
             # 3. Transition State & Cleanup AFTER audio is sent
             self.state.transition_to(CallState.CALL_END, trace_id=trace_id)
