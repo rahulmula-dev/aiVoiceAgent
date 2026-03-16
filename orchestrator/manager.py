@@ -91,6 +91,7 @@ class VoiceOrchestrator:
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
         self._watchdog_check_time = time.time()  # Throttler for watchdog
         self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
+        self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
 
 
     def _create_task_with_log(self, coro):
@@ -615,7 +616,14 @@ class VoiceOrchestrator:
             current_state = self.state.get_state()
             # [STATE FIX]: TRANSCRIBING is USER speaking. SPEAKING/INTERRUPTED is AI.
             is_speaking = current_state in [CallState.SPEAKING, CallState.INTERRUPTED]
-            
+
+            # [ECHO-SUPPRESSION] Discard transcript if it matches the agent's own voice echoed
+            # back by Twilio. Must be checked before response_task.cancel() so the agent
+            # continues speaking uninterrupted when echo is detected.
+            if is_speaking and self._is_echo_transcript(raw_text):
+                logger.debug(f"[ECHO-SUPPRESSION] Discarding echo transcript during SPEAKING: '{raw_text}'")
+                return
+
             logger.debug(f">>> BARGE-IN DETECTED: state={current_state}, speaking={is_speaking}")
             
             if self.call_logger:
@@ -826,6 +834,7 @@ class VoiceOrchestrator:
 
             # Speak it with a safety timeout to prevent "dead silence"
             chunks_sent = 0
+            self._current_speaking_text = text  # [ECHO-SUPPRESSION] track for echo detection
             async with asyncio.timeout(10.0): # 10s max for immediate response tts
                 async for chunk in self.synthesizer.speak(text, call_id=self.sid):
                     await self._send_response_chunk(chunk)
@@ -852,6 +861,7 @@ class VoiceOrchestrator:
         except Exception as e:
             logger.error(f"Error in speak_immediate_response: {e}")
         finally:
+            self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
             # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
             if not is_cancelled and self.state.get_state() != CallState.CALL_END:
                 self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
@@ -1103,12 +1113,6 @@ class VoiceOrchestrator:
                         payload = base64.b64decode(data['media']['payload'])
                         if self.recorder:
                             self.recorder.write_chunk(payload)
-                        # [FIX-7] Gate STT while agent is SPEAKING to prevent Twilio echo/sidetone
-                        # from reaching Deepgram and producing false barge-in transcripts.
-                        # Audio is still recorded (above) but not forwarded to the STT pipeline.
-                        if self.state.get_state() == CallState.SPEAKING:
-                            self.session.touch()  # Life signal still needs to fire
-                            continue
                         try:
                             await self.transcriber.send_audio(payload)
                         except Exception as stt_err:
@@ -1333,7 +1337,8 @@ class VoiceOrchestrator:
                         
                         tts_start_time = time.time()
                         first_chunk_received = False
-                        
+                        self._current_speaking_text = sentence  # [ECHO-SUPPRESSION] track for echo detection
+
                         try:
                             async for chunk in self.synthesizer.speak(sentence, call_id=self.sid):
                                 # DEFENSIVE: If task was cancelled during synthesis, stop immediately
@@ -1372,6 +1377,7 @@ class VoiceOrchestrator:
                     logger.debug("TTS Worker Cancelled.")
                     
                 finally:
+                    self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
                     # Back to Listening when done speaking (if not escalated)
                     # [FIX]: Don't overwrite state if user already started INTERRUPTED, TRANSCRIBING, or if AI is generating
                     if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED, CallState.TRANSCRIBING, CallState.INTENT_EVAL, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
@@ -1719,8 +1725,31 @@ class VoiceOrchestrator:
         sentences = re.split(r'[\.\?\!]\s+', text)
         if len(sentences) >= 4:
             return True
-            
+
         return False
+
+    def _is_echo_transcript(self, transcript: str) -> bool:
+        """
+        [ECHO-SUPPRESSION] Returns True if the incoming transcript is likely Twilio
+        echo of the agent's own voice rather than genuine caller speech.
+        Uses word-overlap between the transcript and the agent's active TTS sentence.
+        Threshold is config-driven via ECHO_OVERLAP_THRESHOLD (default 0.6).
+        Transcripts shorter than 3 words are never suppressed so short genuine
+        commands like "stop", "wait", "yes" always get through.
+        """
+        speaking = self._current_speaking_text
+        if not speaking or not transcript:
+            return False
+        speaking_words = set(speaking.lower().split())
+        transcript_words = transcript.lower().split()
+        if len(transcript_words) < 3:
+            return False
+        overlap = sum(1 for w in transcript_words if w in speaking_words) / len(transcript_words)
+        threshold = float(os.getenv("ECHO_OVERLAP_THRESHOLD", "0.6"))
+        is_echo = overlap >= threshold
+        if is_echo:
+            logger.debug(f"[ECHO-SUPPRESSION] overlap={overlap:.2f} >= threshold={threshold} — transcript classified as echo")
+        return is_echo
 
     async def cleanup(self):
         """Final session archival and resource release (Pillar 3)."""
