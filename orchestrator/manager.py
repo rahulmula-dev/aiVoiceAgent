@@ -182,8 +182,11 @@ class VoiceOrchestrator:
             # [REMOVED for Telephony-Layer VAD Hardening - Task 2]
             # Interruption logic moved to handle_audio_stream (Telephony 'speech' event)
             
-            # Reset silence timer on partials so the monitor doesn't trigger while user is talking
-            self.last_interaction_time = time.time()
+            # Reset silence timer on partials — but ONLY when the agent is not speaking.
+            # During SPEAKING, Twilio echoes TTS audio back as partial transcripts (non-final),
+            # which would keep resetting the timer and prevent silence termination from firing.
+            if raw_text and self.state.get_state() != CallState.SPEAKING:
+                self.last_interaction_time = time.time()
 
             # STREAM BUFFERING: Pre-fetch RAG context for partial transcripts
             if len(raw_text) > 15 and self.session:
@@ -282,7 +285,7 @@ class VoiceOrchestrator:
                 # [GOVERNANCE FIX]: ONLY allow empty frame detection during LISTENING.
                 # If we allow it during SPEAKING, the AI's own voice being sent back as empty
                 # frames to Deepgram over a 12-second long sentence triggers a false strike!
-                if current_call_state != CallState.LISTENING:
+                if current_call_state not in [CallState.LISTENING, CallState.TRANSCRIBING]:
                     logger.debug(f"[DEBOUNCE] Ignoring empty frame in state {current_call_state}")
                     return
 
@@ -464,6 +467,9 @@ class VoiceOrchestrator:
             return
         
         # STATE: Transcribing / Input Received
+        # [BARGE-IN FIX] Capture state BEFORE transitioning so the barge-in check below
+        # can detect if the AI was SPEAKING when this transcript arrived.
+        pre_transition_state = self.state.get_state()
         if self.mode == "audio":
             self.state.transition_to(CallState.TRANSCRIBING, trace_id=trace_id)
         else:
@@ -615,8 +621,10 @@ class VoiceOrchestrator:
             # [S4-11 FIX]: Check both SPEAKING and INTERRUPTED states
             # Because a partial transcript might have already flipped the state to INTERRUPTED
             current_state = self.state.get_state()
-            # [STATE FIX]: TRANSCRIBING is USER speaking. SPEAKING/INTERRUPTED is AI.
-            is_speaking = current_state in [CallState.SPEAKING, CallState.INTERRUPTED]
+            # [BARGE-IN FIX]: Use pre_transition_state because state is already TRANSCRIBING
+            # by the time we reach here (transition fired earlier in this method).
+            # pre_transition_state reflects what the AI was doing when the user spoke.
+            is_speaking = pre_transition_state in [CallState.SPEAKING, CallState.INTERRUPTED]
 
             # [ECHO-SUPPRESSION] Discard transcript if it matches the agent's own voice echoed
             # back by Twilio. Must be checked before response_task.cancel() so the agent
