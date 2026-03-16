@@ -1115,6 +1115,7 @@ class VoiceOrchestrator:
                             self.recorder.write_chunk(payload)
                         try:
                             await self.transcriber.send_audio(payload)
+                            self._last_stt_packet_time = time.time()  # [WATCHDOG] Audio delivered → connection is live
                         except Exception as stt_err:
                             logger.error(f"[FAILOVER] STT send failed: {stt_err}. Attempting recovery...")
                             # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
@@ -1189,8 +1190,9 @@ class VoiceOrchestrator:
                     if now - self._watchdog_check_time > 1.0:
                         self._watchdog_check_time = now
                         if self.state.get_state() == CallState.LISTENING:
-                            if now - self._last_stt_packet_time > 8.0:
-                                logger.warning(f"[CALL-CPR] STT silence watchdog triggered (8s). Forcing Hot-Swap.")
+                            _watchdog_timeout = float(os.getenv("STT_WATCHDOG_TIMEOUT_S", "30.0"))
+                            if now - self._last_stt_packet_time > _watchdog_timeout:
+                                logger.warning(f"[CALL-CPR] STT silence watchdog triggered ({_watchdog_timeout}s). Forcing Hot-Swap.")
                                 self._last_stt_packet_time = now # Reset to avoid loop
                                 self._create_task_with_log(self._on_stt_listener_error(RuntimeError("Watchdog timeout")))
                     
