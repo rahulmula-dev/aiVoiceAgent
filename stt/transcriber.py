@@ -111,6 +111,9 @@ class Transcriber(STTProvider):
         try:
             async for message in self.ws:
                 data = json.loads(message)
+                if not isinstance(data, dict):
+                    logger.debug(f"[STT] Received non-dict message: {data}")
+                    continue
                 msg_type = data.get("type")
                 
                 if msg_type == "Metadata":
@@ -133,7 +136,7 @@ class Transcriber(STTProvider):
                         if not channel_data: continue
                         channel_data = channel_data[0]
                     
-                    if not channel_data.get("alternatives"):
+                    if not isinstance(channel_data, dict) or not channel_data.get("alternatives"):
                         continue
                         
                     alt = channel_data["alternatives"][0]

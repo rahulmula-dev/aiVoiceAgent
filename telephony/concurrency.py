@@ -7,9 +7,8 @@ logger = logging.getLogger("concurrency")
 # Connect to Redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 try:
-    # Use extremely low timeouts (100ms) so if Redis is offline locally, 
-    # it instantly fails over to the local RAM counter without freezing the Uvicorn event loop.
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=0.1, socket_connect_timeout=0.1)
+    # Increase timeouts for local dev stability (Windows context)
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1.0, socket_connect_timeout=1.0)
 except Exception as e:
     logger.error(f"Failed to connect to Redis: {e}")
     redis_client = None

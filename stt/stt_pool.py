@@ -47,7 +47,7 @@ stt_pool = WebSocketPool(
     reset_connection_func=reset_transcriber,
     pool_size=int(os.getenv("DEEPGRAM_POOL_SIZE", "30")),
     min_connections=int(os.getenv("DEEPGRAM_MIN_CONNECTIONS", "10")),
-    health_check_interval_s=12  # Reduced to 12s to stay well within Deepgram's silence window (net0001)
+    health_check_interval_s=5  # Reduced to 5s to stay well within Deepgram's silence window (net0001)
 )
 
 class PooledTranscriber:

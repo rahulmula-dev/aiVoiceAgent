@@ -76,7 +76,8 @@ async def create_default_orchestrator(
         except Exception as e:
             # WS-02: CRM Fallback & Soft Landing (CRITICAL Audit Point)
             logger.error(f"TTS Pool Exhausted: {e}. Triggering CRM Ticket & Fallback Audio.")
-            from crm.client import crm_client
+            from crm.client import CRMClient
+            crm_client = CRMClient()
             asyncio.create_task(crm_client.create_ticket(
                 title="Dropped Call - Resource Exhaustion",
                 description=f"TTS Pool Exhaustion for session {session_id}. Error: {e}",
