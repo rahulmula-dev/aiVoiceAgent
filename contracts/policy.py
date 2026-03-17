@@ -155,7 +155,8 @@ class ResponsePolicyEngine:
         "career", "vocational", "technical", "gd college", "cila agent", "issue", "question",
         "uh", "um", "hmm", "ah", "mhm",
         "continue", "restart", "give", "list", "kill", "people", "common", "india", 
-        "us", "africa", "america", "visa", "status", "so", "yeah", "thank", "thanks", "wait", "welcome"
+        "us", "africa", "america", "visa", "status", "so", "yeah", "thank", "thanks", "wait", "welcome",
+        "ged", "approvals", "measured", "registration", "joining", "join", "enroll", "enrolled", "admissions", "admission"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -219,8 +220,10 @@ class ResponsePolicyEngine:
         is_very_short = len(words) <= 3
         
         # Reduced threshold even further to allow for local audio clipping/noise
-        threshold = 0.20 
-        is_mixed_danger = not is_very_short and density < threshold
+        # [REFINEMENT] Density check is only aggressive for sentences >= 3 words.
+        # Short phrases (1-2 words) are extremely hard to detect via density.
+        threshold = 0.50 if len(words) == 3 else 0.20
+        is_mixed_danger = len(words) >= 3 and density < threshold
         
         if is_mixed_danger:
             policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
