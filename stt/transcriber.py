@@ -60,8 +60,7 @@ class Transcriber(STTProvider):
             f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
-            "endpointing=1500",
-            "utterance_end_ms=1500",
+            "endpointing=500",
             "language=en"
         ]
 

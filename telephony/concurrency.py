@@ -9,6 +9,15 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 try:
     # Increase timeouts for local dev stability (Windows context)
     redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1.0, socket_connect_timeout=1.0)
+    # [FIX] Perform a lightweight ping at startup to avoid 1s hangs during call induction
+    if os.getenv("LOCAL_TEST", "false").lower() == "true":
+        logger.info(f"Local test mode detected. Verifying Redis at {REDIS_URL}...")
+        try:
+            redis_client.ping()
+            logger.info("Redis is available.")
+        except Exception:
+            logger.warning("Redis not found. Falling back to local RAM counters for development.")
+            redis_client = None
 except Exception as e:
     logger.error(f"Failed to connect to Redis: {e}")
     redis_client = None

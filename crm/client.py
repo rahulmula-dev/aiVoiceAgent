@@ -70,6 +70,29 @@ class CRMClient(CRMEngine):
         # CONFIG: S3 DLQ Path (ca-central-1 - PRD Section 5)
         from utils.s3_storage import S3Storage
         self.s3_queue = S3Storage(bucket_name="crm-failover-queue")
+        
+        # [FIX] Reactive bypass for local dev
+        self._is_unreachable = False
+        if self.app_env in ["dev", "development", "test"]:
+            logger.info("Dev environment detected. Testing CRM connectivity...")
+            # We'll set a flag if health check fails immediately
+            import asyncio
+            try:
+                # Use a very short timeout for the initial probe
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If called from an async context, we can't easily wait here without blocking
+                    # but CRMClient is usually initialized at module level or in a sync way.
+                    # For now, we'll let the first call set the flag.
+                    pass
+                else:
+                    # Sync health check during startup
+                    with httpx.Client() as client:
+                        resp = client.get(f"{self.base_url}/health", timeout=1.0)
+                        if resp.status_code >= 500: self._is_unreachable = True
+            except Exception:
+                logger.warning(f"CRM at {self.base_url} is unreachable. Enabling local bypass.")
+                self._is_unreachable = True
 
     @property
     def is_configured(self) -> bool:
@@ -277,6 +300,10 @@ class CRMClient(CRMEngine):
         Internal method that performs the actual API call.
         PRD: Requires X-Idempotency-Key support to prevent duplicate tickets.
         """
+        if self._is_unreachable and self.app_env in ["dev", "development", "test"]:
+            logger.debug("[CRM] Bypassing request (CRM known unreachable in dev)")
+            raise CRMConnectionError("CRM Unreachable (Bypassed)")
+
         url = f"{self.base_url}/{endpoint}"
         
         headers = dict(self.headers)

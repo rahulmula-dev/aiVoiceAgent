@@ -25,7 +25,7 @@ from contracts.policy import PRDScripts
 
 # [LOCAL TESTING TIMERS]
 # Relaxed to account for long physical distances, Ngrok routing, and local network latency:
-LLM_TIMEOUT = 1.0  # Reduced to keep closer to 0.5s PRD
+LLM_TIMEOUT = 1.5  # Increased for local testing to avoid premature "busy" responses
 RAG_TIMEOUT = 5.0   # Reverted from 10.0 (H4 fix: match Sprint 4 ceiling)
 # ----------------------------------------
 

@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 import time
@@ -68,7 +69,10 @@ class WebSocketPool:
                     success_count += 1
                 
         if success_count == 0:
-            raise Exception(f"[{self.name}] CRITICAL: Failed to initialize any connections")
+            if os.getenv("LOCAL_TEST", "false").lower() == "true":
+                logger.error(f"[{self.name}] FAILED to initialize any connections. (Continuing anyway due to LOCAL_TEST=true)")
+            else:
+                raise Exception(f"[{self.name}] CRITICAL: Failed to initialize any connections")
             
         self._health_task = asyncio.create_task(self._health_monitor())
         self._lease_task = asyncio.create_task(self._lease_monitor())
