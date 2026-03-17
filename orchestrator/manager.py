@@ -93,7 +93,6 @@ class VoiceOrchestrator:
         self._watchdog_check_time = time.time()  # Throttler for watchdog
         self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
         self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
-        self._strike_this_turn = False    # [GOVERNANCE] Prevent double-striking the same user turn
 
 
     def _create_task_with_log(self, coro):
@@ -345,12 +344,6 @@ class VoiceOrchestrator:
                                 self.state.transition_to(CallState.LISTENING)
                             return
 
-                        # [GOVERNANCE] Strike check with double-strike protection
-                        if self._strike_this_turn:
-                            logger.debug(f"[GOVERNANCE] Skipping partial strike increment — already struck this turn: '{raw_text}'")
-                            return
-                        
-                        self._strike_this_turn = True
                         self.language_strike_count += 1
                         logger.warning(f"[GOVERNANCE] Unrecognized-language speech detected (empty+0.0 frames). Strike: {self.language_strike_count}/3")
 
@@ -531,13 +524,8 @@ class VoiceOrchestrator:
             
             # --- TASK 3.4: STRIKE TRACKING ---
             if intent == "HARD_REFUSAL_LANGUAGE":
-                # [GOVERNANCE] Strike check with double-strike protection
-                if self._strike_this_turn:
-                    logger.debug(f"[GOVERNANCE] Final strike evaluation: Strike already registered via partial transcript.")
-                else:
-                    self._strike_this_turn = True
-                    self.language_strike_count += 1
-                    logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
+                self.language_strike_count += 1
+                logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
 
                 # Persist warning_count on the session for this caller
                 if self.session:
@@ -847,9 +835,6 @@ class VoiceOrchestrator:
             logger.debug(f"[RESET] Counter {self.consecutive_empty_frames}→0 (agent speaking)")
             self.consecutive_empty_frames = 0
             self.non_english_run_start = time.time()
-        
-        # [GOVERNANCE] Reset turn-level strike status when AI starts speaking
-        self._strike_this_turn = False
         
         # Only transition to SPEAKING if we are NOT already terminating.
         if self.state.get_state() == CallState.SPEAKING:
@@ -1543,9 +1528,6 @@ class VoiceOrchestrator:
                         self.session.touch()
                         self.session_manager.save_session(self.session)
                         self.session_manager.update_state(self.session.session_id, SessionState.SPEAKING)
-                        
-                        # [GOVERNANCE] Reset turn-level strike status when AI starts speaking
-                        self._strike_this_turn = False
                         
                         # Perform safety check (Response Policy) before streaming
                         context = self.session.call_context

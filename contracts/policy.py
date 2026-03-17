@@ -156,7 +156,18 @@ class ResponsePolicyEngine:
         "uh", "um", "hmm", "ah", "mhm",
         "continue", "restart", "give", "list", "kill", "people", "common", "india", 
         "us", "africa", "america", "visa", "status", "so", "yeah", "thank", "thanks", "wait", "welcome",
-        "ged", "approvals", "measured", "registration", "joining", "join", "enroll", "enrolled", "admissions", "admission"
+        "ged", "approvals", "measured", "registration", "joining", "join", "enroll", "enrolled", "admissions", "admission",
+        "quite", "high", "actually", "very", "much", "many", "little", "few", "most", "none", "only", "just", "really",
+        "almost", "already", "soon", "late", "often", "sometimes", "always", "never", "again", "together", "probably",
+        "certaincertainly", "definitely", "basically", "literally", "honestly", "personally", "totally", "absolutely", "entirely",
+        "completely", "mostly", "partially", "slightly", "fairly", "pretty", "rather", "somewhat", "instead", "otherwise",
+        "meanwhile", "anyway", "besides", "moreover", "furthermore", "however", "nevertheless", "nonetheless", "therefore",
+        "consequently", "accordingly", "thus", "hence", "namely", "specifically", "especially", "particularly", "notably", "primarily", "mainly", "largely",
+        "requirement", "requirements", "specific", "international", "student", "students", "financial", "aid", "available", "scholarship", "scholarships",
+        "tuition", "payment", "payments", "installment", "deadline", "deadlines", "date", "dates", "schedule", "timetable", "orientation",
+        "faculty", "staff", "instructor", "instructors", "professor", "professors", "department", "school", "university", "campus", "facility",
+        "library", "lab", "laboratory", "workshop", "placement", "internship", "graduation", "alumni", "certificate", "degree", "diploma",
+        "qualification", "exam", "examination", "test", "assessment", "grade", "results", "transcript", "transcripts", "enrollment"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -215,36 +226,27 @@ class ResponsePolicyEngine:
         density = num_common / len(words)
         
         # 1. Density Check: Strict thresholds for English-only enforcement.
-        # [REFINEMENT]: Even if keywords are present, we must calculate density.
-        # Example: "Mujhe Cosmetology join karna hai" = low density = FAIL.
-        is_very_short = len(words) <= 3
-        
-        # [REFINEMENT] Tighter thresholds for multi-word Hinglish strings.
-        # 3 words: Extremely high density required (0.65)
-        # 4-5 words: High density required (0.50)
-        # > 5 words: Moderate density required (0.35)
-        word_count = len(words)
-        if word_count == 3:
-            threshold = 0.65
-        elif word_count <= 5:
-            threshold = 0.50
-        else:
-            threshold = 0.35
-            
+        # [HARDENING] Mixed languages (Hinglish/Spanglish) are now strictly blocked.
+        # If density is less than 85%, we assume it's mixed and block it immediately.
+        # Short phrases (1-2 words) are exempted from high-density check to prevent
+        # blocking names or affirmations, but are still checked by STT Metadata and LangDetect.
+        threshold = 0.85 if len(words) >= 3 else 0.50
         is_mixed_danger = density < threshold
         
         if is_mixed_danger:
-            policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
-            return False
+            # Special bypass for introductions which have specific regex coverage
+            if not re.search(intro_regex, lower_text):
+                policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
+                return False
 
         if detected_lang and detected_lang != 'en':
             # EXPERT OVERRIDE: langdetect is notoriously bad at short strings.
             # If it's a very short sentence (1-2 words), we only block if it's 
             # definitely NOT a common word and NOT purely alphabetical (names).
             
-            # Trust density more for short samples.
-            if density >= 0.85:
-                policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to High Density ({density:.2f}): '{text}'")
+            # TRUST STT metadata aggressively if density isn't near perfect.
+            if density >= 0.95:
+                policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to Near-Perfect Density ({density:.2f}): '{text}'")
                 return True
                 
             if is_very_short:
@@ -286,21 +288,17 @@ class ResponsePolicyEngine:
                 top = detected_langs[0]
                 
                 # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
-                # [SKEPTIC] If density is low (< 0.60), we require extreme confidence in 'en'
-                is_skeptical_eng = top.lang == 'en' and density < 0.60 and top.prob < 0.90
-                
-                if (top.lang != 'en' and top.prob >= 0.40) or is_skeptical_eng:
-                    # langdetect is extremely unreliable on short, high-density English sentences
-                    # (especially introductions containing proper names). If density is high, treat as English.
-                    if density >= 0.45:
+                if top.lang != 'en' and top.prob >= 0.35:
+                    # Only override if density is nearly perfect.
+                    if density >= 0.90:
                         policy_logger.info(
                             f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) due to English Density "
-                            f"({density:.2f} >= 0.45). Text='{text}'"
+                            f"({density:.2f} >= 0.90). Text='{text}'"
                         )
                         return True
                     policy_logger.warning(
-                        f"[GOVERNANCE] Blocked via Skeptic/Probability: {top.lang} ({top.prob:.2f}), "
-                        f"density={density:.2f}. Text='{text}'"
+                        f"[GOVERNANCE] Non-English detected by langdetect: {top.lang} ({top.prob:.2f}), "
+                        f"density={density:.2f}. Blocking by design (Phase 1 English-only). Text='{text}'"
                     )
                     return False
                 
@@ -369,8 +367,7 @@ class ResponsePolicyEngine:
                     detected = detect_langs(response_text)
                     if detected:
                         top = detected[0]
-                        is_skeptical_eng = top.lang == 'en' and density < 0.60 and top.prob < 0.90
-                        if (top.lang != 'en' and top.prob >= 0.40) or is_skeptical_eng:
+                        if top.lang != 'en' and top.prob >= 0.40:
                             # If density is high, it's likely just a list of nouns that 
                             # statistical models struggle with. Trust density more.
                             if density >= 0.45:
