@@ -56,6 +56,10 @@ class PooledTTSEngine:
     def stop_current_speech(self, call_id: str) -> str:
         return self._delegate.stop_current_speech(call_id)
 
+    async def play_fallback_audio(self, websocket, streamSid: str = None):
+        if self._delegate:
+            await self._delegate.play_fallback_audio(websocket, streamSid)
+
     async def close(self):
         """Intercepts the orchestration tier's close() command and instead releases it back to the pool."""
         if self._delegate:

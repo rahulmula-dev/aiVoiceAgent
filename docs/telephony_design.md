@@ -38,5 +38,28 @@ The system maintains a pool of warm WebSocket connections to eliminate the hands
 ---
 
 ## 4. Concurrency & Failure Modes
-- **Hard Cap Enforcement:** The pool size (e.g., 30) acts as a physical ceiling. If the pool is exhausted and the "lifeboat" fresh connection also fails, the call is rejected.
-- **Graceful Rejection:** Rejected calls trigger the `CRM_FAILOVER` logic, playing a "Lines busy" message and creating a callback ticket.
+The system implements a strict **30-call hard cap** to ensure predictable performance and resource availability. This is enforced through a two-layer atomic safety gate system.
+
+### 4.1. Layered Concurrency Enforcement
+The architecture uses two independent but consistent admission gates to prevent "zombie" sessions and slot leakage during high-concurrency bursts.
+
+1.  **Primary Admission Gate (`telephony/server.py`):**
+    - Executes immediately upon the Twilio HTTPS `/voice` webhook.
+    - Uses `increment_if_under_cap()` (Redis Lua) to atomically check the limit and claim a slot.
+    - If rejected here, the caller hears a "Lines busy" TwiML message and the call never reaches the WebSocket stage.
+
+2.  **Secondary Authoritative Backstop (`orchestrator/manager.py`):**
+    - Executes during the WebSocket `media-stream` handshake.
+    - Uses `is_over_capacity_atomic()` (Redis Lua) to verify the call is still within the valid set of active SIDs.
+    - This layer handles the TOCTOU (Time-Of-Check to Time-Of-Use) race window between the TwiML response and the persistent connection upgrade, ensuring that if multiple calls bypass the primary gate due to a network glitch or Redis restart, the orchestrator acts as a final authoritative barrier.
+
+### 4.2. Atomic Logic (Redis Lua)
+Both gates rely on shared Lua scripts in `telephony/concurrency.py` to guarantee atomicity:
+- **`LUA_INCREMENT_IF_UNDER_CAP`**: Atomic compare-and-increment.
+- **`LUA_CHECK_CAPACITY_ATOMIC`**: Atomic membership check + capacity verification.
+- **`LUA_DECREMENT_ONLY_IF_TRACKED`**: Atomic decrement that prevents "counter-leakage" if a non-tracked call ends.
+
+### 4.3. Failure Modes
+- **Hard Cap Rejection:** If the pool is exhausted or the capacity check fails at either gate, the call is rejected.
+- **Graceful Rejection:** Rejected calls trigger the `CRM_FAILOVER` logic, playing a "Lines busy" message and creating a high-priority callback ticket in the CRM.
+- **Redis Offline:** In local development or during Redis outages, the system fails over to shared `asyncio.Lock` protected RAM counters, maintaining consistency within a single instance.

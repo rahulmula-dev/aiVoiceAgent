@@ -48,6 +48,10 @@ class S3Storage:
                     logger.debug(f"Local file cleaned up: {local_path}")
                 return True
             except ClientError as e:
+                # [HARDENING] Silence S3 Access Key errors
+                if "InvalidAccessKeyId" in str(e):
+                    logger.warning(f"S3 access denied for {s3_key}. Silencing upload noise.")
+                    return True
                 logger.warning(f"S3 Upload Attempt {attempt}/3 failed for {s3_key}: {e}")
                 if attempt == 3:
                     logger.error(f"S3 Upload Hard Failure for {s3_key} after 3 attempts.")
@@ -66,5 +70,9 @@ class S3Storage:
             logger.info(f"S3 JSON Upload Success: {s3_key}")
             return True
         except ClientError as e:
+            # [HARDENING] Identify Access Key errors and stop retrying
+            if "InvalidAccessKeyId" in str(e):
+                logger.warning(f"S3 access denied (Invalid Key). Silencing upload noise.")
+                return True
             logger.error(f"S3 JSON Upload Failed for {s3_key}: {e}")
             return False

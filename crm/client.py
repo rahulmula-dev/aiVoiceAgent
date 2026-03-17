@@ -70,12 +70,48 @@ class CRMClient(CRMEngine):
         # CONFIG: S3 DLQ Path (ca-central-1 - PRD Section 5)
         from utils.s3_storage import S3Storage
         self.s3_queue = S3Storage(bucket_name="crm-failover-queue")
+        
+        # [FIX] Reactive bypass for local dev
+        self._is_unreachable = False
+        if self.app_env in ["dev", "development", "test"]:
+            logger.info("Dev environment detected. Testing CRM connectivity...")
+            # We'll set a flag if health check fails immediately
+            import asyncio
+            try:
+                # Use a very short timeout for the initial probe
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If called from an async context, we can't easily wait here without blocking
+                    # but CRMClient is usually initialized at module level or in a sync way.
+                    # For now, we'll let the first call set the flag.
+                    pass
+                else:
+                    # Sync health check during startup
+                    with httpx.Client() as client:
+                        resp = client.get(f"{self.base_url}/health", timeout=1.0)
+                        if resp.status_code >= 500: self._is_unreachable = True
+            except Exception:
+                logger.warning(f"CRM at {self.base_url} is unreachable. Enabling local bypass.")
+                self._is_unreachable = True
 
     @property
     def is_configured(self) -> bool:
-        """Checks if the CRM API key is set to a non-default value."""
+        """
+        Checks if the CRM client has been configured with valid external targets.
+        Used to prevent log spam and sync loops in local production defaults.
+        """
         default_key = "crm_test_key_123"
-        return self.api_key and self.api_key != default_key
+        default_url = "https://api.leadsquared.com"
+        
+        # We are 'configured' if:
+        # 1. The key is not the default
+        # 2. OR the URL is not the default (user is pointing to a specific test endpoint)
+        # 3. OR the environment is explicitly set to dev/test (user intent to test)
+        is_custom_key = self.api_key and self.api_key != default_key
+        is_custom_url = self.base_url and self.base_url != default_url
+        is_explicit_dev = self.app_env in ["dev", "development", "test"]
+        
+        return is_custom_key or is_custom_url or is_explicit_dev
 
     async def check_health(self) -> bool:
         """Verifies CRM API reachability for readiness probe."""
@@ -189,9 +225,14 @@ class CRMClient(CRMEngine):
              final_title = f"{final_title} | Call-{short_id}"
 
         # Forensic Metadata Enrichment (Task 6)
-        enhanced_metadata = {
-            "structured_turns": structured_turns
-        } if structured_turns else {}
+        enhanced_metadata = {}
+        if structured_turns:
+            # [FIX] Pydantic models are not JSON serializable by default. 
+            # Convert the list of models to a list of dicts.
+            enhanced_metadata["structured_turns"] = [
+                turn.model_dump() if hasattr(turn, 'model_dump') else turn.dict() if hasattr(turn, 'dict') else turn 
+                for turn in structured_turns
+            ]
         
         if session_obj:
             if session_obj.interruption_snapshot:
@@ -259,6 +300,10 @@ class CRMClient(CRMEngine):
         Internal method that performs the actual API call.
         PRD: Requires X-Idempotency-Key support to prevent duplicate tickets.
         """
+        if self._is_unreachable and self.app_env in ["dev", "development", "test"]:
+            logger.debug("[CRM] Bypassing request (CRM known unreachable in dev)")
+            raise CRMConnectionError("CRM Unreachable (Bypassed)")
+
         url = f"{self.base_url}/{endpoint}"
         
         headers = dict(self.headers)
@@ -324,8 +369,16 @@ class CRMClient(CRMEngine):
         # 1. ATTEMPT S3 UPLOAD FIRST (ca-central-1)
         # CRITICAL-P3-04: Local disk is only for buffer/dead-end
         s3_key = f"dlq_tickets/{entry_id}.json"
-        s3_success = self.s3_queue.upload_json(entry, s3_key)
         
+        # [FIX] Only attempt S3 if credentials are likely to exist to avoid log noise
+        aws_id = os.getenv("AWS_ACCESS_KEY_ID")
+        s3_success = False
+        if aws_id:
+            s3_success = self.s3_queue.upload_json(entry, s3_key)
+        else:
+            logger.debug("[CRM] AWS credentials missing; skipping S3 DLQ upload.")
+            s3_success = False
+            
         if s3_success:
             logger.info(f"[CRM] Payload synced directly to S3 DLQ: {entry_id}")
             return

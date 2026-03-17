@@ -1,6 +1,8 @@
+import os
 import asyncio
 import logging
 import time
+import random
 from typing import Optional, Callable, Any
 
 logger = logging.getLogger("WebSocketPool")
@@ -40,26 +42,40 @@ class WebSocketPool:
         
         # Metrics
         self.replacement_count = 0
+        self._checkout_times = {} # conn -> checkout_time
 
     async def initialize(self):
         logger.info(f"[{self.name}] Initializing pool of size {self.pool_size}")
         
-        # Run creations concurrently to speed up startup
-        tasks = [self.create_connection_func() for _ in range(self.pool_size)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+        # MEDIUM-WS-03: Batched initialization with jitter to prevent burst rate limiting
+        batch_size = 10
         success_count = 0
-        for res in results:
-            if isinstance(res, Exception) or res is None:
-                logger.error(f"[{self.name}] Failed to create connection during initialization: {res}")
-            else:
-                self._pool.put_nowait(res)
-                success_count += 1
+        
+        for i in range(0, self.pool_size, batch_size):
+            if i > 0:
+                jitter = random.uniform(0.1, 0.5)
+                logger.info(f"[{self.name}] Initialization batch jitter: sleeping for {jitter:.2f}s")
+                await asyncio.sleep(jitter)
+                
+            current_batch_size = min(batch_size, self.pool_size - i)
+            tasks = [self.create_connection_func() for _ in range(current_batch_size)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for res in results:
+                if isinstance(res, Exception) or res is None:
+                    logger.error(f"[{self.name}] Failed to create connection during initialization: {res}")
+                else:
+                    self._pool.put_nowait(res)
+                    success_count += 1
                 
         if success_count == 0:
-            raise Exception(f"[{self.name}] CRITICAL: Failed to initialize any connections")
+            if os.getenv("LOCAL_TEST", "false").lower() == "true":
+                logger.error(f"[{self.name}] FAILED to initialize any connections. (Continuing anyway due to LOCAL_TEST=true)")
+            else:
+                raise Exception(f"[{self.name}] CRITICAL: Failed to initialize any connections")
             
         self._health_task = asyncio.create_task(self._health_monitor())
+        self._lease_task = asyncio.create_task(self._lease_monitor())
         logger.info(f"[{self.name}] Pool initialized successfully with {success_count} connections")
 
     async def acquire(self, timeout: float = 5.0) -> Any:
@@ -71,6 +87,7 @@ class WebSocketPool:
                 # Verify health before handing out
                 if await self.health_check_func(conn):
                     self._active_connections.add(conn)
+                    self._checkout_times[conn] = asyncio.get_event_loop().time()
                     
                     # Emit wait time metric
                     wait_time_ms = (time.time() - start_time) * 1000
@@ -90,6 +107,7 @@ class WebSocketPool:
     async def release(self, conn: Any):
         if conn in self._active_connections:
             self._active_connections.discard(conn)
+            self._checkout_times.pop(conn, None)
             
         # Reset state on return
         self.reset_connection_func(conn)
@@ -153,6 +171,26 @@ class WebSocketPool:
             
             self._emit_metrics()
 
+    async def _lease_monitor(self):
+        """
+        Antigravity Mechanism: Sweeps orphaned connections (WS-03).
+        Runs every 60s to reclaim connections held for > 300s.
+        """
+        while True:
+            await asyncio.sleep(60)
+            now = asyncio.get_event_loop().time()
+            expired = []
+            
+            for conn in list(self._active_connections):
+                checkout_time = self._checkout_times.get(conn)
+                if checkout_time and (now - checkout_time) > 300:
+                    expired.append(conn)
+            
+            for conn in expired:
+                logger.error(f"[{self.name}] LEASE EXPIRED for connection held for >300s. Force-reclaiming.")
+                # Force release
+                await self.release(conn)
+
     def _emit_metrics(self, wait_time_ms: float = 0.0):
         active = len(self._active_connections)
         idle = self._pool.qsize()
@@ -171,6 +209,8 @@ class WebSocketPool:
     async def close_pool(self):
         if self._health_task:
             self._health_task.cancel()
+        if hasattr(self, '_lease_task') and self._lease_task:
+            self._lease_task.cancel()
             
         while not self._pool.empty():
             conn = await self._pool.get()

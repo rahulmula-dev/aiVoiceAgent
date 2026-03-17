@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
     content TEXT NOT NULL,
     checksum TEXT UNIQUE,
+    source_id TEXT, -- M3: Preserves legacy Pinecone IDs for audit mapping
     metadata JSONB
 );
 
@@ -38,12 +39,20 @@ CREATE TABLE IF NOT EXISTS embeddings (
     model_version TEXT DEFAULT 'titan-v2'
 );
 
--- Governance metadata: tracks sensitivity and topic tags per chunk
+-- Governance metadata: tracks sensitivity, verification, and audit trails per chunk (H2 Compliance)
 CREATE TABLE IF NOT EXISTS governance_metadata (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     chunk_id UUID REFERENCES chunks(id) ON DELETE CASCADE,
     sensitivity_level TEXT DEFAULT 'public',
-    topic_tags TEXT[]
+    is_sensitive_topic BOOLEAN DEFAULT FALSE,
+    topic_tags TEXT[],
+    kb_version_id TEXT DEFAULT 'v1.1',
+    hard_refusal_category TEXT,
+    is_dynamic_field BOOLEAN DEFAULT FALSE,
+    is_policy_locked BOOLEAN DEFAULT FALSE,
+    requires_human_verification BOOLEAN DEFAULT FALSE,
+    confidence_score DOUBLE PRECISION DEFAULT 1.0,
+    chunk_confidence_score DOUBLE PRECISION DEFAULT 1.0
 );
 
 -- HNSW Index for fast cosine similarity search

@@ -143,10 +143,32 @@ class ElevenLabsSynthesizer(TTSEngine):
                 break
 
     async def send_keepalive(self):
-        """Health check payload to prevent timeout"""
-        # The websockets library handles Ping/Pong automatically.
-        # Sending empty text frames to ElevenLabs causes billed silence.
-        pass
+        """
+        Active health check (HIGH-WS-01). 
+        Sends a ping frame. If no pong received within 2s, marks WS closed.
+        """
+        if self.ws and not getattr(self.ws, 'closed', True):
+            try:
+                # Use websockets library standard ping
+                # It will automatically await the pong or raise a ConnectionClosed
+                pong_waiter = await self.ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=2.0)
+                logger.debug("[ELEVENLABS TTS] Active Health Check: PONG received.")
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.warning(f"[ELEVENLABS TTS] Active Health Check FAILED: {e}. Marking connection dead.")
+                # Mark as closed so the pool monitor reclaims it
+                if self.ws:
+                    self.ws.closed = True 
+
+    async def play_fallback_audio(self, websocket, streamSid: str = None):
+        """
+        Streams a local pre-recorded audio file to the WebSocket.
+        (WS-02: Compliance Fallback)
+        """
+        # Load logic from common Synthesizer utility to maintain consistency
+        from tts.synthesizer import Synthesizer
+        temp_synth = Synthesizer()
+        await temp_synth.play_fallback_audio(websocket, streamSid)
 
     async def close(self):
         if self._receive_task:

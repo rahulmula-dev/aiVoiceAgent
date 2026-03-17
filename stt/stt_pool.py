@@ -19,14 +19,20 @@ async def close_transcriber(transcriber: Transcriber):
         await transcriber.close()
 
 async def check_health_transcriber(transcriber: Transcriber) -> bool:
-    if not transcriber or not transcriber.ws or getattr(transcriber.ws, 'closed', True):
+    try:
+        if not transcriber or not transcriber.ws or getattr(transcriber.ws, 'closed', True):
+            return False
+        # CRITICAL: Verify the _listen loop hasn't crashed.
+        if not getattr(transcriber, '_is_listening', False):
+            return False
+        # Send a Deepgram KeepAlive metadata event
+        # Safety check: ensure method exists before calling
+        if hasattr(transcriber, 'send_keepalive'):
+            await transcriber.send_keepalive()
+        return True
+    except Exception as e:
+        logger.debug(f"Health check failed for transcriber: {e}")
         return False
-    # CRITICAL: Verify the _listen loop hasn't crashed.
-    if not getattr(transcriber, '_is_listening', False):
-        return False
-    # Send a Deepgram KeepAlive metadata event
-    await transcriber.send_keepalive()
-    return True
 
 def reset_transcriber(transcriber: Transcriber):
     if transcriber:
@@ -41,7 +47,7 @@ stt_pool = WebSocketPool(
     reset_connection_func=reset_transcriber,
     pool_size=int(os.getenv("DEEPGRAM_POOL_SIZE", "30")),
     min_connections=int(os.getenv("DEEPGRAM_MIN_CONNECTIONS", "10")),
-    health_check_interval_s=int(os.getenv("DEEPGRAM_HEALTH_CHECK_INTERVAL_S", "30"))
+    health_check_interval_s=5  # Reduced to 5s to stay well within Deepgram's silence window (net0001)
 )
 
 class PooledTranscriber:

@@ -65,18 +65,52 @@ class KnowledgeBase(KnowledgeBaseEngine):
         
         # Connection Pool (Initialized asynchronously)
         self.pool = None
+        
+        # M2 Fix: Assert Canadian Data Residency at startup
+        self._validate_residency()
+
+        if self.local_test:
+            logger.warning("!!! CRITICAL: KnowledgeBase is running in LOCAL_TEST mode (Bypassing Bedrock) !!!")
+            logger.warning("!!! Metadata thresholds will still be STRICTLY enforced (M1 Fix) !!!")
         logger.info("KnowledgeBase: Initialized (PGVector)")
+
+    def _validate_residency(self):
+        """
+        M2 Fix: Assert that RDS instances are located in ca-central-1.
+        Strict Canadian data residency requirement.
+        """
+        if self.local_test:
+            return # Skip residency check for local development
+            
+        if not self.db_url:
+            return
+
+        # Check for AWS RDS host patterns
+        if "rds.amazonaws.com" in self.db_url:
+            if "ca-central-1" not in self.db_url:
+                error_msg = f"DATA RESIDENCY VIOLATION: RDS host detected outside ca-central-1 region. URL: {self.db_url}"
+                logger.critical(error_msg)
+                raise RuntimeError(error_msg)
+            else:
+                logger.info("Data Residency Verified: RDS host is in ca-central-1.")
+        else:
+             logger.warning("Non-RDS database host detected. Manual residency verification required for production.")
 
     async def _ensure_pool(self):
         if self.pool is None:
             try:
+                async def init(conn):
+                    from pgvector.asyncpg import register_vector
+                    await register_vector(conn)
+
                 self.pool = await asyncpg.create_pool(
                     self.db_url,
-                    min_size=1,
-                    max_size=5,
-                    command_timeout=5.0
+                    min_size=10,
+                    max_size=40,
+                    command_timeout=5.0,
+                    init=init
                 )
-                logger.info("KnowledgeBase: Connected to PGVector Pool")
+                logger.info("KnowledgeBase: Connected to PGVector Pool (with Vector support)")
             except Exception as e:
                 logger.error(f"KnowledgeBase Pool Init Failed: {e}")
                 raise
@@ -94,21 +128,20 @@ class KnowledgeBase(KnowledgeBaseEngine):
 
     async def get_query_embedding(self, query: str) -> List[float]:
         """Generate 1536-dimensional embedding for the query."""
-        if self.local_test:
-            # Mock 1536-dim vector (all 1s to match newly migrated data)
-            return [1.0] * 1536
-            
-        # PRODUCTION CODE (Commented for now):
-        # bedrock = boto3.client(service_name="bedrock-runtime", region_name="ca-central-1")
-        # body = json.dumps({"inputText": query, "dimensions": 1536, "normalize": True})
-        # response = bedrock.invoke_model(body=body, modelId="amazon.titan-embed-text-v2:0")
-        # return json.loads(response.get("body").read()).get("embedding")
-        return [0.0] * 1536
+        from retrieval.embeddings import get_bedrock_embeddings
+        try:
+            return await get_bedrock_embeddings(query, local_test=self.local_test)
+        except Exception as e:
+            logger.error(f"Search embedding failed: {e}. Falling back to zero-vector.")
+            return [0.0] * 1536
 
     async def search(self, query: str, call_logger=None, top_k=3, trace_id=None):
         """
         Search PGVector with Safety and Confidence gates.
         """
+        # [AUDIT] L1: Explicit log line to verify that RAG search happens AFTER Policy check.
+        logger.info(f"RAG Search: Starting PGVector lookup for: '{query[:50]}...'")
+        
         try:
             await self._ensure_pool()
             
@@ -119,104 +152,86 @@ class KnowledgeBase(KnowledgeBaseEngine):
                 # Set search_path for the session
                 await conn.execute("SET search_path TO rag, public;")
                 
-                # 2. Query PGVector using <=> (cosine distance)
-                # Results sorted by distance ascending
-                logger.info(f"RAG-TRACE: Querying with embedding prefix: {query_embedding[:5]}...")
+                # 2. Query PGVector with Ensemble Scoring (H1 Compliance)
+                # PRD spec requires 0.7 * cosine + 0.3 * semantic_relevance (trigram similarity)
+                # We fetch more candidates than top_k to allow re-ranking via the ensemble score.
+                re_rank_limit = 50 if self.local_test else 20
                 
-                # SPREAD BUG FIX: In local_test mode, embeddings are mocked (all 1s).
-                # To avoid missing the relevant chunk because it didn't random-seed into the top_k,
-                # we fetch 100 rows (the whole DB currently) for keyword re-ranking.
-                fetch_limit = 100 if self.local_test else top_k
+                logger.info(f"RAG-TRACE: Querying with ensemble re-ranking (Limit: {re_rank_limit})")
                 
                 rows = await conn.fetch(
                     """
                     SELECT 
                         c.content, 
                         c.metadata,
-                        1 - (e.embedding <=> $1::vector) as similarity_score,
-                        e.embedding <=> $1::vector as distance,
+                        1 - (e.embedding <=> $1) as cosine_val,
+                        similarity(c.content, $3) as semantic_val,
                         c.id as chunk_id,
                         d.doc_type as category
                     FROM chunks c
                     JOIN embeddings e ON c.id = e.chunk_id
                     JOIN documents d ON c.document_id = d.id
-                    ORDER BY e.embedding <=> $1::vector ASC
+                    -- Initial broad candidate fetch via vector distance
+                    ORDER BY e.embedding <=> $1 ASC
                     LIMIT $2;
                     """,
-                    str(query_embedding), fetch_limit
+                    query_embedding, re_rank_limit, query
                 )
                 
-                logger.info(f"RAG-TRACE: Found {len(rows)} raw rows from PGVector.")
-                for i, row in enumerate(rows):
-                    logger.info(f"ROW {i}: Score={row['similarity_score']}, Distance={row['distance']}, Content={row['content'][:50]}...")
-
-                valid_chunks = []
-                scores = []
-                chunk_ids = []
-                final_category = "General"
+                logger.info(f"RAG-TRACE: Found {len(rows)} candidates. Computing ensemble scores...")
                 
+                logger.info(f"RAG-TRACE: Found {len(rows)} raw rows from PGVector.")
+                # 3. Apply Ensemble Scoring & Filtering
+                scored_results = []
                 for row in rows:
-                    score = row['similarity_score']
                     content = row['content']
                     metadata = json.loads(row['metadata']) if isinstance(row['metadata'], str) else row['metadata']
                     category = row['category']
                     
+                    # Compute Weighted Ensemble Score
+                    cos_score = row['cosine_val'] or 0.0
+                    sem_score = row['semantic_val'] or 0.0
+                    final_score = (0.7 * cos_score) + (0.3 * sem_score)
+                    
                     # Confidence Gate
+                    # Confidence Gate (H1 Weighting + M1 Strict Enforcement)
                     threshold = get_threshold(None, category)
                     
-                    # For local testing with mock vectors, we might want to bypass the threshold if scores are weird
-                    if self.local_test:
-                        # In local test mode, we accept anything since vectors are mocked
-                        pass
-                    elif score < threshold:
-                        logger.debug(f"RAG-DROP: Score {score:.2f} < Threshold {threshold}")
+                    if final_score < threshold:
+                        logger.debug(f"RAG-DROP: Confidence gate failed ({final_score:.4f} < {threshold}).")
                         continue
                     
-                    valid_chunks.append(content)
-                    scores.append(score)
-                    chunk_ids.append(str(row['chunk_id']))
-                    final_category = category
+                    scored_results.append({
+                        "content": content,
+                        "score": final_score,
+                        "id": str(row['chunk_id']),
+                        "category": category
+                    })
 
-                if not valid_chunks:
-                    logger.info("RAG Search: 0 chunks passed confidence gates.")
+                # 4. Final Sort & Top-K Slicing
+                scored_results.sort(key=lambda x: x['score'], reverse=True)
+                top_results = scored_results[:top_k]
+
+                if not top_results:
+                    logger.info("RAG Search: 0 chunks passed confidence gates after ensemble scoring.")
                     if call_logger:
                         call_logger.log_event("retrieval", "rag_search_complete", meta={"matches": 0, "top_score": 0}, trace_id=trace_id)
                     return "LOW_CONFIDENCE_FALLBACK", 0.0, "General", "unknown", []
 
-                # --- 🟢 LOCAL SEARCH OPTIMIZATION 🟢 ---
-                # If we are in local test mode, embeddings are mocked (all 1s).
-                # To ensure the user gets relevant answers for "fee", "location", etc.,
-                # we perform a simple keyword-based filter/ranking on the top candidate chunks.
-                if self.local_test:
-                    logger.info("[LOCAL-RAG] Performing keyword-boost for relevance...")
-                    query_words = set(query.lower().replace("?", "").replace(".", "").split())
-                    
-                    # Score each chunk by intersection count
-                    ranked_chunks = []
-                    for content in valid_chunks:
-                        content_words = set(content.lower().split())
-                        overlap = len(query_words.intersection(content_words))
-                        if overlap > 0:
-                            ranked_chunks.append((overlap, content))
-                    
-                    # Sort by overlap descending
-                    ranked_chunks.sort(key=lambda x: x[0], reverse=True)
-                    
-                    if ranked_chunks:
-                        # Take top 5 boosters for context
-                        selected = [c[1] for c in ranked_chunks[:5]]
-                        logger.info(f"[LOCAL-RAG] Returning {len(selected)} chunks based on keyword overlap.")
-                        return "\n\n".join(selected), 1.0, final_category, "pgvector-local-boost", chunk_ids
+                # Format return values
+                final_chunks = [r['content'] for r in top_results]
+                best_score = top_results[0]['score']
+                best_category = top_results[0]['category']
+                chunk_ids = [r['id'] for r in top_results]
 
-                top_score = max(scores) if scores else 0.0
-                logger.info(f"RAG Search: Found {len(valid_chunks)} verified chunks (Top Score: {top_score:.2f})")
+                logger.info(f"RAG Search: Found {len(top_results)} ensemble-verified chunks (Top Score: {best_score:.2f})")
                 
                 if call_logger:
                     call_logger.log_event("retrieval", "rag_search_complete",
-                                         meta={"matches": len(valid_chunks), "top_score": round(top_score, 2)},
+                                         meta={"matches": len(top_results), "top_score": round(best_score, 2)},
                                          trace_id=trace_id)
                 
-                return "\n\n".join(valid_chunks), top_score, final_category, "pgvector-v1", chunk_ids
+                return "\n\n".join(final_chunks), best_score, best_category, "pgvector-ensemble-v1", chunk_ids
 
         except Exception as e:
             logger.error(f"KnowledgeBase Search Failed: {e}", exc_info=True)

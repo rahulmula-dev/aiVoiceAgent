@@ -270,7 +270,7 @@ class CallLogger:
                 "end_time": end_time.isoformat(),
                 "duration_seconds": duration,
                 "status": self.status,
-                "structured_turns": structured_turns,
+                "structured_turns": [t.dict() if hasattr(t, 'dict') else t for t in structured_turns],
                 "events": events_snapshot
             }
             
