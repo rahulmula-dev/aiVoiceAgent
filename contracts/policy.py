@@ -219,11 +219,19 @@ class ResponsePolicyEngine:
         # Example: "Mujhe Cosmetology join karna hai" = low density = FAIL.
         is_very_short = len(words) <= 3
         
-        # Reduced threshold even further to allow for local audio clipping/noise
-        # [REFINEMENT] Density check is only aggressive for sentences >= 3 words.
-        # Short phrases (1-2 words) are extremely hard to detect via density.
-        threshold = 0.50 if len(words) == 3 else 0.20
-        is_mixed_danger = len(words) >= 3 and density < threshold
+        # [REFINEMENT] Tighter thresholds for multi-word Hinglish strings.
+        # 3 words: Extremely high density required (0.65)
+        # 4-5 words: High density required (0.50)
+        # > 5 words: Moderate density required (0.35)
+        word_count = len(words)
+        if word_count == 3:
+            threshold = 0.65
+        elif word_count <= 5:
+            threshold = 0.50
+        else:
+            threshold = 0.35
+            
+        is_mixed_danger = density < threshold
         
         if is_mixed_danger:
             policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
@@ -278,7 +286,10 @@ class ResponsePolicyEngine:
                 top = detected_langs[0]
                 
                 # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
-                if top.lang != 'en' and top.prob >= 0.40:
+                # [SKEPTIC] If density is low (< 0.60), we require extreme confidence in 'en'
+                is_skeptical_eng = top.lang == 'en' and density < 0.60 and top.prob < 0.90
+                
+                if (top.lang != 'en' and top.prob >= 0.40) or is_skeptical_eng:
                     # langdetect is extremely unreliable on short, high-density English sentences
                     # (especially introductions containing proper names). If density is high, treat as English.
                     if density >= 0.45:
@@ -288,8 +299,8 @@ class ResponsePolicyEngine:
                         )
                         return True
                     policy_logger.warning(
-                        f"[GOVERNANCE] Non-English detected by langdetect: {top.lang} ({top.prob:.2f}), "
-                        f"density={density:.2f}. Blocking by design (Phase 1 English-only). Text='{text}'"
+                        f"[GOVERNANCE] Blocked via Skeptic/Probability: {top.lang} ({top.prob:.2f}), "
+                        f"density={density:.2f}. Text='{text}'"
                     )
                     return False
                 
@@ -358,7 +369,8 @@ class ResponsePolicyEngine:
                     detected = detect_langs(response_text)
                     if detected:
                         top = detected[0]
-                        if top.lang != 'en' and top.prob >= 0.40:
+                        is_skeptical_eng = top.lang == 'en' and density < 0.60 and top.prob < 0.90
+                        if (top.lang != 'en' and top.prob >= 0.40) or is_skeptical_eng:
                             # If density is high, it's likely just a list of nouns that 
                             # statistical models struggle with. Trust density more.
                             if density >= 0.45:
