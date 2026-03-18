@@ -3,7 +3,7 @@ name: Deploy AI Voice Agent
 on:
   push:
     branches:
-      - main
+      - dev
 
 jobs:
   deploy:
@@ -29,7 +29,7 @@ jobs:
             cd ~/ai-voice-agent
 
             echo "Pulling latest code"
-            git pull origin main
+            git pull origin dev
 
             echo "Pulling base images"
             docker-compose pull || true
