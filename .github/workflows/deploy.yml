@@ -16,14 +16,11 @@ jobs:
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
-          envs: GH_TOKEN
           script: |
             set -e
 
@@ -32,7 +29,6 @@ jobs:
             cd ~/ai-voice-agent
 
             echo "Pulling latest code"
-            git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/team-ccl/ai-voice-agent.git
             git pull origin dev
 
             echo "Pulling base images"
