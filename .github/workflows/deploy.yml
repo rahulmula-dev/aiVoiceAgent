@@ -14,15 +14,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Copy code to EC2
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: GITHUB_TOKEN
+          source: "."
+          target: "~/ai-voice-agent"
+
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
           script: |
             set -e
@@ -30,10 +36,6 @@ jobs:
             echo "Starting deployment..."
 
             cd ~/ai-voice-agent
-
-            echo "Pulling latest code"
-            git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/team-ccl/ai-voice-agent.git
-            git pull origin dev
 
             echo "Pulling base images"
             docker-compose pull || true
