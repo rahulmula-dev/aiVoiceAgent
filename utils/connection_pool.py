@@ -83,16 +83,22 @@ class WebSocketPool:
         try:
             # PRD §5: Check health but minimize mid-call delay
             while True:
-                conn = await asyncio.wait_for(self._pool.get(), timeout=timeout)
+                # Use remaining time so the overall acquire respects the timeout
+                elapsed = time.time() - start_time
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+
+                conn = await asyncio.wait_for(self._pool.get(), timeout=remaining)
                 # Verify health before handing out
                 if await self.health_check_func(conn):
                     self._active_connections.add(conn)
                     self._checkout_times[conn] = asyncio.get_event_loop().time()
-                    
+
                     # Emit wait time metric
                     wait_time_ms = (time.time() - start_time) * 1000
                     self._emit_metrics(wait_time_ms)
-                    
+
                     return conn
                 else:
                     # Drop dead connection and try next one if time permits

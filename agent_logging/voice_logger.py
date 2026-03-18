@@ -64,7 +64,8 @@ def setup_global_logging():
         os.makedirs('logs')
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    root_logger.setLevel(getattr(logging, log_level, logging.DEBUG))
     
     # Avoid duplicate handlers
     if root_logger.hasHandlers():
@@ -100,6 +101,10 @@ def setup_global_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("boto3").setLevel(logging.WARNING)
+    logging.getLogger("s3transfer").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     return root_logger
 
