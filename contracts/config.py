@@ -79,6 +79,15 @@ class FeatureConfig:
         return os.getenv("OV_DEGRADATION_MODE", "false").lower() == "true"
 
     @property
+    def language_max_strikes(self) -> int:
+        """
+        Number of non-English violations before graceful call termination.
+        Strike 1 → first warning, Strike N-1 → final warning, Strike N → terminate.
+        Configurable via LANGUAGE_MAX_STRIKES env var. Default: 3 (2 warnings + terminate).
+        """
+        return int(os.getenv("LANGUAGE_MAX_STRIKES", "3"))
+
+    @property
     def override_retrieval(self) -> bool:
         """
         If True, disables RAG retrieval (Brain acts as pure LLM).

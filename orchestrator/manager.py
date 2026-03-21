@@ -178,23 +178,13 @@ class VoiceOrchestrator:
         logger.info(f"[STT RAW] Text: '{raw_text}' | is_final: {is_final} (Counter: {self.consecutive_empty_frames})")
 
         if not is_final:
-            # S4-11: Immediate Audio Stop on Interruption (Intelligent Partial Barge-in)
-            if raw_text and self.state.get_state() == CallState.SPEAKING:
-                # [BACKCHANNEL-GUARD]: Ignore short conversational filler words
-                backchannels = {"ok", "okay", "yes", "yeah", "hmm", "right", "uh-huh", "got it"}
-                words = raw_text.lower().strip().split()
-                
-                is_backchannel = len(words) == 1 and words[0].strip(".,?!") in backchannels
-                
-                if not is_backchannel and not self._is_echo_transcript(raw_text):
-                    logger.info(f">>> INTERRUPTED BY PARTIAL TRANSCRIPT: '{raw_text}'")
-                    if self.response_task and not self.response_task.done():
-                        self.response_task.cancel()
-                    self.synthesizer.stop_current_speech(self.sid)
-                    await self._send_clear_message()
-                    self.state.transition_to(CallState.INTERRUPTED)
+            # S4-11: Immediate Audio Stop on Interruption (Partial Transcript)
+            # [REMOVED for Telephony-Layer VAD Hardening - Task 2]
+            # Interruption logic moved to handle_audio_stream (Telephony 'speech' event)
             
             # Reset silence timer on partials — but ONLY when the agent is not speaking.
+            # During SPEAKING, Twilio echoes TTS audio back as partial transcripts (non-final),
+            # which would keep resetting the timer and prevent silence termination from firing.
             if raw_text and self.state.get_state() != CallState.SPEAKING:
                 self.last_interaction_time = time.time()
 
@@ -320,7 +310,7 @@ class VoiceOrchestrator:
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
                 # Fire a language strike when:
                 #   1. At least 3 frames in this run (rules out a single noise spike)
-                #   2. Run has been active >= 6.0 seconds
+                #   2. Run has been active >= 15.0 seconds (reduced from infinity/15s)
                 #   3. [CRITICAL FIX] User has already spoken at least once.
                 #      If the user has NEVER spoken, empty frames are just normal silence
                 #      (e.g. they're listening to the greeting). Do NOT strike on that.
@@ -491,6 +481,7 @@ class VoiceOrchestrator:
             if not self.user_has_spoken:
                 logger.debug("[GOVERNANCE] First valid transcript received. Enabling strict empty-frame checks.")
                 self.user_has_spoken = True
+                self.non_english_run_start = time.time() # [FIX] Reset timer when speech starts
                 
             # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "user", "parts": [text]})
@@ -1174,10 +1165,6 @@ class VoiceOrchestrator:
                                 self._last_speech_event_time = _vad_now
 
                                 logger.info(">>> IMMEDIATE STOP: Interrupted by Telephony VAD signal.")
-                                if self.response_task and not self.response_task.done():
-                                    self.response_task.cancel()
-                                    logger.debug("[TELEPHONY VAD] Cancelled response_task due to interruption.")
-                                
                                 self.synthesizer.stop_current_speech(self.sid)
                                 await self._send_clear_message() # M1: Await clear message confirmed
                                 self.state.transition_to(CallState.INTERRUPTED)
@@ -2058,24 +2045,24 @@ class VoiceOrchestrator:
                 
                 # [SILENCE-ISS-158] Contextual Silence Machine
                 # Stage 0: Normal
-                # Stage 1: Initial Warning (20s+) - [FIX] Increased from 15s to reduce frustration
-                if silence_gap > 12.0 and self.silence_stage == 0:
+                # Stage 1: Initial Warning after 10s of silence
+                if silence_gap > 10.0 and self.silence_stage == 0:
                     logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {silence_gap:.1f}s)")
                     self.silence_stage = 1
                     msg = PRDScripts.SILENCE_1
                     await self.speak_immediate_response(msg)
                     # interaction_time reset is handled by speak_immediate_response finally block
-                    
-                # Stage 2: Secondary Warning (another 10s silence, total ~25s)
-                elif silence_gap > 25.0 and self.silence_stage <= 1:
+
+                # Stage 2: Secondary Warning (another 10s silence, total ~20s)
+                elif silence_gap > 10.0 and self.silence_stage == 1:
                     logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {silence_gap:.1f}s)")
                     self.silence_stage = 2
                     msg = PRDScripts.SILENCE_2
                     await self.speak_immediate_response(msg)
-                        
-                # Stage 3: Termination (another 10s silence, total ~35s)
-                elif silence_gap > 35.0 and self.silence_stage <= 2:
-                    logger.warning(f"Silence Stage 3 (Termination) triggered (Total: {silence_gap:.1f}s)")
+
+                # Stage 3: Termination (another 10s silence, total ~30s)
+                elif silence_gap > 10.0 and self.silence_stage == 2:
+                    logger.warning(f"Silence Stage 3 (Termination) triggered (Total: 30s)")
                     await self._trigger_silence_termination()
                     break
 
@@ -2094,17 +2081,16 @@ class VoiceOrchestrator:
         if self.session:
             self.session.termination_reason = "silence_termination"
 
-        # Transition to CALL_END but do NOT cleanup yet so we can play the goodbye
+        # Preemptive Cleanup: Kills hanging Brain/RAG tasks immediately
+        await self.cleanup()
+
+        # Speak final termination while socket is in CALL_END state but still open
         try:
             self.state.transition_to(CallState.CALL_END)
         except: pass
         
         goodbye = PRDScripts.SILENCE_TERMINATION
-        logger.info("[SILENCE] Speaking final termination message...")
         await self.speak_immediate_response(goodbye)
-
-        # NOW cleanup after goodbye is spoken
-        await self.cleanup()
 
     async def _language_termination_flow(self, refusal_text, trace_id):
         """
