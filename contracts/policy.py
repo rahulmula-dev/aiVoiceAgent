@@ -249,7 +249,7 @@ class ResponsePolicyEngine:
                 policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to Near-Perfect Density ({density:.2f}): '{text}'")
                 return True
                 
-            if is_very_short:
+            if len(words) <= 2:
                 # If it contains at least one common word ("is", "my", "hi")
                 if num_common >= 1:
                     policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) for short English phrase: '{text}'")

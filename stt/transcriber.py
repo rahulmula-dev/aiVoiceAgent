@@ -4,6 +4,7 @@ import asyncio
 import websockets
 import logging as std_logging
 from dotenv import load_dotenv
+from websockets.connection import State as WsState
 
 from orchestrator.interfaces import STTProvider
 
@@ -52,6 +53,15 @@ class Transcriber(STTProvider):
 
     def set_listener_error_callback(self, callback):
         self._listener_error_callback = callback
+
+    def _ws_is_open(self) -> bool:
+        """Compatible check for websockets v15 (uses state) and older (uses closed)."""
+        if not self.ws:
+            return False
+        state = getattr(self.ws, 'state', None)
+        if state is not None:
+            return state == WsState.OPEN
+        return not getattr(self.ws, 'closed', True)
 
     async def connect(self):
         params = [
@@ -229,7 +239,7 @@ class Transcriber(STTProvider):
         try:
             while self._is_listening:
                 await asyncio.sleep(1.0) # Aggressive 1s heartbeat
-                if self.ws and not getattr(self.ws, 'closed', True):
+                if self._ws_is_open():
                     try:
                         await self.send_keepalive()
                         self._last_heartbeat = asyncio.get_event_loop().time()
@@ -242,7 +252,7 @@ class Transcriber(STTProvider):
 
     async def send_keepalive(self):
         """Sends official JSON KeepAlive to satisfy Deepgram Nova-2."""
-        if self.ws and not getattr(self.ws, 'closed', True):
+        if self._ws_is_open():
             try:
                 # Official JSON KeepAlive ONLY. 
                 # [FIX]: Removed audio wedge - it triggers VAD and causes transcripts to hang.

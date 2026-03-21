@@ -20,7 +20,7 @@ async def close_transcriber(transcriber: Transcriber):
 
 async def check_health_transcriber(transcriber: Transcriber) -> bool:
     try:
-        if not transcriber or not transcriber.ws or getattr(transcriber.ws, 'closed', True):
+        if not transcriber or not transcriber._ws_is_open():
             return False
         # CRITICAL: Verify the _listen loop hasn't crashed.
         if not getattr(transcriber, '_is_listening', False):
