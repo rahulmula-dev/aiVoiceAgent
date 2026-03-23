@@ -167,7 +167,12 @@ class ResponsePolicyEngine:
         "tuition", "payment", "payments", "installment", "deadline", "deadlines", "date", "dates", "schedule", "timetable", "orientation",
         "faculty", "staff", "instructor", "instructors", "professor", "professors", "department", "school", "university", "campus", "facility",
         "library", "lab", "laboratory", "workshop", "placement", "internship", "graduation", "alumni", "certificate", "degree", "diploma",
-        "qualification", "exam", "examination", "test", "assessment", "grade", "results", "transcript", "transcripts", "enrollment"
+        "qualification", "exam", "examination", "test", "assessment", "grade", "results", "transcript", "transcripts", "enrollment",
+        "program", "programs", "details", "information", "interest", "interested", "apply", "applying", "application", "application",
+        "favorite", "color", "therapy", "therapist", "service", "services", "contact", "person", "representative", "manager", "support",
+        "help", "assistant", "system", "technical", "issue", "problem", "solution", "answer", "question", "query", "request", "call", "back",
+        "time", "day", "week", "month", "year", "today", "tomorrow", "yesterday", "now", "later", "soon", "ready", "done", "finish", "start",
+        "begin", "end", "close", "open", "working", "work", "job", "career", "future", "opportunity", "world", "college", "school", "campus"
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:

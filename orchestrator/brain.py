@@ -17,16 +17,10 @@ from contracts.interfaces import LLMEngine
 from contracts.config import FeatureConfig
 from contracts.policy import PRDScripts
 
-# --- Pillar 2: Anti-Freeze Timeouts ---
-# [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD]
-# Uncomment these when deployed to a cloud server (US-East) to enforce strict <500ms rules:
-# LLM_TIMEOUT = 0.5
-# RAG_TIMEOUT = 0.3
-
-# [LOCAL TESTING TIMERS]
-# Relaxed to account for long physical distances, Ngrok routing, and local network latency:
-LLM_TIMEOUT = float(os.getenv("LLM_TTFT_TIMEOUT", "10.0"))  # Configurable; default 10s for local testing
-RAG_TIMEOUT = 5.0   # Reverted from 10.0 (H4 fix: match Sprint 4 ceiling)
+# --- [DYNAMIC ENVIRONMENT-AWARE TIMERS] ---
+from contracts.config import config
+LLM_TIMEOUT = 10.0 if config.is_dev_or_staging else 0.5
+RAG_TIMEOUT = config.rag_search_timeout
 # ----------------------------------------
 
 class Brain(LLMEngine):
@@ -517,93 +511,106 @@ class Brain(LLMEngine):
             history.append({"role": "user", "parts": [rag_prompt]})
 
             # 4. STREAM GENERATE (with graceful quota handling and TTFT enforcement)
-            # A. Select Model based on Degradation State
-            active_model = self.model
-            active_model_name = self.model_name
-            
-            # Dynamic Switch: Use fast model if global degradation is ON or current turn is slow
-            if degraded_mode or self.config.is_degradation_mode:
-                active_model = self.fast_model
-                active_model_name = self.fast_model_name
-                logger.warning(f"[DEGRADATION] Switching to FAST model: {active_model_name} (degraded_mode={degraded_mode})")
-
-            # B. Start the generation request
-            response_stream = await active_model.generate_content_async(
-                contents=history,
-                stream=True
-            )
-            
-            # B. Use iterator to enforce TTFT on the FIRST chunk
-            stream_iter = response_stream.__aiter__()
-            first_chunk_received = False
+            # Pillar 4: Model Fallback Strategy (Primary -> Fast)
             full_ai_text = ""
-            sentence_buffer = ""
-
-            while True:
-                try:
-                    # PRD Pillar 2: TTFT Guardrail (500ms) - only on the first chunk
-                    if not first_chunk_received:
-                        chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=LLM_TIMEOUT)
-                        first_chunk_received = True
-                    else:
-                        # Normal streaming for subsequent chunks
-                        chunk = await stream_iter.__anext__()
-                    
-                    # Process the chunk
-                    if not chunk.candidates: continue
-                    candidate = chunk.candidates[0]
-                    if candidate.finish_reason not in [0, 1]: continue
-                    if not candidate.content.parts: continue
-                    
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_chunk = part.text.replace("*", "")
-                            sentence_buffer += text_chunk
-                            if any(punct in sentence_buffer for punct in [". ", "? ", "! ", "\n"]):
-                                parts = sentence_buffer.replace("\n", ". ").split(". ")
-                                for i in range(len(parts) - 1):
-                                    sentence = parts[i].strip()
-                                    # [FIX] Strip internal label leakage from LLM output
-                                    import re as _re
-                                    sentence = _re.sub(r'^(RETRIEVE|GUARD|N/A)[:\s]*', '', sentence, flags=_re.IGNORECASE).strip()
-                                    if sentence and sentence.upper() not in ('N/A', 'NA', 'NONE'):
-                                        full_ai_text += sentence + ". "
-                                        yield (sentence + ".", sent_metadata)
-                                sentence_buffer = parts[-1]
-
-                except asyncio.TimeoutError:
-                    logger.error(f"Gemini First Token (TTFT) timed out after {LLM_TIMEOUT}s")
-                    yield (PRDScripts.APOLOGY_CAPACITY, {"error": "timeout_ttft"})
-                    return
-                except StopAsyncIteration:
-                    break
-                except Exception as e:
-                    if "429" in str(e) or "quota" in str(e).lower():
-                        logger.warning("Gemini Quota Exceeded during stream.")
-                        yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
-                        return
-                    raise e
-
-            # Yield remaining buffer
-            final_sentence = sentence_buffer.strip()
-            if final_sentence:
-                full_ai_text += final_sentence
-                yield (final_sentence, sent_metadata)
             
-            # 5. APPEND AI RESPONSE TO HISTORY (After success)
-            if full_ai_text.strip():
-                history.append({"role": "model", "parts": [full_ai_text.strip()]})
-                if call_context:
-                    call_context.last_agent_answer_summary = full_ai_text.strip()
+            for model_attempt in range(2):
+                active_model = self.model
+                active_model_name = self.model_name
+                
+                # Use fast model if:
+                # 1. We are on the second attempt (fallback)
+                # 2. Global degradation is ON
+                # 3. Current turn was flagged as degraded
+                if model_attempt == 1 or degraded_mode or self.config.is_degradation_mode:
+                    active_model = self.fast_model
+                    active_model_name = self.fast_model_name
+                    if model_attempt == 1:
+                        logger.warning(f"[FALLBACK] Primary model failed. Retrying with FAST model: {active_model_name}")
+                    else:
+                        logger.warning(f"[DEGRADATION] Switching to FAST model: {active_model_name} (degraded_mode={degraded_mode})")
 
-        except ResourceExhausted as quota_error:
-            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
-            # GRACEFUL HANDLING: Catch quota errors at stream iteration level too
-            logger.warning("Gemini Quota Exceeded (429) during streaming. Triggering fallback.")
-            yield (PRDScripts.APOLOGY_CAPACITY, {"error": True})
-        except ResourceExhausted:
-            logger.warning("Gemini Quota Exceeded during streaming.")
-            yield (PRDScripts.APOLOGY_CAPACITY, {"error": "quota_exhausted"})
+                try:
+                    # B. Start the generation request
+                    response_stream = await active_model.generate_content_async(
+                        contents=history,
+                        stream=True
+                    )
+                    
+                    # B. Use iterator to enforce TTFT on the FIRST chunk
+                    stream_iter = response_stream.__aiter__()
+                    first_chunk_received = False
+                    sentence_buffer = ""
+
+                    while True:
+                        try:
+                            # PRD Pillar 2: TTFT Guardrail (500ms) - only on the first chunk
+                            if not first_chunk_received:
+                                chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=LLM_TIMEOUT)
+                                first_chunk_received = True
+                            else:
+                                # Normal streaming for subsequent chunks
+                                chunk = await stream_iter.__anext__()
+                            
+                            # Process the chunk
+                            if not chunk.candidates: continue
+                            candidate = chunk.candidates[0]
+                            if candidate.finish_reason not in [0, 1]: continue
+                            if not candidate.content.parts: continue
+                            
+                            for part in candidate.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    text_chunk = part.text.replace("*", "")
+                                    sentence_buffer += text_chunk
+                                    if any(punct in sentence_buffer for punct in [". ", "? ", "! ", "\n"]):
+                                        parts = sentence_buffer.replace("\n", ". ").split(". ")
+                                        for i in range(len(parts) - 1):
+                                            sentence = parts[i].strip()
+                                            # [FIX] Strip internal label leakage from LLM output
+                                            import re as _re
+                                            sentence = _re.sub(r'^(RETRIEVE|GUARD|N/A)[:\s]*', '', sentence, flags=_re.IGNORECASE).strip()
+                                            if sentence and sentence.upper() not in ('N/A', 'NA', 'NONE'):
+                                                full_ai_text += sentence + ". "
+                                                yield (sentence + ".", sent_metadata)
+                                        sentence_buffer = parts[-1]
+
+                        except asyncio.TimeoutError:
+                            logger.error(f"Gemini First Token (TTFT) timed out after {LLM_TIMEOUT}s for model {active_model_name}")
+                            if model_attempt == 0:
+                                logger.warning("[FALLBACK] Switching model due to TTFT timeout...")
+                                break # Break inner loop to trigger next model_attempt
+                            yield (PRDScripts.APOLOGY_FATAL, {"error": "timeout_ttft"})
+                            return
+                        except StopAsyncIteration:
+                            # Reached end of successful stream
+                            final_sentence = sentence_buffer.strip()
+                            if final_sentence:
+                                full_ai_text += final_sentence
+                                yield (final_sentence, sent_metadata)
+                            
+                            # Append to history and RETURN (Success)
+                            if full_ai_text.strip():
+                                history.append({"role": "model", "parts": [full_ai_text.strip()]})
+                                if call_context:
+                                    call_context.last_agent_answer_summary = full_ai_text.strip()
+                            return
+
+                        except Exception as e:
+                            if "429" in str(e) or "quota" in str(e).lower() or "ResourceExhausted" in str(type(e)):
+                                logger.warning(f"Gemini Quota Exceeded for {active_model_name}: {e}")
+                                if model_attempt == 0:
+                                    break # Trigger fallback
+                                yield (PRDScripts.APOLOGY_FATAL, {"error": "quota_exhausted"})
+                                return
+                            raise e
+
+                except Exception as attempt_err:
+                    if model_attempt == 0:
+                         logger.warning(f"[FALLBACK] Primary model initialization error: {attempt_err}. Retrying...")
+                         continue
+                    logger.error(f"Critical LLM Failure on fallback model: {attempt_err}")
+                    yield (PRDScripts.APOLOGY_FATAL, {"error": str(attempt_err)})
+                    return
         except Exception as e:
             # OTHER ERRORS: Still log full traceback for debugging
             logger.error(f"AI Stream Error: {e}", exc_info=True)
