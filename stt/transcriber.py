@@ -27,7 +27,7 @@ class Transcriber(STTProvider):
         
         self.session_metadata = session_metadata or {}
         self.on_transcript_callback = on_transcript_callback
-        self.model = os.getenv("DEEPGRAM_MODEL", "nova-2-phone")
+        self.model = os.getenv("DEEPGRAM_MODEL", "nova-2")
         self.encoding = encoding
         self.sample_rate = sample_rate
         self.ws = None
@@ -65,13 +65,13 @@ class Transcriber(STTProvider):
 
     async def connect(self):
         params = [
-            f"model={self.model}", 
+            f"model={self.model}",
             f"encoding={self.encoding}",
             f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
             "endpointing=500",
-            "language=en"
+            "language=multi",
         ]
 
         domain = "api.deepgram.com"
@@ -152,7 +152,9 @@ class Transcriber(STTProvider):
                     sentence = alt.get("transcript", "")
                     conf = alt.get("confidence", 0)
                     is_final = data.get("is_final", False)
-                    detected_lang = data.get("language")
+                    # With detect_language=true, Deepgram returns the detected language
+                    # in channel_data["detected_language"]. Fall back to top-level "language".
+                    detected_lang = channel_data.get("detected_language") or data.get("language")
 
                     # Latching Heuristic
                     if not is_final:
