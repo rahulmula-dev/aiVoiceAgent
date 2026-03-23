@@ -513,7 +513,8 @@ class Brain(LLMEngine):
             """
             
             # 3. APPEND USER MSG TO HISTORY (Internal)
-            history = self._fix_history_roles(history)
+            # Always create a local copy so the RAG prompt never mutates session.conversation_history
+            history = list(self._fix_history_roles(history))
             history.append({"role": "user", "parts": [rag_prompt]})
 
             # 4. STREAM GENERATE (with graceful quota handling and TTFT enforcement)
