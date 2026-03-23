@@ -125,54 +125,71 @@ class ResponsePolicyEngine:
 
     # --- 6. LANGUAGE DETECTION (Story S1-4) ---
     COMMON_ENGLISH_WORDS = {
+        # Pronouns
         "a", "an", "the", "i", "m", "my", "me", "you", "your", "he", "she", "it", "we", "they",
+        "him", "her", "his", "its", "our", "their", "them", "us",
+        # Core verbs
         "is", "am", "are", "was", "were", "be", "been", "being",
         "have", "has", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "shall", "must", "can",
+        "need", "get", "got", "make", "made", "go", "gone", "went", "come", "came",
+        "take", "took", "see", "saw", "know", "knew", "think", "thought",
+        "look", "use", "find", "give", "tell", "ask", "seem", "let", "put",
+        "say", "said", "try", "keep", "hold", "show", "hear", "feel",
+        "work", "mean", "call", "move", "live", "run", "turn", "start", "stop",
+        # Prepositions / Conjunctions
         "of", "to", "in", "and", "or", "but", "if", "for", "with", "at", "by", "from",
+        "on", "up", "out", "into", "over", "after", "before", "about", "than", "as",
+        "not", "also", "just", "then", "so", "too",
+        # Question words
         "what", "where", "how", "when", "why", "who", "which",
+        # Demonstratives / location
         "this", "that", "these", "those", "here", "there",
-        "ok", "okay", "fine", "yes", "yup", "no", "mhm", "hello", "hi", "hey",
-        "can", "more", "tell", "good", "bad", "thanks", "thank", "please", "help",
-        "admission", "admissions", "course", "courses", "college", "fees",
-        "available", "program", "programs", "certificate", "diploma",
-        "applied", "last", "week", "month", "year", "want", "need", "info", "information",
-        "structure", "details", "process", "apply", "online", "campus",
-        "student", "asking", "query", "regarding", "saying", "speak", "know", "about",
-        "would", "like", "get", "brief", "fee", "cost", "price", "duration", "time", "date",
-        "batch", "next", "start", "location", "address", "branch", "office", "contact",
-        "number", "email", "phone", "call", "back", "human", "agent", "representative",
-        "support", "team", "gd", "college", "cila", "goodbye", "bye", "see", "later",
-        "morning", "afternoon", "evening", "night", "one", "two", "three", "four", "five",
-        "first", "second", "third", "all", "any", "some", "every", "each", "other",
-        "another", "new", "old", "still", "waiting", "listen", "hearing", "catch", "repeat",
-        "m", "s", "re", "ve", "ll", "d", "t", "can", "t", "isn", "wasn", "don", "didn",
+        # Common affirmations / fillers
+        "ok", "okay", "fine", "yes", "yup", "no", "mhm", "mhmm", "hmm", "uh", "um", "ah",
+        "hello", "hi", "hey", "yeah", "yep", "nope", "sure", "great", "good", "bad",
+        "thanks", "thank", "please", "welcome", "bye", "goodbye", "later",
+        # Common adjectives / adverbs
+        "more", "less", "very", "much", "many", "little", "few", "most", "none",
+        "only", "just", "really", "quite", "high", "low", "actually", "still",
+        "almost", "already", "soon", "late", "often", "sometimes", "always", "never",
+        "again", "together", "probably", "definitely", "basically", "literally",
+        "honestly", "totally", "absolutely", "completely", "mostly", "slightly",
+        "fairly", "pretty", "rather", "somewhat", "instead", "otherwise",
+        "meanwhile", "anyway", "however", "therefore", "thus", "hence",
+        "new", "old", "first", "second", "third", "last", "next",
+        "one", "two", "three", "four", "five", "all", "any", "some", "every", "each", "other", "another",
+        # Contractions (post-apostrophe split)
+        "m", "s", "re", "ve", "ll", "d", "t", "isn", "wasn", "don", "didn", "can",
+        # Common nouns
+        "name", "time", "year", "week", "month", "day", "number", "phone", "email",
         "something", "anything", "nothing", "someone", "anyone", "everyone",
-        "now", "name", "doing", "gmail", "great", "sure", "maybe", "logic",
-        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage", "esthetics",
-        "robot", "going", "since", "empower", "empowers", "empowering", "financial",
-        "independence", "business", "marketing", "portfolio", "building", "interview",
-        "preparation", "gender", "genders", "skills", "mission", "vision", "values",
-        "career", "vocational", "technical", "gd college", "cila agent", "issue", "question",
-        "uh", "um", "hmm", "ah", "mhm",
-        "continue", "restart", "give", "list", "kill", "people", "common", "india", 
-        "us", "africa", "america", "visa", "status", "so", "yeah", "thank", "thanks", "wait", "welcome",
-        "ged", "approvals", "measured", "registration", "joining", "join", "enroll", "enrolled", "admissions", "admission",
-        "quite", "high", "actually", "very", "much", "many", "little", "few", "most", "none", "only", "just", "really",
-        "almost", "already", "soon", "late", "often", "sometimes", "always", "never", "again", "together", "probably",
-        "certaincertainly", "definitely", "basically", "literally", "honestly", "personally", "totally", "absolutely", "entirely",
-        "completely", "mostly", "partially", "slightly", "fairly", "pretty", "rather", "somewhat", "instead", "otherwise",
-        "meanwhile", "anyway", "besides", "moreover", "furthermore", "however", "nevertheless", "nonetheless", "therefore",
-        "consequently", "accordingly", "thus", "hence", "namely", "specifically", "especially", "particularly", "notably", "primarily", "mainly", "largely",
-        "requirement", "requirements", "specific", "international", "student", "students", "financial", "aid", "available", "scholarship", "scholarships",
-        "tuition", "payment", "payments", "installment", "deadline", "deadlines", "date", "dates", "schedule", "timetable", "orientation",
-        "faculty", "staff", "instructor", "instructors", "professor", "professors", "department", "school", "university", "campus", "facility",
-        "library", "lab", "laboratory", "workshop", "placement", "internship", "graduation", "alumni", "certificate", "degree", "diploma",
-        "qualification", "exam", "examination", "test", "assessment", "grade", "results", "transcript", "transcripts", "enrollment",
-        "program", "programs", "details", "information", "interest", "interested", "apply", "applying", "application", "application",
-        "favorite", "color", "therapy", "therapist", "service", "services", "contact", "person", "representative", "manager", "support",
-        "help", "assistant", "system", "technical", "issue", "problem", "solution", "answer", "question", "query", "request", "call", "back",
-        "time", "day", "week", "month", "year", "today", "tomorrow", "yesterday", "now", "later", "soon", "ready", "done", "finish", "start",
-        "begin", "end", "close", "open", "working", "work", "job", "career", "future", "opportunity", "world", "college", "school", "campus"
+        "now", "today", "doing", "going", "waiting", "listening", "speaking",
+        # College-specific domain
+        "admission", "admissions", "course", "courses", "college", "fees", "fee", "cost",
+        "available", "program", "programs", "certificate", "diploma", "degree",
+        "applied", "info", "information", "details", "process", "apply", "online",
+        "campus", "student", "students", "asking", "query", "regarding",
+        "would", "like", "get", "brief", "price", "duration", "date", "dates",
+        "batch", "start", "location", "address", "branch", "office", "contact",
+        "back", "human", "agent", "representative", "support", "team",
+        "gd", "cila", "ged", "school", "university", "faculty", "staff",
+        "scholarship", "scholarships", "tuition", "payment", "installment",
+        "deadline", "schedule", "orientation", "lab", "library", "placement",
+        "internship", "graduation", "alumni", "transcript", "enrollment", "enroll",
+        "enrolled", "join", "joining", "registration", "exam", "test", "grade",
+        "morning", "afternoon", "evening", "night",
+        "continue", "restart", "give", "list", "people", "india",
+        "africa", "america", "visa", "status",
+        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage",
+        "business", "marketing", "portfolio", "interview", "preparation",
+        "skills", "mission", "vision", "values", "career", "vocational",
+        "issue", "question", "help", "know", "about", "speak", "call",
+        "gmail", "logic", "empower", "financial", "independence",
+        "requirement", "requirements", "specific", "international", "aid",
+        "instructor", "instructors", "professor", "professors", "department",
+        "facility", "workshop", "qualification", "examination", "assessment",
+        "results", "approvals", "measured",
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -231,14 +248,16 @@ class ResponsePolicyEngine:
         density = num_common / len(words)
         
         # 1. Density Check: Strict thresholds for English-only enforcement.
-        # [HARDENING] Mixed languages (Hinglish/Spanglish) are now strictly blocked.
-        # If density is less than 85%, we assume it's mixed and block it immediately.
-        # Short phrases (1-2 words) are exempted from high-density check to prevent
-        # blocking names or affirmations, but are still checked by STT Metadata and LangDetect.
-        threshold = 0.85 if len(words) >= 3 else 0.50
-        is_mixed_danger = density < threshold
+        # [FIX] Lowered from 0.85 to 0.60. 85% was too aggressive and blocked valid English 
+        # sentences that contained regular nouns, verbs, or names not in the 150-word whitelist.
+        # We rely on langdetect (below) to catch Hinglish code-switching robustly.
+        threshold = 0.60 if len(words) >= 3 else 0.40
+        is_mixed_danger = density <= threshold  # <= catches exact-boundary cases like density=0.60
         
-        if is_mixed_danger:
+        # Short purely-alphabetical inputs (≤2 words, all letters) are likely names —
+        # skip density block and let langdetect be the gate instead.
+        is_name_like = len(words) <= 2 and all(w.isalpha() for w in words)
+        if is_mixed_danger and not is_name_like:
             # Special bypass for introductions which have specific regex coverage
             if not re.search(intro_regex, lower_text):
                 policy_logger.warning(f"[GOVERNANCE] Blocked via Density ({density:.2f} < {threshold}): '{text}'")
@@ -281,8 +300,26 @@ class ResponsePolicyEngine:
         # 3. Probabilistic Check (Catches Spanish, French, German, Hinglish, etc.)
         # Avoid running statistical detection on 1-2 words as it generates massive false positives
         if len(words) < 3:
-            policy_logger.debug(f"[GOVERNANCE] Bypass Langdetect (Short input: {len(words)} words): '{text}'")
-            # For very short strings, any common English word should be enough to stay in English-mode.
+            policy_logger.debug(f"[GOVERNANCE] Short input ({len(words)} words): '{text}'")
+            if is_name_like:
+                # If any word is a known English word, accept immediately — no langdetect needed.
+                if num_common >= 1:
+                    policy_logger.debug(f"[GOVERNANCE] Permitting short input (has English word): '{text}'")
+                    return True
+                # density=0: both words are unknown. Could be a name (Akansha Kumar) or
+                # a foreign phrase (theek hai). Run langdetect with a strict threshold.
+                try:
+                    detected_langs = detect_langs(text)
+                    if detected_langs:
+                        top = detected_langs[0]
+                        if top.lang != 'en' and top.prob >= 0.70:
+                            policy_logger.warning(f"[GOVERNANCE] 2-word non-English by langdetect ({top.lang} {top.prob:.2f}): '{text}'")
+                            return False
+                except Exception:
+                    pass
+                policy_logger.debug(f"[GOVERNANCE] Permitting 2-word name-like input: '{text}'")
+                return True
+            # For very short non-name strings, require at least one English word.
             return density >= 0.50
 
         try:
@@ -293,7 +330,7 @@ class ResponsePolicyEngine:
                 top = detected_langs[0]
                 
                 # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
-                if top.lang != 'en' and top.prob >= 0.35:
+                if top.lang != 'en' and top.prob >= 0.30:
                     # Only override if density is nearly perfect.
                     if density >= 0.90:
                         policy_logger.info(

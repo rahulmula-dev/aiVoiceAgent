@@ -146,21 +146,41 @@ class ContextManager:
         return False
 
     def _extract_name(self, text: str) -> str | None:
-        # Very distinct patterns only to avoid false positives
-        patterns = [
-            r"my name is ([a-zA-Z]+)",
-            r"i am ([a-zA-Z]+)",
-            r"i'm ([a-zA-Z]+)",
-            r"this is ([a-zA-Z]+) speaking"
+        # Words that are never names
+        FALSE_POSITIVES = {
+            "interested", "calling", "asking", "wondering", "student",
+            "not", "also", "just", "here", "actually", "trying", "looking",
+            "speaking", "calling", "going", "doing", "trying", "fine", "good",
+            "okay", "yes", "no", "hello", "hi", "hey"
+        }
+
+        # Pattern 1: Explicit intro phrases — highest confidence
+        intro_patterns = [
+            r"my name(?:'s| is) ([a-zA-Z]+(?:\s+[a-zA-Z]+)?)",
+            r"i(?:'m| am) ([a-zA-Z]+(?:\s+[a-zA-Z]+)?)",
+            r"this is ([a-zA-Z]+(?:\s+[a-zA-Z]+)?) speaking",
+            r"call(?:ing)? me ([a-zA-Z]+(?:\s+[a-zA-Z]+)?)",
+            r"name(?:'s| is) ([a-zA-Z]+(?:\s+[a-zA-Z]+)?)",
         ]
-        
-        for p in patterns:
+        for p in intro_patterns:
             match = re.search(p, text, re.IGNORECASE)
             if match:
-                name = match.group(1)
-                # Filter out common false positives
-                if name.lower() not in ["interested", "calling", "asking", "wondering", "student"]:
+                name = match.group(1).strip()
+                first_word = name.split()[0].lower()
+                if first_word not in FALSE_POSITIVES:
                     return name.title()
+
+        # Pattern 2: Short bare response (1-2 capitalised words, no other content)
+        # Catches: "Akansha Kumar", "John" when agent asked "What's your name?"
+        stripped = text.strip().rstrip(".,!?")
+        bare_words = stripped.split()
+        if 1 <= len(bare_words) <= 2 and all(w.isalpha() for w in bare_words):
+            first_word = bare_words[0].lower()
+            if first_word not in FALSE_POSITIVES:
+                # Only treat as a name if it looks capitalised in original text (proper noun)
+                if bare_words[0][0].isupper():
+                    return stripped.title()
+
         return None
 
     def _extract_mode(self, text: str) -> str | None:

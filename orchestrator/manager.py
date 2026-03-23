@@ -93,6 +93,8 @@ class VoiceOrchestrator:
         self._watchdog_check_time = time.time()  # Throttler for watchdog
         self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
         self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
+        self._last_partial = ""           # [MUTATION] Last partial transcript seen
+        self._partial_mutations = 0       # [MUTATION] Count of content changes within one utterance
 
 
     def _create_task_with_log(self, coro):
@@ -178,10 +180,19 @@ class VoiceOrchestrator:
         logger.info(f"[STT RAW] Text: '{raw_text}' | is_final: {is_final} (Counter: {self.consecutive_empty_frames})")
 
         if not is_final:
-            # S4-11: Immediate Audio Stop on Interruption (Partial Transcript)
-            # [REMOVED for Telephony-Layer VAD Hardening - Task 2]
-            # Interruption logic moved to handle_audio_stream (Telephony 'speech' event)
-            
+            # [BARGE-IN] Partial-transcript path: stop AI audio immediately (<300ms target).
+            # Twilio standard Media Streams never send a 'speech' event, so we use Deepgram
+            # interim results as the VAD signal instead.
+            if raw_text and self.state.get_state() == CallState.SPEAKING:
+                if self.response_task and not self.response_task.done():
+                    if not self._is_echo_transcript(raw_text):
+                        halt_start = asyncio.get_event_loop().time()
+                        self.synthesizer.stop_current_speech(self.sid)
+                        self._create_task_with_log(self._send_clear_message())
+                        self.state.transition_to(CallState.INTERRUPTED)
+                        halt_ms = int((asyncio.get_event_loop().time() - halt_start) * 1000)
+                        logger.info(f">>> BARGE-IN (Partial, ~{halt_ms}ms halt): '{raw_text}'")
+
             # Reset silence timer on partials — but ONLY when the agent is not speaking.
             # During SPEAKING, Twilio echoes TTS audio back as partial transcripts (non-final),
             # which would keep resetting the timer and prevent silence termination from firing.
@@ -202,12 +213,60 @@ class VoiceOrchestrator:
                         )
                 else:
                     logger.debug(f"[STREAM BUFFER] Blocked proactive KB lookup due to policy: {intent} ('{raw_text}')")
+
+            # [MUTATION TRACKER] Track content changes in partials — Hindi hallucinations
+            # mutate mid-stream (words change), real English only grows (words added).
+            if raw_text:
+                last = self._last_partial.rstrip('.?! ')
+                cur = raw_text.rstrip('.?! ')
+                if last and not cur.startswith(last) and not last.startswith(cur):
+                    # Neither is a prefix of the other → content changed, not just grown
+                    self._partial_mutations += 1
+                    logger.debug(f"[MUTATION] Partial changed ({self._partial_mutations}x): '{last[:40]}' → '{cur[:40]}'")
+                self._last_partial = raw_text
+            else:
+                self._last_partial = ""
+                self._partial_mutations = 0
+
             return # Only process complete sentences for LLM.
             
         # 2. Run the failsafe policy (EXACT logic per Debugger Plan)
         # If there is text, run the char-ratio/langdetect guard.
+        # Consume & reset mutation counter on every final transcript
+        _mutations = self._partial_mutations
+        self._partial_mutations = 0
+        self._last_partial = ""
+
         if raw_text:
-            is_eng = self.policy._is_english(raw_text, detected_lang=detected_lang)
+            # [MUTATION GUARD] Hindi hallucinations mutate partial content mid-stream
+            # (words change, not just grow). Real English only accumulates words.
+            # >= 2 mutations + conf < 0.85 + >= 4 words = hallucinated non-English.
+            _mutation_guard_triggered = False
+            if _mutations >= 2 and confidence < 0.85 and len(raw_text.split()) >= 4:
+                logger.warning(f"[GOVERNANCE] Transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
+                _mutation_guard_triggered = True
+
+            # [CONF-LANG-GUARD] Nova-2 force-maps non-English phonemes to English words,
+            # but always with LOW confidence. Real English scores 0.85+ consistently.
+            # Density limit is fixed at 0.80 — no escalation (prevents false positives on
+            # valid English with slightly low confidence due to phone audio quality).
+            # Only the confidence ceiling escalates slightly after each strike.
+            # Strike 0: conf<0.65  Strike 1: conf<0.73  Strike 2: conf<0.81
+            _strikes = self.language_strike_count
+            _conf_limit = min(0.65 + (_strikes * 0.08), 0.82)
+            _density_limit = 0.80  # Fixed — never escalates
+
+            _conf_guard_triggered = False
+            if not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
+                _words = re.findall(r'\b\w+\b', raw_text.lower())
+                if _words:
+                    _common = sum(1 for w in _words if w in self.policy.COMMON_ENGLISH_WORDS)
+                    _density = _common / len(_words)
+                    if _density < _density_limit:
+                        logger.warning(f"[GOVERNANCE] Low-conf non-English heuristic (strike={_strikes}): conf={confidence:.2f}<{_conf_limit:.2f}, density={_density:.2f}<{_density_limit:.2f}: '{raw_text}'")
+                        _conf_guard_triggered = True
+
+            is_eng = False if (_mutation_guard_triggered or _conf_guard_triggered) else self.policy._is_english(raw_text, detected_lang=detected_lang)
             
             if not is_eng:
                 logger.warning(f"[ORCHESTRATOR] Language violation caught: '{raw_text}'")
@@ -298,7 +357,7 @@ class VoiceOrchestrator:
                     return
                 
                 self.last_empty_frame_time = stt_current_time
-                
+
                 # Track the start of this non-English "run" (resets when high-confidence English text comes in)
                 if self.consecutive_empty_frames == 0:
                     self.non_english_run_start = time.time()  # Fresh start for each new run
@@ -310,7 +369,7 @@ class VoiceOrchestrator:
                 # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
                 # Fire a language strike when:
                 #   1. At least 3 frames in this run (rules out a single noise spike)
-                #   2. Run has been active >= 15.0 seconds (reduced from infinity/15s)
+                #   2. Run has been active >= 6.0 seconds
                 #   3. [CRITICAL FIX] User has already spoken at least once.
                 #      If the user has NEVER spoken, empty frames are just normal silence
                 #      (e.g. they're listening to the greeting). Do NOT strike on that.
@@ -320,7 +379,10 @@ class VoiceOrchestrator:
                 # triggers the 'Are you still there?' prompt FIRST, rather than a language strike.
                 # A language strike will only fire if there is sustained ambiguous audio 
                 # that bypasses the silence check.
-                if self.consecutive_empty_frames >= 3 and non_english_duration >= 15.0 and self.user_has_spoken:
+                # Frame-rate guard: active non-English speech produces ~1 frame/2s.
+                # Pure silence produces ~1 frame/5s. Require ≥5 frames to rule out silence.
+                # Duration guard (16s) stays above the silence monitor's 10s first-warning.
+                if self.consecutive_empty_frames >= 5 and non_english_duration >= 16.0 and self.user_has_spoken:
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -328,7 +390,7 @@ class VoiceOrchestrator:
                         # violations accumulate across BOTH detection methods.
                         # ───────────────────────────────────────────────────────────────────────
                         current_time = time.time()
-                        if current_time - self.last_refusal_time < 10:
+                        if current_time - self.last_refusal_time < 4:
                             # Still ensure state is reset before silent return
                             if self.state.get_state() in [CallState.TRANSCRIBING, CallState.RESPONSE_VALIDATION]:
                                 self.state.transition_to(CallState.LISTENING)
@@ -421,30 +483,19 @@ class VoiceOrchestrator:
                 return
         else:
             # Non-empty transcript received.
-            # ── HALLUCINATION PROTECTION ──────────────────────────────────────────
-            # If the confidence is low (< 0.80), we suspect it's a "forced English"
-            # hallucination of foreign speech. In this case, we do NOT reset the 
-            # non-English run counter.
-            # ──────────────────────────────────────────────────────────────────────
-            if confidence < 0.80:
-                # ── EXTREME PROTECTION: Treat < 0.40 as a non-English phoneme ────────
-                # If it's truly garbled, it counts as an increment to the run.
-                if confidence < 0.40:
-                    self.consecutive_empty_frames += 1
-                    logger.warning(f"[GOVERNANCE] Garbled text detected as non-English signal. Counter: {self.consecutive_empty_frames}")
-                else:
-                    logger.debug(f"[GOVERNANCE] Low-confidence text '{text}' ({confidence:.2f}) - preserving status quo.")
-            
-            # [REFINEMENT]: Reset run timer on ANY non-empty transcript to prevent 
-            # silence from old frames bleeding into new speech turns.
-            if self.consecutive_empty_frames > 0:
-                logger.debug(f"[RESET] Resetting empty frame counter (was {self.consecutive_empty_frames}) - received text")
-                self.consecutive_empty_frames = 0
-            
-            # Always reset run timer when valid text is processing to keep it fresh
-            self.non_english_run_start = time.time() 
-            
-            # SILENCE RESET: legitimate user text
+            # Only HIGH-confidence text (≥0.75) is trusted as genuine English and resets
+            # the phoneme run counter. Low-confidence text is likely Deepgram force-fitting
+            # non-English phonemes into English words — we preserve the run so it can
+            # accumulate toward the 5-frame / 16s threshold.
+            if confidence >= 0.75:
+                if self.consecutive_empty_frames > 0:
+                    logger.debug(f"[RESET] Resetting phoneme counter (was {self.consecutive_empty_frames}) - high-confidence English")
+                    self.consecutive_empty_frames = 0
+                self.non_english_run_start = time.time()
+            else:
+                logger.debug(f"[GOVERNANCE] Low-confidence text (conf={confidence:.2f}) - phoneme counter preserved at {self.consecutive_empty_frames}")
+
+            # SILENCE RESET: any user speech (even low-confidence) resets the silence timer
             self.last_interaction_time = time.time()
             self.silence_stage = 0
         
@@ -481,7 +532,6 @@ class VoiceOrchestrator:
             if not self.user_has_spoken:
                 logger.debug("[GOVERNANCE] First valid transcript received. Enabling strict empty-frame checks.")
                 self.user_has_spoken = True
-                self.non_english_run_start = time.time() # [FIX] Reset timer when speech starts
                 
             # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "user", "parts": [text]})
@@ -617,7 +667,12 @@ class VoiceOrchestrator:
 
             self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
             return # SHORT-CIRCUIT
-        # 3. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
+        # 3. CONTEXT EXTRACTION — must happen before barge-in so names/slots are never dropped
+        # even when the user speaks while the AI is mid-sentence.
+        if self.session:
+            self.context_manager.update_context(self.session.call_context, text, intent)
+
+        # 4. INTERRUPTION & BARGE-IN (Only for PROCEED intents)
         if self.response_task and not self.response_task.done():
             # [S4-11 FIX]: Check both SPEAKING and INTERRUPTED states
             # Because a partial transcript might have already flipped the state to INTERRUPTED
@@ -685,13 +740,9 @@ class VoiceOrchestrator:
             else:
                 logger.debug("AI was only thinking/processing. Silently cancelling old task.")
         # 3. Start Parallel Response Generation (Normal Flow)
-        # S4-9: Update Context (Deterministic)
+        # S4-9: Context already updated above (before barge-in check). Log the snapshot here.
         if self.session:
-            changes = self.context_manager.update_context(self.session.call_context, text, intent)
-            
-            # 5. Logging + Audit (Context Snapshot)
             import hashlib
-            # Create a deterministic snapshot of just the persistent memory fields
             memory_state = {
                 "program": self.session.call_context.program_interest,
                 "intake": self.session.call_context.intake,
@@ -700,14 +751,12 @@ class VoiceOrchestrator:
                 "campus": self.session.call_context.campus
             }
             context_hash = hashlib.md5(json.dumps(memory_state, sort_keys=True).encode()).hexdigest()
-            
             if self.call_logger:
-                 self.call_logger.log_event("context", "audit_snapshot", meta={
-                     "snapshot_hash": context_hash,
-                     "updated_fields": list(changes.keys()),
-                     "slot_extraction_result": changes,
-                     "reason_for_update": "Deterministic phrase match" if changes else "No new slots detected"
-                 }, trace_id=trace_id)
+                self.call_logger.log_event("context", "audit_snapshot", meta={
+                    "snapshot_hash": context_hash,
+                    "slot_values": memory_state,
+                    "reason_for_update": "Context updated pre-barge-in"
+                }, trace_id=trace_id)
         
         # We start the task and let it handle its own errors (including LatencyBreachError)
         self.response_task = asyncio.create_task(self.generate_and_speak(text, intent=intent, trace_id=trace_id, turn_start_time=turn_start_time, stt_latency=stt_latency))
@@ -2087,23 +2136,25 @@ class VoiceOrchestrator:
                     _last_tick_log = _now
 
                 # [SILENCE-ISS-158] Contextual Silence Machine
-                # Stage 0: Normal
-                # Stage 1: Initial Warning after 10s of silence
+                # Stage 0 → 1: First warning at 10s (fires before phoneme path's 16s)
+                # Stage 1 → 2: Second warning after another 10s
+                # Stage 2 → 3: Termination after another 10s
                 if silence_gap > 10.0 and self.silence_stage == 0:
                     logger.info(f"[SILENCE-TIMER] FIRE stage=1 (first warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 1
+                    self.last_interaction_time = time.time() # Reset timer for next stage
                     msg = PRDScripts.SILENCE_1
                     await self.speak_immediate_response(msg)
-                    # interaction_time reset is handled by speak_immediate_response finally block
 
-                # Stage 2: Secondary Warning (another 10s silence, total ~20s)
+                # Stage 2: Secondary Warning
                 elif silence_gap > 10.0 and self.silence_stage == 1:
                     logger.info(f"[SILENCE-TIMER] FIRE stage=2 (second warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 2
+                    self.last_interaction_time = time.time()
                     msg = PRDScripts.SILENCE_2
                     await self.speak_immediate_response(msg)
 
-                # Stage 3: Termination (another 10s silence, total ~30s)
+                # Stage 3: Termination
                 elif silence_gap > 10.0 and self.silence_stage == 2:
                     logger.warning(f"[SILENCE-TIMER] FIRE stage=3 (termination) gap={silence_gap:.1f}s total≈30s")
                     await self._trigger_silence_termination()
