@@ -42,7 +42,8 @@ async def create_default_orchestrator(
     from tts.elevenlabs_pool import elevenlabs_pool, PooledTTSEngine
 
     # 1. Acquire STT (Deepgram Websockets)
-    stt_timeout = 0.5 # Strict timeout for POOLED acquisition (PRD §5)
+    # [PRD §5] Increased from 0.5s to 2.0s to allow for health-checks and one retry cycle.
+    stt_timeout = 2.0 
     try:
         raw_stt = await stt_pool.acquire(timeout=stt_timeout)
     except Exception as e:
@@ -70,7 +71,8 @@ async def create_default_orchestrator(
     # 2. Acquire TTS
     tts_provider_name = os.getenv("TTS_PROVIDER", "deepgram").lower()
     if tts_provider_name == "elevenlabs":
-        tts_timeout = int(os.getenv("ELEVENLABS_SESSION_TIMEOUT_MS", "300")) / 1000.0
+        # Relaxed from 300ms to 1.5s to allow for retry logic in the pool
+        tts_timeout = 1.5 
         try:
             raw_tts = await elevenlabs_pool.acquire(timeout=tts_timeout)
         except Exception as e:

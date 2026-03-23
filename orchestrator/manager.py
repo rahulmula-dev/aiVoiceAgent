@@ -667,8 +667,23 @@ class VoiceOrchestrator:
                     self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
                 )
                 return
+            elif current_state == CallState.TRANSCRIBING:
+                # [BARGE-IN FIX]: Dev-Phone / environments that don't send Twilio VAD 'speech' events
+                # never flip state SPEAKING -> INTERRUPTED before the STT final arrives.
+                # By the time we reach here, state has already raced to TRANSCRIBING, but the
+                # response_task is still running (TTS may still be streaming buffered audio).
+                # We must stop TTS output now and answer the user's actual question.
+                logger.info(f">>> LATE BARGE-IN (state=TRANSCRIBING): Stopping residual TTS for: '{raw_text}'")
+                partial_text = self.synthesizer.stop_current_speech(self.sid)
+                self._create_task_with_log(self._send_clear_message())
+                if self.session:
+                    self.session_manager.save_session(self.session)
+                self.response_task = asyncio.create_task(
+                    self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
+                )
+                return
             else:
-                logger.debug("AI was only thinking/transcribing. Silently cancelling old task.")
+                logger.debug("AI was only thinking/processing. Silently cancelling old task.")
         # 3. Start Parallel Response Generation (Normal Flow)
         # S4-9: Update Context (Deterministic)
         if self.session:
@@ -1017,8 +1032,7 @@ class VoiceOrchestrator:
 
             if not sid:
                 logger.warning("WebSocket disconnected before Twilio start event. Triggering cleanup for early-exit CRM ticket.")
-                await self.cleanup()
-                return
+                return # finally block will call cleanup()
 
             # 🟢 ENTER SESSION CONTEXT (Pillar 3)
             # Use 'from' number extracted from Twilio if available
@@ -1131,7 +1145,7 @@ class VoiceOrchestrator:
                             # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
                             try:
                                 from stt.stt_pool import stt_pool, PooledTranscriber
-                                raw_stt = await stt_pool.acquire(timeout=1.0)
+                                raw_stt = await stt_pool.acquire(timeout=3.0)
                                 old_stt = self.transcriber
                                 self.transcriber = PooledTranscriber(stt_pool, raw_stt)
                                 self.transcriber.set_callback(self._on_transcript)
@@ -1458,25 +1472,22 @@ class VoiceOrchestrator:
                     # Task 3 & 4: Early Latency Check (Before RAG/LLM)
                     self._latency_alert_emitted = False
                     if turn_start_time:
-                         current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                         # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-                         # Uncomment and use these values when deployed in US-East for <5s rules:
-                         # if current_turn_elapsed > 3.0: logger.warning(...)
-                         # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
+                        current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                        # --- [DYNAMIC ENVIRONMENT-AWARE CIRCUIT BREAKER] ---
+                        from contracts.config import config
+                        CERTAINTY_BUDGET = config.turn_latency_circuit_break_s
+                        
+                        if current_turn_elapsed > (CERTAINTY_BUDGET * 0.6):
+                            sid = self.session.session_id if self.session else "unknown"
+                            logger.warning(f"[LATENCY_ALERT] Pressure detected | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
+                            self._latency_alert_emitted = True
+                            
+                            if self.call_logger:
+                                self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": CERTAINTY_BUDGET*0.6, "status": "warning"})
 
-                         # --- [LOCAL TESTING TIMERS] ---
-                         if current_turn_elapsed > 20.0:
-                             sid = self.session.session_id if self.session else "unknown"
-                             logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
-                             self._latency_alert_emitted = True
-                             
-                             # 🟢 COMPLIANCE: formal 'Alert Payload' for monitoring hooks (Prometheus/CW Alerts)
-                             if self.call_logger:
-                                 self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
-
-                         if current_turn_elapsed > 35.0:
-                             logger.error(f"[LATENCY_CIRCUIT_BREAK] Pre-generation latency exceeded 35s: {current_turn_elapsed:.2f}s. Breaking call to prevent 'Dead Air'.")
-                             raise LatencyBreachError(f"High pre-generation delay: {current_turn_elapsed:.2f}s")
+                        if current_turn_elapsed > CERTAINTY_BUDGET:
+                            logger.error(f"[LATENCY_CIRCUIT_BREAK] Pre-generation latency exceeded budget: {current_turn_elapsed:.2f}s. Breaking call to prevent 'Dead Air'.")
+                            raise LatencyBreachError(f"High pre-generation delay: {current_turn_elapsed:.2f}s")
 
                     # Extract Caller Number for Auto-ID
                     caller_num = self.session.caller_number if self.session else "unknown"
@@ -1515,23 +1526,23 @@ class VoiceOrchestrator:
                         if hasattr(self.session, 'prefetched_context_task'):
                             self.session.prefetched_context_task = None
                         # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
+                        # --- [DYNAMIC ENVIRONMENT-AWARE CIRCUIT BREAKER] ---
+                        from contracts.config import config
+                        CERTAINTY_BUDGET = config.turn_latency_circuit_break_s
+
                         if turn_start_time:
                             current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
                             
-                            # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-                            # if current_turn_elapsed > 3.0: ...
-                            # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
-
-                            # --- [LOCAL TESTING TIMERS] ---
-                            # 🟢 Circuit Break ceiling
-                            if current_turn_elapsed > 35.0:
-                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                             # 🟢 Alert for auto-scaling hook
-                            if current_turn_elapsed > 20.0 and not self._latency_alert_emitted:
-                                logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | Elapsed: {current_turn_elapsed:.1f}s")
+                            if current_turn_elapsed > (CERTAINTY_BUDGET * 0.6) and not self._latency_alert_emitted:
+                                logger.warning(f"[LATENCY_ALERT] Pressure detected | Elapsed: {current_turn_elapsed:.1f}s")
                                 self._latency_alert_emitted = True
                                 if self.call_logger:
-                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
+                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": CERTAINTY_BUDGET*0.6, "status": "warning"})
+                                
+                            # 🟢 Circuit Break ceiling
+                            if current_turn_elapsed > CERTAINTY_BUDGET:
+                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                                 
 
                         self.session.touch()
