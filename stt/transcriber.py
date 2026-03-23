@@ -40,6 +40,7 @@ class Transcriber(STTProvider):
         self._voice_packets = 0
         self._is_listening = False
         self._last_voice_timestamp = 0.0
+        self._prev_was_voice = False
         self._last_heartbeat = 0.0
         self._heartbeat_task = None
         self._listen_task = None
@@ -213,15 +214,39 @@ class Transcriber(STTProvider):
                 non_silence = [b for b in audio_chunk if b not in [0xff, 0x7f]]
             else:
                 non_silence = [b for b in audio_chunk if b != 0x00]
-            
-            if len(non_silence) > len(audio_chunk) * 0.15:
+
+            energy_ratio = len(non_silence) / len(audio_chunk) if audio_chunk else 0.0
+            is_voice = energy_ratio > 0.15
+
+            if is_voice:
                 self._voice_packets += 1
                 self._last_voice_timestamp = asyncio.get_event_loop().time()
+                if not self._prev_was_voice:
+                    # Rising edge: silence → voice
+                    logger.info(
+                        f"[VAD] Voice activity START: energy={energy_ratio:.1%} "
+                        f"pkt={self._total_packets} silent_run={self._silent_packets}"
+                    )
+                else:
+                    logger.debug(f"[VAD] Voice: energy={energy_ratio:.1%} pkt={self._total_packets}")
+                self._prev_was_voice = True
             else:
                 self._silent_packets += 1
+                if self._prev_was_voice:
+                    # Falling edge: voice → silence
+                    logger.info(
+                        f"[VAD] Voice activity END: energy={energy_ratio:.1%} "
+                        f"pkt={self._total_packets} voice_run={self._voice_packets}"
+                    )
+                self._prev_was_voice = False
 
             if self._packet_counter % 100 == 0:
-                logger.info(f"🎤 AUDIO: Packets={self._total_packets}, Voice={self._voice_packets} ({ (self._voice_packets/self._total_packets)*100:.1f}%)")
+                voice_pct = (self._voice_packets / self._total_packets) * 100
+                logger.info(
+                    f"[VAD] 🎤 AUDIO stats: pkts={self._total_packets} "
+                    f"voice={self._voice_packets} ({voice_pct:.1f}%) "
+                    f"silent={self._silent_packets}"
+                )
 
             await self.ws.send(audio_chunk)
         except Exception as e:
@@ -269,6 +294,7 @@ class Transcriber(STTProvider):
         self._voice_packets = 0
         self._silent_packets = 0
         self._last_voice_timestamp = 0.0
+        self._prev_was_voice = False
 
     async def close(self):
         self._is_listening = False

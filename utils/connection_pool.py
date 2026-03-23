@@ -98,7 +98,10 @@ class WebSocketPool:
                     # Emit wait time metric
                     wait_time_ms = (time.time() - start_time) * 1000
                     self._emit_metrics(wait_time_ms)
-
+                    logger.info(
+                        f"[{self.name}] [POOL-ACQUIRE] wait={wait_time_ms:.1f}ms "
+                        f"active={len(self._active_connections)} idle={self._pool.qsize()}"
+                    )
                     return conn
                 else:
                     # Drop dead connection and try next one if time permits
@@ -111,9 +114,16 @@ class WebSocketPool:
             raise PoolExhaustedError(f"Pool {self.name} exhausted after {timeout}s")
 
     async def release(self, conn: Any):
+        held_ms = 0.0
+        if conn in self._checkout_times:
+            held_ms = (asyncio.get_event_loop().time() - self._checkout_times[conn]) * 1000
         if conn in self._active_connections:
             self._active_connections.discard(conn)
             self._checkout_times.pop(conn, None)
+        logger.info(
+            f"[{self.name}] [POOL-RELEASE] held={held_ms:.0f}ms "
+            f"active={len(self._active_connections)} idle={self._pool.qsize()}"
+        )
             
         # Reset state on return
         self.reset_connection_func(conn)
@@ -138,7 +148,10 @@ class WebSocketPool:
                 try:
                     self._pool.put_nowait(conn)
                     self.replacement_count += 1
-                    logger.info(f"[{self.name}] Replaced dead connection")
+                    logger.info(
+                        f"[{self.name}] [POOL-RECONNECT] Dead connection replaced "
+                        f"(total_replacements={self.replacement_count} idle={self._pool.qsize()})"
+                    )
                 except asyncio.QueueFull:
                     await self.close_connection_func(conn)
         except Exception as e:

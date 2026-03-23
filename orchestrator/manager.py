@@ -1328,13 +1328,21 @@ class VoiceOrchestrator:
             # Worker: Speaks chunks as they arrive from the brain
             async def tts_worker():
                 total_chars = 0
+                sentence_idx = 0
                 worker_start_time = time.time()
+                logger.info(f"[TTS-WORKER] Started trace={trace_id}")
                 try:
                     while True:
                         sentence = await audio_queue.get()
                         if sentence is None: break
+                        sentence_idx += 1
                         total_chars += len(sentence)
-                        
+                        sentence_start_time = time.time()
+                        logger.info(
+                            f"[TTS-WORKER] Sentence #{sentence_idx} start: "
+                            f"chars={len(sentence)} total_so_far={total_chars} trace={trace_id}"
+                        )
+
                         # STATE: Speaking
                         self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
                         
@@ -1375,19 +1383,29 @@ class VoiceOrchestrator:
                             if hasattr(self.synthesizer, 'play_fallback_audio'):
                                 await self.synthesizer.play_fallback_audio(self.websocket, streamSid=self.sid)
                             
+                        sentence_elapsed_ms = int((time.time() - sentence_start_time) * 1000)
+                        logger.info(
+                            f"[TTS-WORKER] Sentence #{sentence_idx} complete: "
+                            f"elapsed={sentence_elapsed_ms}ms chars={len(sentence)} trace={trace_id}"
+                        )
                         audio_queue.task_done()
-                    
+
                     # Calculate estimated playback duration (approx 10 chars per sec for natural TTS)
                     estimated_play_time = total_chars / 10.0
                     time_spent_generating = time.time() - worker_start_time
                     remaining_time = estimated_play_time - time_spent_generating
-                    
+                    logger.info(
+                        f"[TTS-WORKER] All {sentence_idx} sentence(s) streamed: "
+                        f"total_chars={total_chars} estimated_play={estimated_play_time:.1f}s "
+                        f"gen_time={time_spent_generating:.1f}s sync_sleep={max(0, remaining_time):.1f}s "
+                        f"trace={trace_id}"
+                    )
                     if remaining_time > 0:
-                        logger.debug(f"Audio streamed to client. Sleeping {remaining_time:.1f}s to align with client playback.")
+                        logger.debug(f"[TTS-WORKER] Sleeping {remaining_time:.1f}s to align with client playback.")
                         await asyncio.sleep(remaining_time)
                 except asyncio.CancelledError:
-                    logger.debug("TTS Worker Cancelled.")
-                    
+                    logger.info(f"[TTS-WORKER] Cancelled mid-stream (sentence #{sentence_idx}) trace={trace_id}")
+
                 finally:
                     self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
                     # Back to Listening when done speaking (if not escalated)
@@ -1396,6 +1414,10 @@ class VoiceOrchestrator:
                         self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
                         # Reset interaction time so silence monitor starts counting from NOW
                         self.last_interaction_time = time.time()
+                    logger.info(
+                        f"[TTS-WORKER] Done. final_state={self.state.get_state().value} "
+                        f"sentences={sentence_idx} total_chars={total_chars} trace={trace_id}"
+                    )
 
             worker_task = asyncio.create_task(tts_worker())
             
@@ -1957,25 +1979,27 @@ class VoiceOrchestrator:
         next 10-20s silence -> prompt #2
         continued silence -> termination
         """
-        logger.debug("Starting Silence Monitor")
+        logger.info("[SILENCE-TIMER] Monitor started")
+        _last_tick_log = 0.0
         try:
             while not self.stop_event.is_set():
                 await asyncio.sleep(1)
-                
+
                 # 1. State Guard: DO NOT count silence while AI is busy.
                 # If we are speaking, thinking, or transcribing, the user is 'interacting' or waiting.
                 # Includes INTERRUPTED, RETRIEVAL, and VALIDATION states.
                 current_call_state = self.state.get_state()
                 if current_call_state in [
-                    CallState.SPEAKING, 
-                    CallState.INTENT_EVAL, 
-                    CallState.TRANSCRIBING, 
-                    CallState.ESCALATION, 
-                    CallState.RETRIEVAL, 
+                    CallState.SPEAKING,
+                    CallState.INTENT_EVAL,
+                    CallState.TRANSCRIBING,
+                    CallState.ESCALATION,
+                    CallState.RETRIEVAL,
                     CallState.RESPONSE_VALIDATION
                 ]:
                     # Keep the 'interaction' timestamp fresh so we don't 'timeout' mid-thought.
                     self.last_interaction_time = time.time()
+                    logger.debug(f"[SILENCE-TIMER] Suppressed (state={current_call_state.value}), resetting timer")
                     continue
 
                 # 2. Maximum Session Limit check (6 minutes)
@@ -2042,12 +2066,20 @@ class VoiceOrchestrator:
 
                 # 2. Silence Stage Logic
                 silence_gap = time.time() - self.last_interaction_time
-                
+
+                # Periodic tick log every 5s so gaps are always visible in logs
+                _now = time.time()
+                if _now - _last_tick_log >= 5.0:
+                    logger.debug(
+                        f"[SILENCE-TIMER] Tick: gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}"
+                    )
+                    _last_tick_log = _now
+
                 # [SILENCE-ISS-158] Contextual Silence Machine
                 # Stage 0: Normal
                 # Stage 1: Initial Warning after 10s of silence
                 if silence_gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {silence_gap:.1f}s)")
+                    logger.info(f"[SILENCE-TIMER] FIRE stage=1 (first warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 1
                     msg = PRDScripts.SILENCE_1
                     await self.speak_immediate_response(msg)
@@ -2055,23 +2087,23 @@ class VoiceOrchestrator:
 
                 # Stage 2: Secondary Warning (another 10s silence, total ~20s)
                 elif silence_gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {silence_gap:.1f}s)")
+                    logger.info(f"[SILENCE-TIMER] FIRE stage=2 (second warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 2
                     msg = PRDScripts.SILENCE_2
                     await self.speak_immediate_response(msg)
 
                 # Stage 3: Termination (another 10s silence, total ~30s)
                 elif silence_gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"Silence Stage 3 (Termination) triggered (Total: 30s)")
+                    logger.warning(f"[SILENCE-TIMER] FIRE stage=3 (termination) gap={silence_gap:.1f}s total≈30s")
                     await self._trigger_silence_termination()
                     break
 
         except asyncio.CancelledError:
-            logger.debug("Silence Monitor cancelled")
+            logger.info("[SILENCE-TIMER] Monitor cancelled")
         except Exception as e:
-            logger.error(f"Error in Silence Monitor: {e}", exc_info=True)
+            logger.error(f"[SILENCE-TIMER] Error in monitor: {e}", exc_info=True)
         finally:
-            logger.debug("Silence Monitor loop exited.")
+            logger.info("[SILENCE-TIMER] Monitor stopped")
 
     async def _trigger_silence_termination(self):
         """

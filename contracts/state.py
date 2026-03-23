@@ -1,6 +1,7 @@
 from enum import Enum
 import logging
 import asyncio
+import time
 
 logger = logging.getLogger("StateMachine")
 
@@ -31,7 +32,7 @@ class StateMachine:
             
             CallState.SPEAKING: [CallState.LISTENING, CallState.CALL_END, CallState.ESCALATION, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.TRANSCRIBING],
             
-            CallState.INTERRUPTED: [CallState.LISTENING, CallState.CALL_END, CallState.TRANSCRIBING, CallState.SPEAKING],
+            CallState.INTERRUPTED: [CallState.LISTENING, CallState.CALL_END, CallState.TRANSCRIBING, CallState.SPEAKING, CallState.ESCALATION],
 
             CallState.LISTENING: [CallState.TRANSCRIBING, CallState.SPEAKING, CallState.CALL_END, CallState.INTENT_EVAL, CallState.RESPONSE_VALIDATION, CallState.INTERRUPTED, CallState.ESCALATION],
             
@@ -87,11 +88,15 @@ class StateMachine:
         # 3. Update State
         old_state = self.current_state
         self.current_state = new_state
-        
-        # 4. JSON Log Only (No console spam)
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        ms = int((time.time() % 1) * 1000)
+        trace_suffix = f" trace={trace_id}" if trace_id else ""
+        logger.info(f"[STATE] {ts}.{ms:03d} {old_state.value} → {new_state.value}{trace_suffix}")
+
+        # 4. JSON Log
         if self.call_logger:
-            self.call_logger.log_event("state_machine", "transition", 
-                                     meta={"from": old_state.value, "to": new_state.value},
+            self.call_logger.log_event("state_machine", "transition",
+                                     meta={"from": old_state.value, "to": new_state.value, "ts": f"{ts}.{ms:03d}"},
                                      trace_id=trace_id)
 
     def get_state(self):
