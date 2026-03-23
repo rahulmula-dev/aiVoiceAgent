@@ -32,7 +32,11 @@ class FeatureConfig:
 
     @property
     def is_dev_or_staging(self) -> bool:
-        return self.env in ["development", "staging", "test"]
+        """
+        True if we are in a purely local testing environment.
+        User wants Staging/Production to follow strict PRD rules.
+        """
+        return self.env in ["development", "test"]
 
     @property
     def is_intake_enabled(self) -> bool:
@@ -98,6 +102,62 @@ class FeatureConfig:
             logger.warning("Attempted to use OV_DISABLE_RETRIEVAL in production. Ignoring.")
             return False
         return val
+
+    # --- ENVIRONMENT-AWARE THRESHOLDS (PRD vs DEV) ---
+    
+    @property
+    def ttfa_budget(self) -> float:
+        """Time to First Audio (TTFA) budget."""
+        # PRD: 0.3s | DEV: 15.0s
+        return 0.3 if not self.is_dev_or_staging else 15.0
+
+    @property
+    def stt_connect_timeout(self) -> float:
+        """STT WebSocket connection timeout."""
+        # PRD: 0.5s | DEV: 5.0s
+        return 0.5 if not self.is_dev_or_staging else 5.0
+
+    @property
+    def stt_max_attempts(self) -> int:
+        """STT Connection retry limit."""
+        # PRD: 2 total | DEV: 3 total
+        return 2 if not self.is_dev_or_staging else 3
+
+    @property
+    def turn_latency_circuit_break_s(self) -> float:
+        """Maximum allowed latency for a single turn before circuit break."""
+        # PRD: 5.0s | DEV: 35.0s
+        return 5.0 if not self.is_dev_or_staging else 35.0
+
+    @property
+    def max_inbound_calls(self) -> int:
+        """Concurrency limit for inbound calls."""
+        # PRD: 30 | DEV: 1 (or whatever is in env)
+        if not self.is_dev_or_staging:
+            return 30
+        return int(os.getenv("DEV_MAX_INBOUND_CALLS", "30"))
+
+    @property
+    def rag_search_timeout(self) -> float:
+        """Maximum time allowed for a RAG search."""
+        # PRD: 2.0s | DEV: 15.0s
+        return 2.0 if not self.is_dev_or_staging else 15.0
+
+    @property
+    def stt_pool_size(self) -> int:
+        """Maximum size of the STT connection pool."""
+        # PRD: 30 | DEV: 5 (or from env)
+        if not self.is_dev_or_staging:
+            return 30
+        return int(os.getenv("DEEPGRAM_POOL_SIZE", "5"))
+
+    @property
+    def stt_min_connections(self) -> int:
+        """Minimum warmed connections to maintain in the STT pool."""
+        # PRD: 10 | DEV: 2 (or from env)
+        if not self.is_dev_or_staging:
+            return 10
+        return int(os.getenv("DEEPGRAM_MIN_CONNECTIONS", "2"))
 
 # Global instance for easy access if needed, though injection is preferred
 config = FeatureConfig()

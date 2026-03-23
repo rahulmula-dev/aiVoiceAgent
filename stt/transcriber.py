@@ -40,6 +40,8 @@ class Transcriber(STTProvider):
         self._voice_packets = 0
         self._is_listening = False
         self._last_voice_timestamp = 0.0
+        self._prev_was_voice = False
+        self._has_critical_error = False
         self._last_heartbeat = 0.0
         self._heartbeat_task = None
         self._listen_task = None
@@ -85,11 +87,10 @@ class Transcriber(STTProvider):
         # --- [STRICT PRD vs TESTING RULES] ---
         # PRD §5: 1 retry ≤500ms (2 total attempts, 0.5s timeout each).
         # Testing override: higher timeout for Ngrok/Home WiFi jitter.
-        # [FIX-6] Values are now env-driven so production deploys enforce the PRD budget
-        # without requiring a code change. APP_ENV controls the default.
-        _is_test_env = os.getenv("APP_ENV", "production").lower() in ["development", "staging", "test"]
-        MAX_ATTEMPTS = int(os.getenv("STT_MAX_ATTEMPTS", "3" if _is_test_env else "2"))
-        ATTEMPT_TIMEOUT = float(os.getenv("STT_ATTEMPT_TIMEOUT", "5.0" if _is_test_env else "0.5"))
+        # --- [DYNAMIC ENVIRONMENT-AWARE TIMERS] ---
+        from contracts.config import config
+        MAX_ATTEMPTS = config.stt_max_attempts
+        ATTEMPT_TIMEOUT = config.stt_connect_timeout
         last_error = None
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -131,6 +132,7 @@ class Transcriber(STTProvider):
                 if msg_type == "Error":
                     logger.error(f"[DEEPGRAM ERROR] {data.get('message')}: {data.get('description')}")
                     if "1011" in str(data.get('message', '')) or "1011" in str(data.get('description', '')):
+                        self._has_critical_error = True
                         if self._listener_error_callback:
                             await self._trigger_error(ConnectionError(f"Deepgram 1011: {data.get('description')}"))
                     continue
@@ -215,15 +217,39 @@ class Transcriber(STTProvider):
                 non_silence = [b for b in audio_chunk if b not in [0xff, 0x7f]]
             else:
                 non_silence = [b for b in audio_chunk if b != 0x00]
-            
-            if len(non_silence) > len(audio_chunk) * 0.15:
+
+            energy_ratio = len(non_silence) / len(audio_chunk) if audio_chunk else 0.0
+            is_voice = energy_ratio > 0.15
+
+            if is_voice:
                 self._voice_packets += 1
                 self._last_voice_timestamp = asyncio.get_event_loop().time()
+                if not self._prev_was_voice:
+                    # Rising edge: silence → voice
+                    logger.info(
+                        f"[VAD] Voice activity START: energy={energy_ratio:.1%} "
+                        f"pkt={self._total_packets} silent_run={self._silent_packets}"
+                    )
+                else:
+                    logger.debug(f"[VAD] Voice: energy={energy_ratio:.1%} pkt={self._total_packets}")
+                self._prev_was_voice = True
             else:
                 self._silent_packets += 1
+                if self._prev_was_voice:
+                    # Falling edge: voice → silence
+                    logger.info(
+                        f"[VAD] Voice activity END: energy={energy_ratio:.1%} "
+                        f"pkt={self._total_packets} voice_run={self._voice_packets}"
+                    )
+                self._prev_was_voice = False
 
             if self._packet_counter % 100 == 0:
-                logger.info(f"🎤 AUDIO: Packets={self._total_packets}, Voice={self._voice_packets} ({ (self._voice_packets/self._total_packets)*100:.1f}%)")
+                voice_pct = (self._voice_packets / self._total_packets) * 100
+                logger.info(
+                    f"[VAD] 🎤 AUDIO stats: pkts={self._total_packets} "
+                    f"voice={self._voice_packets} ({voice_pct:.1f}%) "
+                    f"silent={self._silent_packets}"
+                )
 
             await self.ws.send(audio_chunk)
         except Exception as e:
@@ -243,9 +269,23 @@ class Transcriber(STTProvider):
                 await asyncio.sleep(1.0) # Aggressive 1s heartbeat
                 if self._ws_is_open():
                     try:
+                        now = asyncio.get_event_loop().time()
+                        
+                        # [STT-SILENCE-FIX]: Deepgram Nova-2 can time out (1011) if NO audio is sent
+                        # even if JSON KeepAlives are flowing. If > 5s of silence, send a small 
+                        # 'audio keepalive' (zero frame) to force connection activity.
+                        if now - self._last_voice_timestamp > 5.0:
+                            # 160 bytes of zero/mulaw-silence = 20ms of audio
+                            silence_byte = b'\xff' if self.encoding == "mulaw" else b'\x00'
+                            keepalive_audio = silence_byte * 160
+                            await self.ws.send(keepalive_audio)
+                            self._last_voice_timestamp = now # Reset so we don't spam audio
+                            logger.debug("[STT] Sent audio keepalive (silence window exceeded)")
+
                         await self.send_keepalive()
-                        self._last_heartbeat = asyncio.get_event_loop().time()
-                    except Exception:
+                        self._last_heartbeat = now
+                    except Exception as e:
+                        logger.debug(f"STT heartbeat sub-task failed: {e}")
                         break
         except asyncio.CancelledError:
             pass
@@ -271,6 +311,7 @@ class Transcriber(STTProvider):
         self._voice_packets = 0
         self._silent_packets = 0
         self._last_voice_timestamp = 0.0
+        self._prev_was_voice = False
 
     async def close(self):
         self._is_listening = False

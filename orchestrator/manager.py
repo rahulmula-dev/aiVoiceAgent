@@ -722,8 +722,23 @@ class VoiceOrchestrator:
                     self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
                 )
                 return
+            elif current_state == CallState.TRANSCRIBING:
+                # [BARGE-IN FIX]: Dev-Phone / environments that don't send Twilio VAD 'speech' events
+                # never flip state SPEAKING -> INTERRUPTED before the STT final arrives.
+                # By the time we reach here, state has already raced to TRANSCRIBING, but the
+                # response_task is still running (TTS may still be streaming buffered audio).
+                # We must stop TTS output now and answer the user's actual question.
+                logger.info(f">>> LATE BARGE-IN (state=TRANSCRIBING): Stopping residual TTS for: '{raw_text}'")
+                partial_text = self.synthesizer.stop_current_speech(self.sid)
+                self._create_task_with_log(self._send_clear_message())
+                if self.session:
+                    self.session_manager.save_session(self.session)
+                self.response_task = asyncio.create_task(
+                    self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
+                )
+                return
             else:
-                logger.debug("AI was only thinking/transcribing. Silently cancelling old task.")
+                logger.debug("AI was only thinking/processing. Silently cancelling old task.")
         # 3. Start Parallel Response Generation (Normal Flow)
         # S4-9: Context already updated above (before barge-in check). Log the snapshot here.
         if self.session:
@@ -1066,8 +1081,7 @@ class VoiceOrchestrator:
 
             if not sid:
                 logger.warning("WebSocket disconnected before Twilio start event. Triggering cleanup for early-exit CRM ticket.")
-                await self.cleanup()
-                return
+                return # finally block will call cleanup()
 
             # 🟢 ENTER SESSION CONTEXT (Pillar 3)
             # Use 'from' number extracted from Twilio if available
@@ -1180,7 +1194,7 @@ class VoiceOrchestrator:
                             # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
                             try:
                                 from stt.stt_pool import stt_pool, PooledTranscriber
-                                raw_stt = await stt_pool.acquire(timeout=1.0)
+                                raw_stt = await stt_pool.acquire(timeout=3.0)
                                 old_stt = self.transcriber
                                 self.transcriber = PooledTranscriber(stt_pool, raw_stt)
                                 self.transcriber.set_callback(self._on_transcript)
@@ -1377,13 +1391,21 @@ class VoiceOrchestrator:
             # Worker: Speaks chunks as they arrive from the brain
             async def tts_worker():
                 total_chars = 0
+                sentence_idx = 0
                 worker_start_time = time.time()
+                logger.info(f"[TTS-WORKER] Started trace={trace_id}")
                 try:
                     while True:
                         sentence = await audio_queue.get()
                         if sentence is None: break
+                        sentence_idx += 1
                         total_chars += len(sentence)
-                        
+                        sentence_start_time = time.time()
+                        logger.info(
+                            f"[TTS-WORKER] Sentence #{sentence_idx} start: "
+                            f"chars={len(sentence)} total_so_far={total_chars} trace={trace_id}"
+                        )
+
                         # STATE: Speaking
                         self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
                         
@@ -1424,19 +1446,29 @@ class VoiceOrchestrator:
                             if hasattr(self.synthesizer, 'play_fallback_audio'):
                                 await self.synthesizer.play_fallback_audio(self.websocket, streamSid=self.sid)
                             
+                        sentence_elapsed_ms = int((time.time() - sentence_start_time) * 1000)
+                        logger.info(
+                            f"[TTS-WORKER] Sentence #{sentence_idx} complete: "
+                            f"elapsed={sentence_elapsed_ms}ms chars={len(sentence)} trace={trace_id}"
+                        )
                         audio_queue.task_done()
-                    
+
                     # Calculate estimated playback duration (approx 10 chars per sec for natural TTS)
                     estimated_play_time = total_chars / 10.0
                     time_spent_generating = time.time() - worker_start_time
                     remaining_time = estimated_play_time - time_spent_generating
-                    
+                    logger.info(
+                        f"[TTS-WORKER] All {sentence_idx} sentence(s) streamed: "
+                        f"total_chars={total_chars} estimated_play={estimated_play_time:.1f}s "
+                        f"gen_time={time_spent_generating:.1f}s sync_sleep={max(0, remaining_time):.1f}s "
+                        f"trace={trace_id}"
+                    )
                     if remaining_time > 0:
-                        logger.debug(f"Audio streamed to client. Sleeping {remaining_time:.1f}s to align with client playback.")
+                        logger.debug(f"[TTS-WORKER] Sleeping {remaining_time:.1f}s to align with client playback.")
                         await asyncio.sleep(remaining_time)
                 except asyncio.CancelledError:
-                    logger.debug("TTS Worker Cancelled.")
-                    
+                    logger.info(f"[TTS-WORKER] Cancelled mid-stream (sentence #{sentence_idx}) trace={trace_id}")
+
                 finally:
                     self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
                     # Back to Listening when done speaking (if not escalated)
@@ -1445,6 +1477,10 @@ class VoiceOrchestrator:
                         self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
                         # Reset interaction time so silence monitor starts counting from NOW
                         self.last_interaction_time = time.time()
+                    logger.info(
+                        f"[TTS-WORKER] Done. final_state={self.state.get_state().value} "
+                        f"sentences={sentence_idx} total_chars={total_chars} trace={trace_id}"
+                    )
 
             worker_task = asyncio.create_task(tts_worker())
             
@@ -1485,25 +1521,22 @@ class VoiceOrchestrator:
                     # Task 3 & 4: Early Latency Check (Before RAG/LLM)
                     self._latency_alert_emitted = False
                     if turn_start_time:
-                         current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
-                         # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-                         # Uncomment and use these values when deployed in US-East for <5s rules:
-                         # if current_turn_elapsed > 3.0: logger.warning(...)
-                         # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
+                        current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
+                        # --- [DYNAMIC ENVIRONMENT-AWARE CIRCUIT BREAKER] ---
+                        from contracts.config import config
+                        CERTAINTY_BUDGET = config.turn_latency_circuit_break_s
+                        
+                        if current_turn_elapsed > (CERTAINTY_BUDGET * 0.6):
+                            sid = self.session.session_id if self.session else "unknown"
+                            logger.warning(f"[LATENCY_ALERT] Pressure detected | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
+                            self._latency_alert_emitted = True
+                            
+                            if self.call_logger:
+                                self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": CERTAINTY_BUDGET*0.6, "status": "warning"})
 
-                         # --- [LOCAL TESTING TIMERS] ---
-                         if current_turn_elapsed > 20.0:
-                             sid = self.session.session_id if self.session else "unknown"
-                             logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | {sid} | Elapsed: {current_turn_elapsed:.2f}s")
-                             self._latency_alert_emitted = True
-                             
-                             # 🟢 COMPLIANCE: formal 'Alert Payload' for monitoring hooks (Prometheus/CW Alerts)
-                             if self.call_logger:
-                                 self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
-
-                         if current_turn_elapsed > 35.0:
-                             logger.error(f"[LATENCY_CIRCUIT_BREAK] Pre-generation latency exceeded 35s: {current_turn_elapsed:.2f}s. Breaking call to prevent 'Dead Air'.")
-                             raise LatencyBreachError(f"High pre-generation delay: {current_turn_elapsed:.2f}s")
+                        if current_turn_elapsed > CERTAINTY_BUDGET:
+                            logger.error(f"[LATENCY_CIRCUIT_BREAK] Pre-generation latency exceeded budget: {current_turn_elapsed:.2f}s. Breaking call to prevent 'Dead Air'.")
+                            raise LatencyBreachError(f"High pre-generation delay: {current_turn_elapsed:.2f}s")
 
                     # Extract Caller Number for Auto-ID
                     caller_num = self.session.caller_number if self.session else "unknown"
@@ -1542,23 +1575,23 @@ class VoiceOrchestrator:
                         if hasattr(self.session, 'prefetched_context_task'):
                             self.session.prefetched_context_task = None
                         # --- LATENCY ENFORCEMENT (Task 3 & 4) ---
+                        # --- [DYNAMIC ENVIRONMENT-AWARE CIRCUIT BREAKER] ---
+                        from contracts.config import config
+                        CERTAINTY_BUDGET = config.turn_latency_circuit_break_s
+
                         if turn_start_time:
                             current_turn_elapsed = asyncio.get_event_loop().time() - turn_start_time
                             
-                            # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-                            # if current_turn_elapsed > 3.0: ...
-                            # if current_turn_elapsed > 5.0: raise LatencyBreachError(...)
-
-                            # --- [LOCAL TESTING TIMERS] ---
-                            # 🟢 Circuit Break ceiling
-                            if current_turn_elapsed > 35.0:
-                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                             # 🟢 Alert for auto-scaling hook
-                            if current_turn_elapsed > 20.0 and not self._latency_alert_emitted:
-                                logger.warning(f"[LATENCY_ALERT] SUSTAINED_PRESSURE_LOCAL_TESTING | Elapsed: {current_turn_elapsed:.1f}s")
+                            if current_turn_elapsed > (CERTAINTY_BUDGET * 0.6) and not self._latency_alert_emitted:
+                                logger.warning(f"[LATENCY_ALERT] Pressure detected | Elapsed: {current_turn_elapsed:.1f}s")
                                 self._latency_alert_emitted = True
                                 if self.call_logger:
-                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": 20.0, "status": "warning"})
+                                    self.call_logger.log_event("alert", "sustained_latency_pressure", latency_ms=int(current_turn_elapsed*1000), meta={"threshold": CERTAINTY_BUDGET*0.6, "status": "warning"})
+                                
+                            # 🟢 Circuit Break ceiling
+                            if current_turn_elapsed > CERTAINTY_BUDGET:
+                                raise LatencyBreachError(f"Turn processing timed out at {current_turn_elapsed:.2f}s")
                                 
 
                         self.session.touch()
@@ -2006,25 +2039,27 @@ class VoiceOrchestrator:
         next 10-20s silence -> prompt #2
         continued silence -> termination
         """
-        logger.debug("Starting Silence Monitor")
+        logger.info("[SILENCE-TIMER] Monitor started")
+        _last_tick_log = 0.0
         try:
             while not self.stop_event.is_set():
                 await asyncio.sleep(1)
-                
+
                 # 1. State Guard: DO NOT count silence while AI is busy.
                 # If we are speaking, thinking, or transcribing, the user is 'interacting' or waiting.
                 # Includes INTERRUPTED, RETRIEVAL, and VALIDATION states.
                 current_call_state = self.state.get_state()
                 if current_call_state in [
-                    CallState.SPEAKING, 
-                    CallState.INTENT_EVAL, 
-                    CallState.TRANSCRIBING, 
-                    CallState.ESCALATION, 
-                    CallState.RETRIEVAL, 
+                    CallState.SPEAKING,
+                    CallState.INTENT_EVAL,
+                    CallState.TRANSCRIBING,
+                    CallState.ESCALATION,
+                    CallState.RETRIEVAL,
                     CallState.RESPONSE_VALIDATION
                 ]:
                     # Keep the 'interaction' timestamp fresh so we don't 'timeout' mid-thought.
                     self.last_interaction_time = time.time()
+                    logger.debug(f"[SILENCE-TIMER] Suppressed (state={current_call_state.value}), resetting timer")
                     continue
 
                 # 2. Maximum Session Limit check (6 minutes)
@@ -2091,13 +2126,21 @@ class VoiceOrchestrator:
 
                 # 2. Silence Stage Logic
                 silence_gap = time.time() - self.last_interaction_time
-                
+
+                # Periodic tick log every 5s so gaps are always visible in logs
+                _now = time.time()
+                if _now - _last_tick_log >= 5.0:
+                    logger.debug(
+                        f"[SILENCE-TIMER] Tick: gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}"
+                    )
+                    _last_tick_log = _now
+
                 # [SILENCE-ISS-158] Contextual Silence Machine
                 # Stage 0 → 1: First warning at 10s (fires before phoneme path's 16s)
                 # Stage 1 → 2: Second warning after another 10s
                 # Stage 2 → 3: Termination after another 10s
                 if silence_gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"Silence Stage 1 (Warning) triggered (Gap: {silence_gap:.1f}s)")
+                    logger.info(f"[SILENCE-TIMER] FIRE stage=1 (first warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 1
                     self.last_interaction_time = time.time() # Reset timer for next stage
                     msg = PRDScripts.SILENCE_1
@@ -2105,7 +2148,7 @@ class VoiceOrchestrator:
 
                 # Stage 2: Secondary Warning
                 elif silence_gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"Silence Stage 2 (Secondary Warning) triggered (Gap: {silence_gap:.1f}s)")
+                    logger.info(f"[SILENCE-TIMER] FIRE stage=2 (second warning) gap={silence_gap:.1f}s")
                     self.silence_stage = 2
                     self.last_interaction_time = time.time()
                     msg = PRDScripts.SILENCE_2
@@ -2113,16 +2156,16 @@ class VoiceOrchestrator:
 
                 # Stage 3: Termination
                 elif silence_gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"Silence Stage 3 (Termination) triggered (Total: 30s)")
+                    logger.warning(f"[SILENCE-TIMER] FIRE stage=3 (termination) gap={silence_gap:.1f}s total≈30s")
                     await self._trigger_silence_termination()
                     break
 
         except asyncio.CancelledError:
-            logger.debug("Silence Monitor cancelled")
+            logger.info("[SILENCE-TIMER] Monitor cancelled")
         except Exception as e:
-            logger.error(f"Error in Silence Monitor: {e}", exc_info=True)
+            logger.error(f"[SILENCE-TIMER] Error in monitor: {e}", exc_info=True)
         finally:
-            logger.debug("Silence Monitor loop exited.")
+            logger.info("[SILENCE-TIMER] Monitor stopped")
 
     async def _trigger_silence_termination(self):
         """

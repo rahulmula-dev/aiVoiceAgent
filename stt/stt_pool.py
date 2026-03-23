@@ -22,7 +22,9 @@ async def check_health_transcriber(transcriber: Transcriber) -> bool:
     try:
         if not transcriber or not transcriber._ws_is_open():
             return False
-        # CRITICAL: Verify the _listen loop hasn't crashed.
+        # CRITICAL: Reject if error has occurred or listen loop crashed
+        if getattr(transcriber, '_has_critical_error', False):
+            return False
         if not getattr(transcriber, '_is_listening', False):
             return False
         # Send a Deepgram KeepAlive metadata event
@@ -38,6 +40,8 @@ def reset_transcriber(transcriber: Transcriber):
     if transcriber:
         transcriber.reset_state()
 
+from contracts.config import config
+
 # Global Singleton Pool
 stt_pool = WebSocketPool(
     name="Deepgram_STT_Pool",
@@ -45,8 +49,8 @@ stt_pool = WebSocketPool(
     close_connection_func=close_transcriber,
     health_check_func=check_health_transcriber,
     reset_connection_func=reset_transcriber,
-    pool_size=int(os.getenv("DEEPGRAM_POOL_SIZE", "30")),
-    min_connections=int(os.getenv("DEEPGRAM_MIN_CONNECTIONS", "10")),
+    pool_size=config.stt_pool_size,
+    min_connections=config.stt_min_connections,
     health_check_interval_s=5  # Reduced to 5s to stay well within Deepgram's silence window (net0001)
 )
 
