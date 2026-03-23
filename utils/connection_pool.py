@@ -80,40 +80,78 @@ class WebSocketPool:
 
     async def acquire(self, timeout: float = 5.0) -> Any:
         start_time = time.time()
-        try:
-            # PRD §5: Check health but minimize mid-call delay
-            while True:
-                # Use remaining time so the overall acquire respects the timeout
-                elapsed = time.time() - start_time
-                remaining = timeout - elapsed
-                if remaining <= 0:
-                    raise asyncio.TimeoutError()
+        attempts = 0
+        max_pool_retries = 1 # Retry once before giving up
+        
+        while attempts <= max_pool_retries:
+            try:
+                # PRD §5: Check health but minimize mid-call delay
+                # Use a local start time for this specific attempt's timeout logic
+                attempt_start = time.time()
+                while True:
+                    # Use remaining time so the overall acquire respects the timeout
+                    elapsed = time.time() - attempt_start
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
 
-                conn = await asyncio.wait_for(self._pool.get(), timeout=remaining)
-                # Verify health before handing out
-                if await self.health_check_func(conn):
-                    self._active_connections.add(conn)
-                    self._checkout_times[conn] = asyncio.get_event_loop().time()
+                    conn = await asyncio.wait_for(self._pool.get(), timeout=remaining)
+                    # Verify health before handing out
+                    if await self.health_check_func(conn):
+                        self._active_connections.add(conn)
+                        self._checkout_times[conn] = asyncio.get_event_loop().time()
 
-                    # Emit wait time metric
-                    wait_time_ms = (time.time() - start_time) * 1000
-                    self._emit_metrics(wait_time_ms)
+                        # Emit wait time metric
+                        wait_time_ms = (time.time() - start_time) * 1000
+                        self._emit_metrics(wait_time_ms)
+                        logger.info(
+                            f"[{self.name}] [POOL-ACQUIRE] wait={wait_time_ms:.1f}ms "
+                            f"active={len(self._active_connections)} idle={self._pool.qsize()}"
+                        )
+                        return conn
+                    else:
+                        # Drop dead connection and try next one if time permits
+                        logger.warning(f"[{self.name}] Dropped dead connection from pool during acquire")
+                        asyncio.create_task(self._replace_connection(conn))
+                        # Loop will try to get another one until timeout expires
+            except (asyncio.TimeoutError, PoolExhaustedError):
+                attempts += 1
+                if attempts <= max_pool_retries:
+                    # Smart Wait: only sleep if we have enough budget left for a retry
+                    elapsed_so_far = time.time() - start_time
+                    if elapsed_so_far < timeout:
+                        wait_time = min(1.0, timeout - elapsed_so_far)
+                        logger.warning(f"[{self.name}] Pool exhausted. Retrying in {wait_time:.1f}s (Attempt {attempts}/{max_pool_retries})")
 
-                    return conn
-                else:
-                    # Drop dead connection and try next one if time permits
-                    logger.warning(f"[{self.name}] Dropped dead connection from pool during acquire")
-                    asyncio.create_task(self._replace_connection(conn))
-                    # Loop will try to get another one until timeout expires
-        except asyncio.TimeoutError:
-            logger.warning(f"[{self.name}] Pool exhausted, acquire timed out after {timeout}s")
-            self._emit_metrics((time.time() - start_time) * 1000)
-            raise PoolExhaustedError(f"Pool {self.name} exhausted after {timeout}s")
+                        # Emit retry metric
+                        prefix = "stt_pool" if "STT" in self.name or "Deepgram" in self.name else "tts_pool"
+                        logger.info(f"[METRIC] {prefix}_acquire_retry_count=1")
+
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.warning(f"[{self.name}] Pool exhausted. No time for retry.")
+                        # Move to final raise by breaking outer loop logic
+                        attempts = max_pool_retries + 1
+
+                if attempts > max_pool_retries:
+                    logger.warning(f"[{self.name}] Pool exhausted after {attempts-1} attempts and {timeout}s total timeout.")
+                    self._emit_metrics((time.time() - start_time) * 1000)
+                    raise PoolExhaustedError(f"Pool {self.name} exhausted after {attempts-1} attempts.")
+            except Exception as e:
+                logger.error(f"[{self.name}] Unexpected error during acquire: {e}")
+                raise
 
     async def release(self, conn: Any):
+        held_ms = 0.0
+        if conn in self._checkout_times:
+            held_ms = (asyncio.get_event_loop().time() - self._checkout_times[conn]) * 1000
         if conn in self._active_connections:
             self._active_connections.discard(conn)
             self._checkout_times.pop(conn, None)
+        logger.info(
+            f"[{self.name}] [POOL-RELEASE] held={held_ms:.0f}ms "
+            f"active={len(self._active_connections)} idle={self._pool.qsize()}"
+        )
             
         # Reset state on return
         self.reset_connection_func(conn)
@@ -138,7 +176,10 @@ class WebSocketPool:
                 try:
                     self._pool.put_nowait(conn)
                     self.replacement_count += 1
-                    logger.info(f"[{self.name}] Replaced dead connection")
+                    logger.info(
+                        f"[{self.name}] [POOL-RECONNECT] Dead connection replaced "
+                        f"(total_replacements={self.replacement_count} idle={self._pool.qsize()})"
+                    )
                 except asyncio.QueueFull:
                     await self.close_connection_func(conn)
         except Exception as e:
@@ -180,22 +221,32 @@ class WebSocketPool:
     async def _lease_monitor(self):
         """
         Antigravity Mechanism: Sweeps orphaned connections (WS-03).
-        Runs every 60s to reclaim connections held for > 300s.
+        Runs every 30s to reclaim connections held for > 300s (safety threshold).
         """
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
             now = asyncio.get_event_loop().time()
             expired = []
             
+            # Prune active connections that have exceeded the lease time
+            # 1200.0s (20 mins) is the hard ceiling for a single call's resource hold
+            # to prevent killing valid long-running conversations.
+            lease_limit = 1200.0
+            
             for conn in list(self._active_connections):
                 checkout_time = self._checkout_times.get(conn)
-                if checkout_time and (now - checkout_time) > 300:
+                if checkout_time and (now - checkout_time) > lease_limit:
                     expired.append(conn)
             
             for conn in expired:
-                logger.error(f"[{self.name}] LEASE EXPIRED for connection held for >300s. Force-reclaiming.")
-                # Force release
+                logger.error(f"[{self.name}] LEASE EXPIRED for connection held for >{lease_limit}s. Force-reclaiming.")
+                # Force release and close
                 await self.release(conn)
+                # Ensure it's truly gone even if release() fails to put it in pool
+                if conn in self._active_connections:
+                    self._active_connections.discard(conn)
+                    self._checkout_times.pop(conn, None)
+                    await self.close_connection_func(conn)
 
     def _emit_metrics(self, wait_time_ms: float = 0.0):
         active = len(self._active_connections)
@@ -208,6 +259,12 @@ class WebSocketPool:
         # Telemetry per PRD
         logger.info(f"[METRIC] {prefix}_active_{session_str}={active}")
         logger.info(f"[METRIC] {prefix}_idle_{session_str}={idle}")
+        
+        # Utilization Logic
+        total = active + idle
+        utilization = (active / self.pool_size * 100) if self.pool_size > 0 else 0
+        logger.info(f"[METRIC] {prefix}_utilization_pct={utilization:.1f}")
+        
         logger.info(f"[METRIC] {prefix}_replacement_count={self.replacement_count}")
         if wait_time_ms > 0:
             logger.info(f"[METRIC] {prefix}_wait_time_ms={wait_time_ms:.2f}")

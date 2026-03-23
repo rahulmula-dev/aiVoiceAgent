@@ -80,11 +80,10 @@ class Synthesizer(TTSEngine):
                     # Convert to manual iterator to enforce TTFA on the first byte only
                     stream_iter = response.aiter_bytes(chunk_size=1024).__aiter__()
                     
-                    # --- [PRODUCTION / DEPLOYMENT TIMERS - STRICT PRD] ---
-                    # TTFA_BUDGET = 0.3 
+                    # --- [DYNAMIC ENVIRONMENT-AWARE BUDGETS] ---
+                    from contracts.config import config
+                    TTFA_BUDGET = config.ttfa_budget
                     
-                    # --- [LOCAL TESTING TIMERS] ---
-                    TTFA_BUDGET = 15.0  # 15s TTFA ceiling (network-resilient for local dev/testing)
                     try:
                         # Calculate remaining budget for TTFA
                         elapsed = asyncio.get_event_loop().time() - start_ttfa

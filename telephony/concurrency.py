@@ -22,9 +22,10 @@ except Exception as e:
     logger.error(f"Failed to connect to Redis: {e}")
     redis_client = None
 
+from contracts.config import config
 COUNTER_KEY = "active_inbound_calls"
 ACTIVE_SIDS_KEY = "active_call_sids"
-MAX_INBOUND_CALLS = 30
+MAX_INBOUND_CALLS = config.max_inbound_calls
 TTL_SECONDS = 3600  # 1 hour safety TTL
 
 # Lua script for atomic conditional increment:
