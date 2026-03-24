@@ -994,9 +994,20 @@ class VoiceOrchestrator:
             logger.error(f"Error in speak_immediate_response: {e}")
         finally:
             self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
-            # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
-            if not is_cancelled and self.state.get_state() != CallState.CALL_END:
-                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            
+            # [GOVERNANCE] Auto-terminate if the response concludes the call
+            import string
+            normalized_text = text.strip().lower().rstrip(string.punctuation).strip()
+            
+            if not is_cancelled and normalized_text.endswith("goodbye"):
+                logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in immediate response. Initiating graceful shutdown.")
+                # We skip resetting to LISTENING since we are hanging up
+                self._create_task_with_log(self._delayed_call_end(delay=1.0))
+            else:
+                # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
+                if not is_cancelled and self.state.get_state() != CallState.CALL_END:
+                    self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            
             self.last_interaction_time = time.time()
 
     async def _send_clear_message(self):
@@ -1738,6 +1749,14 @@ class VoiceOrchestrator:
 
                 await audio_queue.put(None)
                 await worker_task
+                
+                # [GOVERNANCE] Auto-terminate if the response concludes the call
+                if full_ai_text:
+                    import string
+                    normalized_text = full_ai_text.strip().lower().rstrip(string.punctuation).strip()
+                    if normalized_text.endswith("goodbye"):
+                        logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in AI response. Initiating graceful shutdown.")
+                        self._create_task_with_log(self._delayed_call_end(delay=1.0))
                 
             except asyncio.CancelledError:
                 logger.debug("generate_and_speak cancelled. Cleaning up worker...")
