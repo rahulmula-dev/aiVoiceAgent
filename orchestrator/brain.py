@@ -537,7 +537,7 @@ class Brain(LLMEngine):
                         contents=history,
                         stream=True
                     )
-                    
+
                     # B. Use iterator to enforce TTFT on the FIRST chunk
                     stream_iter = response_stream.__aiter__()
                     first_chunk_received = False
@@ -552,13 +552,13 @@ class Brain(LLMEngine):
                             else:
                                 # Normal streaming for subsequent chunks
                                 chunk = await stream_iter.__anext__()
-                            
+
                             # Process the chunk
                             if not chunk.candidates: continue
                             candidate = chunk.candidates[0]
                             if candidate.finish_reason not in [0, 1]: continue
                             if not candidate.content.parts: continue
-                            
+
                             for part in candidate.content.parts:
                                 if hasattr(part, 'text') and part.text:
                                     text_chunk = part.text.replace("*", "")
@@ -588,7 +588,7 @@ class Brain(LLMEngine):
                             if final_sentence:
                                 full_ai_text += final_sentence
                                 yield (final_sentence, sent_metadata)
-                            
+
                             # Append to history and RETURN (Success)
                             if full_ai_text.strip():
                                 history.append({"role": "model", "parts": [full_ai_text.strip()]})
@@ -598,7 +598,7 @@ class Brain(LLMEngine):
 
                         except Exception as e:
                             if "429" in str(e) or "quota" in str(e).lower() or "ResourceExhausted" in str(type(e)):
-                                logger.warning(f"Gemini Quota Exceeded for {active_model_name}: {e}")
+                                logger.error(f"[QUOTA] Gemini rate limit hit for {active_model_name}: {e}")
                                 if model_attempt == 0:
                                     break # Trigger fallback
                                 yield (PRDScripts.APOLOGY_FATAL, {"error": "quota_exhausted"})
@@ -607,8 +607,8 @@ class Brain(LLMEngine):
 
                 except Exception as attempt_err:
                     if model_attempt == 0:
-                         logger.warning(f"[FALLBACK] Primary model initialization error: {attempt_err}. Retrying...")
-                         continue
+                        logger.warning(f"[FALLBACK] Primary model initialization error: {attempt_err}. Retrying...")
+                        continue
                     logger.error(f"Critical LLM Failure on fallback model: {attempt_err}")
                     yield (PRDScripts.APOLOGY_FATAL, {"error": str(attempt_err)})
                     return
@@ -621,6 +621,7 @@ class Brain(LLMEngine):
                 history.pop()
 
             if "429" in str(e) or "quota" in str(e).lower():
+                logger.error(f"[QUOTA] Gemini quota error caught in outer handler. Error: {e}")
                 yield (PRDScripts.APOLOGY_OVERLOADED, {"error": "quota_error_msg"})
             elif "404" in str(e):
                 yield (PRDScripts.APOLOGY_STRUCTURAL_UPDATE, {"error": "model_not_found"})

@@ -165,6 +165,8 @@ class ResponsePolicyEngine:
         "name", "time", "year", "week", "month", "day", "number", "phone", "email",
         "something", "anything", "nothing", "someone", "anyone", "everyone",
         "now", "today", "doing", "going", "waiting", "listening", "speaking",
+        "gmail", "great", "sure", "maybe", "logic", "uh", "um", "hmm", "ah", "mhm",
+        "so", "yeah", "thank", "thanks", "wait", "welcome",
         # College-specific domain
         "admission", "admissions", "course", "courses", "college", "fees", "fee", "cost",
         "available", "program", "programs", "certificate", "diploma", "degree",
@@ -179,17 +181,39 @@ class ResponsePolicyEngine:
         "internship", "graduation", "alumni", "transcript", "enrollment", "enroll",
         "enrolled", "join", "joining", "registration", "exam", "test", "grade",
         "morning", "afternoon", "evening", "night",
-        "continue", "restart", "give", "list", "people", "india",
-        "africa", "america", "visa", "status",
-        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage",
+        "continue", "restart", "give", "list", "kill", "people", "common", "india",
+        "us", "africa", "america", "visa", "status",
+        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage", "esthetics",
         "business", "marketing", "portfolio", "interview", "preparation",
-        "skills", "mission", "vision", "values", "career", "vocational",
+        "gender", "genders", "skills", "mission", "vision", "values", "career", "vocational",
         "issue", "question", "help", "know", "about", "speak", "call",
-        "gmail", "logic", "empower", "financial", "independence",
+        "empower", "empowers", "empowering", "financial", "independence",
         "requirement", "requirements", "specific", "international", "aid",
         "instructor", "instructors", "professor", "professors", "department",
         "facility", "workshop", "qualification", "examination", "assessment",
-        "results", "approvals", "measured",
+        "results", "approvals", "measured", "payments", "timetable", "laboratory",
+        # Common English verbs frequently used in questions
+        "explain", "explained", "describing", "describe", "offer", "offers", "offered", "providing", "provide", "provided",
+        "compare", "comparing", "choose", "choosing", "select", "selecting", "find", "finding", "complete", "completing",
+        "understand", "understanding", "look", "looking", "think", "thinking", "try", "trying", "make", "making",
+        "take", "taking", "come", "coming", "say", "saying", "use", "using",
+        "seem", "seeming", "feel", "feeling", "work", "working", "read", "reading", "change", "changing",
+        "show", "showing", "hear", "hearing", "consider", "considering", "check", "checking", "include", "including",
+        # Common English prepositions and connectives
+        "between", "among", "before", "after", "during", "while", "though", "although", "because", "also",
+        "then", "than", "until", "unless", "since", "within", "without", "through", "against", "along",
+        # Common English adjectives and adverbs
+        "quite", "high", "actually", "very", "much", "many", "little", "few", "most", "none", "only", "just", "really",
+        "almost", "already", "soon", "often", "sometimes", "always", "never", "again", "together", "probably",
+        "definitely", "basically", "literally", "honestly", "personally", "totally", "absolutely", "entirely",
+        "completely", "mostly", "partially", "slightly", "fairly", "pretty", "rather", "somewhat", "instead", "otherwise",
+        "meanwhile", "anyway", "besides", "moreover", "furthermore", "however", "nevertheless", "nonetheless", "therefore",
+        "consequently", "accordingly", "thus", "hence", "namely", "specifically", "especially", "particularly", "notably", "primarily", "mainly", "largely",
+        "different", "difference", "similar", "full", "part", "both", "either", "neither", "several",
+        "enough", "early", "late", "long", "short", "free", "open", "close", "right", "left", "own",
+        "could", "should", "will", "shall", "might", "must", "let",
+        # Common modifiers and filler words used in spoken English
+        "interested", "wondering", "wanted", "needed", "hoping", "planning",
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -212,14 +236,12 @@ class ResponsePolicyEngine:
         [GOVERNANCE] Bulletproof Failsafe English Detection (Expert Debugger Version).
         Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
         """
-        # 0. DEPRECATED: Authoritative STT Metadata Guard 
-        # [REMOVED] This hard gate was blocking short English phrases (e.g. "Wait") 
-        # when STT incorrectly guessed a foreign language. Using density checks below instead.
-        pass
-            
         import re
         import logging
-        from langdetect import detect_langs
+        from langdetect import detect_langs, DetectorFactory
+        # Make langdetect deterministic — without this, results vary between runs/machines
+        # (EC2 vs local), causing English sentences to randomly get language strikes.
+        DetectorFactory.seed = 0
         policy_logger = logging.getLogger("Policy")
 
         text = text.strip()
@@ -247,9 +269,9 @@ class ResponsePolicyEngine:
         num_common = len(common_words_found)
         density = num_common / len(words)
         
-        # 1. Density Check: Strict thresholds for English-only enforcement.
-        # [FIX] Lowered from 0.85 to 0.60. 85% was too aggressive and blocked valid English 
-        # sentences that contained regular nouns, verbs, or names not in the 150-word whitelist.
+        # 1. Density Check: Threshold against COMMON_ENGLISH_WORDS.
+        # Lowered from 0.85 to 0.60. 85% was too aggressive and blocked valid English
+        # sentences that contained regular nouns, verbs, or names not in the whitelist.
         # We rely on langdetect (below) to catch Hinglish code-switching robustly.
         threshold = 0.60 if len(words) >= 3 else 0.40
         is_mixed_danger = density <= threshold  # <= catches exact-boundary cases like density=0.60
@@ -330,7 +352,9 @@ class ResponsePolicyEngine:
                 top = detected_langs[0]
                 
                 # PHASE 1 RULE: Any strong non-English detection is an immediate violation.
-                if top.lang != 'en' and top.prob >= 0.30:
+                # Threshold kept at 0.70: langdetect frequently gives 0.35-0.69 to
+                # English sentences with accents or domain-specific vocabulary, causing false strikes.
+                if top.lang != 'en' and top.prob >= 0.70:
                     # Only override if density is nearly perfect.
                     if density >= 0.90:
                         policy_logger.info(

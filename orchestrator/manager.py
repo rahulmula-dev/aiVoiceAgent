@@ -280,6 +280,11 @@ class VoiceOrchestrator:
                         meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE_EARLY"},
                     )
                 
+                # User WAS active (spoke something, even if non-English) — reset silence stage
+                # so that after the refusal plays the 30s silence clock starts fresh.
+                self.silence_stage = 0
+                self.last_interaction_time = time.time()
+
                 # Increment strike counter and persist to session as warning_count
                 self.language_strike_count += 1
                 if self.session:
@@ -565,6 +570,10 @@ class VoiceOrchestrator:
             
             # --- TASK 3.4: STRIKE TRACKING ---
             if intent == "HARD_REFUSAL_LANGUAGE":
+                # User was active (spoke something) — reset silence stage so the 30s silence
+                # clock starts fresh after the refusal plays, not from wherever it was before.
+                self.silence_stage = 0
+                self.last_interaction_time = time.time()
                 self.language_strike_count += 1
                 logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
 
@@ -1854,6 +1863,9 @@ class VoiceOrchestrator:
         self._cleanup_done = True
 
         sid = self.session.session_id if self.session else getattr(self, "_early_sid", "unknown")
+        # Log the full call stack so we can identify what triggered cleanup/CALL_END prematurely
+        import traceback
+        logger.warning(f"[CLEANUP] Triggered for session {sid}. Call stack:\n{''.join(traceback.format_stack())}")
         logger.info(f"Cleanup started for session {sid}.")
 
         # Reset wrap-up tracking so the orchestrator is clean for the next session

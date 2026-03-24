@@ -69,7 +69,10 @@ class FeatureConfig:
 
     @property
     def primary_model(self) -> str:
-        return os.getenv("PRIMARY_LLM_MODEL", "gemini-2.5-flash")
+        # Default changed from gemini-2.5-flash → gemini-2.0-flash.
+        # gemini-2.5-flash was returning 404 on EC2 (model not available on the API key/tier).
+        # Override via PRIMARY_LLM_MODEL env var if a newer model is available.
+        return os.getenv("PRIMARY_LLM_MODEL", "gemini-2.0-flash")
 
     @property
     def fast_model(self) -> str:

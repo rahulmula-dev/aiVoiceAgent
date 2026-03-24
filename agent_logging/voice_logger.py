@@ -28,6 +28,11 @@ class ContextFilter(logging.Filter):
         record.phone_number = ctx_phone_number.get()
         return True
 
+class NoWarningFilter(logging.Filter):
+    """Suppresses WARNING-level records; passes DEBUG, INFO, ERROR, CRITICAL."""
+    def filter(self, record):
+        return record.levelno != logging.WARNING
+
 class JSONFormatter(logging.Formatter):
     """
     Custom formatter to output logs in JSON format for production audit trails.
@@ -73,10 +78,12 @@ def setup_global_logging():
 
     # Create the context filter instance
     context_filter = ContextFilter()
+    no_warning_filter = NoWarningFilter()
 
     # 1. Console Handler (Live Debugging)
     c_handler = logging.StreamHandler()
     c_handler.addFilter(context_filter)  # Add filter to handler
+    c_handler.addFilter(no_warning_filter)
     c_format = logging.Formatter(
         '%(asctime)s | %(levelname)-8s | [%(session_id)s] [%(phone_number)s] | %(name)s | %(message)s'
     )
@@ -92,6 +99,7 @@ def setup_global_logging():
         encoding='utf-8'
     )
     f_handler.addFilter(context_filter)  # Add filter to handler
+    f_handler.addFilter(no_warning_filter)
     f_handler.setFormatter(JSONFormatter())
     root_logger.addHandler(f_handler)
 

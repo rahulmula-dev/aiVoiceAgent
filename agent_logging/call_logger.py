@@ -53,17 +53,21 @@ class CallLogger:
             "event": event_name,
             "call_id": self.call_id  # Auto-inject ID
         }
-        
+
         if latency_ms is not None:
             event_entry["latency_ms"] = latency_ms
-            
+
         if trace_id:
             event_entry["trace_id"] = trace_id
-            
+
         if meta:
             event_entry.update(meta)
-        
+
         self.events.append(event_entry)
+
+        # Emit to std_logging so component events appear in Docker logs and voice_agent.log
+        lat_str = f" latency={latency_ms}ms" if latency_ms is not None else ""
+        logger.debug(f"[{event_type}] {event_name}{lat_str} call={self.call_id}")
 
         # PRD [HIGH-P3-02]: Append-only event stream for crash resilience
         try:
