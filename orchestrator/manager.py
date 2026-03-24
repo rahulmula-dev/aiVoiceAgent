@@ -238,26 +238,33 @@ class VoiceOrchestrator:
         self._last_partial = ""
 
         if raw_text:
+            # ── DEEPGRAM LANGUAGE SIGNAL CHECK ─────────────────────────────
+            # When Deepgram's acoustic detection confirms a supported language,
+            # trust it over the mutation/confidence heuristics below. These
+            # heuristics were designed for the era before detect_language=true
+            # and can false-block low-confidence but valid English audio.
+            from contracts.policy import ResponsePolicyEngine
+            _dg_lang_normalised = ResponsePolicyEngine._normalise_lang_code(detected_lang) if detected_lang else None
+            _dg_confirms_supported = _dg_lang_normalised in self.config.supported_languages if _dg_lang_normalised else False
+
             # [MUTATION GUARD] Hindi hallucinations mutate partial content mid-stream
             # (words change, not just grow). Real English only accumulates words.
             # >= 2 mutations + conf < 0.85 + >= 4 words = hallucinated non-English.
+            # SKIPPED when Deepgram acoustic detection confirms a supported language.
             _mutation_guard_triggered = False
-            if _mutations >= 2 and confidence < 0.85 and len(raw_text.split()) >= 4:
+            if not _dg_confirms_supported and _mutations >= 2 and confidence < 0.85 and len(raw_text.split()) >= 4:
                 logger.warning(f"[GOVERNANCE] Transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
                 _mutation_guard_triggered = True
 
             # [CONF-LANG-GUARD] Nova-2 force-maps non-English phonemes to English words,
             # but always with LOW confidence. Real English scores 0.85+ consistently.
-            # Density limit is fixed at 0.80 — no escalation (prevents false positives on
-            # valid English with slightly low confidence due to phone audio quality).
-            # Only the confidence ceiling escalates slightly after each strike.
-            # Strike 0: conf<0.65  Strike 1: conf<0.73  Strike 2: conf<0.81
+            # SKIPPED when Deepgram acoustic detection confirms a supported language.
             _strikes = self.language_strike_count
             _conf_limit = min(0.65 + (_strikes * 0.08), 0.82)
             _density_limit = 0.80  # Fixed — never escalates
 
             _conf_guard_triggered = False
-            if not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
+            if not _dg_confirms_supported and not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
                 _words = re.findall(r'\b\w+\b', raw_text.lower())
                 if _words:
                     _common = sum(1 for w in _words if w in self.policy.COMMON_ENGLISH_WORDS)
@@ -368,26 +375,39 @@ class VoiceOrchestrator:
                     self.non_english_run_start = time.time()  # Fresh start for each new run
                 self.consecutive_empty_frames += 1
                 non_english_duration = time.time() - self.non_english_run_start
-                
-                logger.debug(f"[PHONEME] Empty frame #{self.consecutive_empty_frames}, run={non_english_duration:.1f}s")
-                
-                # ── DUAL CONDITION GATE ──────────────────────────────────────────────────────
+
+                logger.debug(f"[PHONEME] Empty frame #{self.consecutive_empty_frames}, run={non_english_duration:.1f}s, detected_lang={detected_lang}")
+
+                # ── DEEPGRAM FAST-PATH: Immediate refusal when acoustic detection ─────
+                # With detect_language=true, Deepgram may report the actual language
+                # even on empty transcripts. If it says non-English, fire immediately
+                # instead of waiting 16 seconds. Requires user_has_spoken and at least
+                # 2 frames (rules out single noise spikes).
+                from contracts.policy import ResponsePolicyEngine
+                _phoneme_dg_lang = ResponsePolicyEngine._normalise_lang_code(detected_lang) if detected_lang else None
+                _phoneme_dg_is_nonsupported = (
+                    _phoneme_dg_lang
+                    and _phoneme_dg_lang not in self.config.supported_languages
+                    and self.user_has_spoken
+                    and self.consecutive_empty_frames >= 2
+                )
+
+                # ── LEGACY ACCUMULATION GATE (fallback when detected_lang is None) ────
                 # Fire a language strike when:
-                #   1. At least 3 frames in this run (rules out a single noise spike)
-                #   2. Run has been active >= 6.0 seconds
-                #   3. [CRITICAL FIX] User has already spoken at least once.
-                #      If the user has NEVER spoken, empty frames are just normal silence
-                #      (e.g. they're listening to the greeting). Do NOT strike on that.
-                # ─────────────────────────────────────────────────────────────────────────────
-                # [GOVERNANCE]: Reverted to a high threshold (15s) for empty frames.
-                # Since silence monitor fires at 10s, this ensures that PURE silence 
-                # triggers the 'Are you still there?' prompt FIRST, rather than a language strike.
-                # A language strike will only fire if there is sustained ambiguous audio 
-                # that bypasses the silence check.
-                # Frame-rate guard: active non-English speech produces ~1 frame/2s.
-                # Pure silence produces ~1 frame/5s. Require ≥5 frames to rule out silence.
-                # Duration guard (16s) stays above the silence monitor's 10s first-warning.
-                if self.consecutive_empty_frames >= 5 and non_english_duration >= 16.0 and self.user_has_spoken:
+                #   1. At least 5 frames in this run (rules out noise spikes)
+                #   2. Run has been active >= 16 seconds
+                #   3. User has spoken at least once
+                # The 16s duration guard stays above the silence monitor's 10s warning
+                # so pure silence triggers 'Are you still there?' first.
+                _legacy_accumulation_triggered = (
+                    self.consecutive_empty_frames >= 5
+                    and non_english_duration >= 16.0
+                    and self.user_has_spoken
+                )
+
+                if _phoneme_dg_is_nonsupported or _legacy_accumulation_triggered:
+                        _trigger_method = f"deepgram_acoustic({_phoneme_dg_lang})" if _phoneme_dg_is_nonsupported else "phoneme_empty_accumulation"
+                        logger.warning(f"[GOVERNANCE] Phoneme strike triggered via {_trigger_method}")
                         # ── FORENSIC FIX: Route through PERMANENT STRIKE SYSTEM ────────────────
                         # Hindi/Bengali/Mandarin arrive as transcript='', confidence=0.0,
                         # speech_final=true because 8kHz mulaw cannot produce non-Latin phonemes.
@@ -402,7 +422,7 @@ class VoiceOrchestrator:
                             return
 
                         self.language_strike_count += 1
-                        logger.warning(f"[GOVERNANCE] Unrecognized-language speech detected (empty+0.0 frames). Strike: {self.language_strike_count}/3")
+                        logger.warning(f"[GOVERNANCE] Unrecognized-language speech detected ({_trigger_method}). Strike: {self.language_strike_count}/3")
 
                         # Persist warning_count on the session (phoneme path)
                         if self.session:
@@ -424,7 +444,7 @@ class VoiceOrchestrator:
                                 "chunks_used": [],
                                 "crm_hit": False,
                                 "governance_decision": "Blocked",
-                                "refusal_flags": {"strike_count": self.language_strike_count, "method": "phoneme_empty"}
+                                "refusal_flags": {"strike_count": self.language_strike_count, "method": _trigger_method}
                             }, trace_id=trace_id)
                             self.session.conversation_history.append({"role": "user", "parts": [f"[UNRECOGNIZED LANGUAGE SPEECH - Strike {self.language_strike_count}]"]})
                         
