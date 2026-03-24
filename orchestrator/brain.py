@@ -159,56 +159,61 @@ class Brain(LLMEngine):
                 logger.warning(f"[RACE] {name} failed: {e}")
                 raise
 
-        # 🟢 THE RACE
+        # 🟢 THE RACE — Primary starts first. Fast model is dispatched if primary is slow OR fails.
         primary_task = asyncio.create_task(_call_model(self.model, "Primary"))
-        
+        fast_task = None
+
         try:
-            # Wait for primary for 1.5s
-            done, pending = await asyncio.wait([primary_task], timeout=PRIMARY_HEAD_START)
-            
-            if primary_task in done:
+            # Wait for primary for up to PRIMARY_HEAD_START
+            done, _ = await asyncio.wait([primary_task], timeout=PRIMARY_HEAD_START)
+
+            primary_ok = primary_task in done and primary_task.exception() is None
+
+            if primary_ok:
                 response, winner = primary_task.result()
             else:
-                # Primary is taking too long (>1.5s). Dispatch Fast Model.
-                logger.info(f"[H1] Primary is slow (>1.5s). Dispatching {self.fast_model_name} as fallback.")
+                # Primary either timed out OR immediately failed (e.g. 429 rate limit).
+                # Dispatch fast model either way.
+                reason = "failed immediately" if primary_task in done else f"slow (>{PRIMARY_HEAD_START}s)"
+                logger.info(f"[H1] Primary {reason}. Dispatching {self.fast_model_name}.")
                 fast_task = asyncio.create_task(_call_model(self.fast_model, "FastFallback"))
-                
-                # Race primary vs fast for the remaining time
-                done, pending = await asyncio.wait(
-                    [primary_task, fast_task], 
+
+                # Race: remaining primary time + fast model
+                remaining = [t for t in [primary_task, fast_task] if not t.done()]
+                done2, pending2 = await asyncio.wait(
+                    remaining,
                     timeout=ABSOLUTE_CEILING - PRIMARY_HEAD_START,
                     return_when=asyncio.FIRST_COMPLETED
                 )
-                
-                # Find the first one that succeeded
+
                 success = None
                 winner = "None"
-                for task in done:
+                for task in done2:
                     try:
-                        response, winner = task.result()
-                        success = response
-                        break
-                    except:
+                        if task.exception() is None:
+                            response, winner = task.result()
+                            success = response
+                            break
+                    except Exception:
                         continue
-                
-                if success:
-                    response = success
-                    # Cancel the other one
-                    for task in pending:
-                        task.cancel()
-                else:
+
+                for task in pending2:
+                    task.cancel()
+
+                if not success:
                     raise asyncio.TimeoutError("All models in race failed or timed out.")
+                response = success
 
             # Process Winning Response
             text = response.text.strip()
             if text.startswith("```json"):
                 text = text.replace("```json", "", 1).replace("```", "", 1).strip()
             elif text.startswith("```"):
-                 text = text.replace("```", "", 1).replace("```", "", 1).strip()
+                text = text.replace("```", "", 1).replace("```", "", 1).strip()
 
             data = json.loads(text)
             logger.info(f"[RACE] Winner: {winner} | Topic: {data.get('topic')}")
-            
+
             return (
                 data.get("classification", "AMBIGUOUS"),
                 data.get("response", "I'm listening, please go ahead."),
@@ -220,13 +225,11 @@ class Brain(LLMEngine):
 
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"Barge-in race failed: {e}")
-            # Ensure cleanup
-            for task in [primary_task]:
-                if not task.done(): task.cancel()
-            if 'fast_task' in locals() and not fast_task.done():
-                fast_task.cancel()
-                
-            return "AMBIGUOUS", "I'm listening, please go ahead.", False, "Barge-in", "unknown", []
+            for task in [primary_task, fast_task]:
+                if task and not task.done():
+                    task.cancel()
+            # Return FAILED so handle_barge_in can route to the normal generate_and_speak path
+            return "FAILED", "", False, "Barge-in", "unknown", []
 
     async def generate_stream(self, text, history, caller_number=None, intent="unknown", trace_id=None, call_context=None, prefetched_context_task=None, degraded_mode=False):
         """
