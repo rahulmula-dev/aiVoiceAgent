@@ -234,20 +234,32 @@ class ResponsePolicyEngine:
             # Substring match for longer distinct terms
             return keyword in text
             
+    @staticmethod
+    def _normalise_lang_code(code: str) -> str:
+        """Normalise BCP-47 codes like 'en-US' → 'en' for comparison."""
+        return code.split("-")[0].lower() if code else ""
+
     def _is_english(self, text: str, detected_lang: str = None) -> bool:
         """
-        [GOVERNANCE] Bulletproof Failsafe English Detection.
+        [GOVERNANCE] Language gate — Phase 1: English-only.
         Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
 
-        Flow for multi-word (≥3 words): langdetect FIRST, density as fallback only.
-        This prevents false positives on valid English sentences with uncommon nouns
-        (e.g. "greenery outside the college" has density=0.50 but langdetect=en:0.99).
+        Detection priority:
+          1. Deepgram acoustic detection (detected_lang) — PRIMARY
+          2. Non-Latin script check                      — FAST-PATH
+          3. langdetect + density COMBINED                — SECONDARY (≥3 words)
+          4. Density fallback                             — TERTIARY (short inputs)
+
+        Phase 2: rename to _is_supported_language() and check against
+        config.supported_languages for multi-language support.
         """
         import re
         import logging
         from langdetect import detect_langs, DetectorFactory
         DetectorFactory.seed = 0
         policy_logger = logging.getLogger("Policy")
+        from contracts.config import config
+        supported = config.supported_languages  # Phase 1: ['en']
 
         text = text.strip()
         if not text:
@@ -294,20 +306,58 @@ class ResponsePolicyEngine:
                 policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
                 return False
 
-        # STT metadata: if STT explicitly detected a foreign language, handle it
-        if detected_lang and detected_lang != 'en':
-            if density >= 0.95:
-                policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) due to Near-Perfect Density ({density:.2f}): '{text}'")
-                return True
-            if len(words) <= 2:
-                if num_common >= 1:
-                    policy_logger.info(f"[GOVERNANCE] Overriding STT Metadata ({detected_lang}) for short English phrase: '{text}'")
+        # ── PRIMARY GATE: Deepgram acoustic language detection ─────────────
+        # With detect_language=true, Deepgram reports the language it detected
+        # at the audio/phoneme level. This is the most reliable signal because
+        # it operates on raw audio, not text that may be garbled by the
+        # English-only transcription model.
+        if detected_lang:
+            norm_lang = self._normalise_lang_code(detected_lang)
+
+            if norm_lang in supported:
+                # Deepgram confirms a supported language. Fast-track approve
+                # unless density is suspiciously low (garbled audio that
+                # Deepgram misidentified as English).
+                if density >= 0.40 or len(words) <= 2:
+                    policy_logger.debug(
+                        f"[GOVERNANCE] APPROVED by Deepgram (lang={norm_lang}, "
+                        f"density={density:.2f}): '{text}'"
+                    )
                     return True
-                if len(words) == 1 and words[0].isalpha():
-                    policy_logger.info(f"[GOVERNANCE] Permitting single alphabetical word (potential name/affirmation): '{text}'")
+                # Low density despite Deepgram saying English — fall through
+                # to secondary checks for additional validation.
+                policy_logger.info(
+                    f"[GOVERNANCE] Deepgram says '{norm_lang}' but density "
+                    f"is low ({density:.2f}). Running secondary checks: '{text}'"
+                )
+            else:
+                # Deepgram detected a NON-supported language at acoustic level.
+                # This is the strongest non-English signal. Only override for:
+                #   1. Near-perfect density (≥0.90) → likely accented English
+                #   2. Name-like inputs (≤2 alphabetical words)
+                if density >= 0.90:
+                    policy_logger.info(
+                        f"[GOVERNANCE] Overriding Deepgram lang='{norm_lang}' — "
+                        f"near-perfect English density ({density:.2f}): '{text}'"
+                    )
                     return True
-            policy_logger.warning(f"[GOVERNANCE] Blocked via STT Metadata ({detected_lang}) - Density: {density:.2f}: '{text}'")
-            return False
+
+                if is_name_like:
+                    policy_logger.info(
+                        f"[GOVERNANCE] Permitting name-like input despite "
+                        f"Deepgram lang='{norm_lang}': '{text}'"
+                    )
+                    return True
+
+                policy_logger.warning(
+                    f"[GOVERNANCE] BLOCKED by Deepgram (lang='{norm_lang}', "
+                    f"density={density:.2f}): '{text}'"
+                )
+                return False
+
+        # ── SECONDARY CHECKS (when Deepgram metadata is unavailable) ──────
+        # These run only when detected_lang is None OR when Deepgram said
+        # English but density was suspiciously low.
 
         # --- MULTI-WORD PATH (≥3 words): langdetect + density COMBINED ---
         # langdetect alone is unreliable for short colloquial English — it frequently

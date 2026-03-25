@@ -66,6 +66,7 @@ class Transcriber(STTProvider):
         return not getattr(self.ws, 'closed', True)
 
     async def connect(self):
+        from contracts.config import config
         _endpointing_ms = int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "800"))
         params = [
             f"model={self.model}",
@@ -74,8 +75,13 @@ class Transcriber(STTProvider):
             "interim_results=true",
             "smart_format=true",
             f"endpointing={_endpointing_ms}",
-            "language=multi",
+            f"language={config.deepgram_language}",
         ]
+        # Phase 1: detect_language=true with language=en gives us acoustic-level
+        # language detection while keeping the English transcription model.
+        # Phase 2: switch deepgram_language to 'multi' for multilingual transcription.
+        if config.deepgram_detect_language:
+            params.append("detect_language=true")
 
         domain = "api.deepgram.com"
         is_canadian = self.session_metadata.get("region") == "CA"
