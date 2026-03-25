@@ -246,7 +246,7 @@ class Transcriber(STTProvider):
                         f"[VAD] Voice activity START: energy={energy_ratio:.1%} "
                         f"pkt={self._total_packets} silent_run={self._silent_packets}"
                     )
-                else:
+                elif self._voice_packets % 100 == 0:
                     logger.debug(f"[VAD] Voice: energy={energy_ratio:.1%} pkt={self._total_packets}")
                 self._prev_was_voice = True
             else:
