@@ -296,7 +296,7 @@ class Transcriber(STTProvider):
                             keepalive_audio = silence_byte * 160
                             await self.ws.send(keepalive_audio)
                             self._last_voice_timestamp = now # Reset so we don't spam audio
-                            logger.debug("[STT] Sent audio keepalive (silence window exceeded)")
+                            # Suppressed per-instance keepalive log — 30 idle connections generate ~10 lines/sec
 
                         await self.send_keepalive()
                         self._last_heartbeat = now

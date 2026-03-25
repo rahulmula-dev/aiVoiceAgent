@@ -256,18 +256,18 @@ class WebSocketPool:
         prefix = "stt_pool" if "STT" in self.name or "Deepgram" in self.name else "tts_pool"
         session_str = "connections" if prefix == "stt_pool" else "sessions"
         
-        # Telemetry per PRD
-        logger.info(f"[METRIC] {prefix}_active_{session_str}={active}")
-        logger.info(f"[METRIC] {prefix}_idle_{session_str}={idle}")
-        
+        # Telemetry per PRD (debug-level to avoid log noise every health-check cycle)
+        logger.debug(f"[METRIC] {prefix}_active_{session_str}={active}")
+        logger.debug(f"[METRIC] {prefix}_idle_{session_str}={idle}")
+
         # Utilization Logic
         total = active + idle
         utilization = (active / self.pool_size * 100) if self.pool_size > 0 else 0
-        logger.info(f"[METRIC] {prefix}_utilization_pct={utilization:.1f}")
-        
-        logger.info(f"[METRIC] {prefix}_replacement_count={self.replacement_count}")
+        logger.debug(f"[METRIC] {prefix}_utilization_pct={utilization:.1f}")
+
+        logger.debug(f"[METRIC] {prefix}_replacement_count={self.replacement_count}")
         if wait_time_ms > 0:
-            logger.info(f"[METRIC] {prefix}_wait_time_ms={wait_time_ms:.2f}")
+            logger.debug(f"[METRIC] {prefix}_wait_time_ms={wait_time_ms:.2f}")
 
     async def close_pool(self):
         if self._health_task:
