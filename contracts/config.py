@@ -100,20 +100,10 @@ class FeatureConfig:
     def deepgram_language(self) -> str:
         """
         Deepgram transcription model language.
-        Phase 1: 'en' — English-only model. Non-English audio is force-transcribed
-                  as garbled English; detect_language reveals the actual language.
-        Phase 2: 'multi' (or 'en,fr,es') for multilingual transcription support.
+        'multi' — Nova-2 multilingual model; auto-detects spoken language and
+        returns detected_language metadata per utterance.
         """
-        return os.getenv("DEEPGRAM_LANGUAGE", "en")
-
-    @property
-    def deepgram_detect_language(self) -> bool:
-        """
-        When True, adds detect_language=true to the Deepgram connection.
-        Deepgram runs acoustic language detection in parallel with transcription
-        and returns the detected language code (BCP-47) per utterance.
-        """
-        return os.getenv("DEEPGRAM_DETECT_LANGUAGE", "true").lower() == "true"
+        return os.getenv("DEEPGRAM_LANGUAGE", "multi")
 
     @property
     def supported_languages(self) -> list:

@@ -68,6 +68,7 @@ class Transcriber(STTProvider):
     async def connect(self):
         from contracts.config import config
         _endpointing_ms = int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "800"))
+        _language = config.deepgram_language
         params = [
             f"model={self.model}",
             f"encoding={self.encoding}",
@@ -75,13 +76,9 @@ class Transcriber(STTProvider):
             "interim_results=true",
             "smart_format=true",
             f"endpointing={_endpointing_ms}",
-            f"language={config.deepgram_language}",
+            f"language={_language}",
         ]
-        # detect_language=true gives acoustic-level language detection metadata.
-        # Only valid with a specific language (e.g. 'en'), NOT with 'multi'
-        # (which already auto-detects language).
-        if config.deepgram_detect_language and config.deepgram_language != "multi":
-            params.append("detect_language=true")
+        logger.info(f"[DEEPGRAM] Connecting with language={_language}, model={self.model}")
 
         domain = "api.deepgram.com"
         is_canadian = self.session_metadata.get("region") == "CA"
@@ -172,11 +169,12 @@ class Transcriber(STTProvider):
                     if detected_lang:
                         logger.info(f"[STT-LANG] Deepgram detected_language='{detected_lang}' conf={conf:.2f} for: '{sentence[:50]}'")
                     elif is_final and sentence:
-                        # Dump raw keys to diagnose missing detected_language
-                        logger.debug(
-                            f"[STT-LANG] No detected_language from Deepgram for: '{sentence[:50]}' | "
-                            f"channel_keys={list(channel_data.keys())} alt_keys={list(alt.keys())} "
-                            f"top_keys={[k for k in data.keys() if k not in ('channel',)]}"
+                        # Dump raw response to diagnose where language info lives
+                        logger.info(
+                            f"[STT-LANG-DEBUG] No detected_language for: '{sentence[:50]}' | "
+                            f"channel_data={json.dumps({k: v for k, v in channel_data.items() if k != 'alternatives'}, default=str)} | "
+                            f"alt_keys={list(alt.keys())} | "
+                            f"top_level={json.dumps({k: v for k, v in data.items() if k not in ('channel', 'channel_index')}, default=str)}"
                         )
 
                     # Latching Heuristic
