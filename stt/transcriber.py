@@ -77,10 +77,10 @@ class Transcriber(STTProvider):
             f"endpointing={_endpointing_ms}",
             f"language={config.deepgram_language}",
         ]
-        # Phase 1: detect_language=true with language=en gives us acoustic-level
-        # language detection while keeping the English transcription model.
-        # Phase 2: switch deepgram_language to 'multi' for multilingual transcription.
-        if config.deepgram_detect_language:
+        # detect_language=true gives acoustic-level language detection metadata.
+        # Only valid with a specific language (e.g. 'en'), NOT with 'multi'
+        # (which already auto-detects language).
+        if config.deepgram_detect_language and config.deepgram_language != "multi":
             params.append("detect_language=true")
 
         domain = "api.deepgram.com"
