@@ -172,7 +172,12 @@ class Transcriber(STTProvider):
                     if detected_lang:
                         logger.info(f"[STT-LANG] Deepgram detected_language='{detected_lang}' conf={conf:.2f} for: '{sentence[:50]}'")
                     elif is_final and sentence:
-                        logger.debug(f"[STT-LANG] No detected_language from Deepgram for: '{sentence[:50]}'")
+                        # Dump raw keys to diagnose missing detected_language
+                        logger.debug(
+                            f"[STT-LANG] No detected_language from Deepgram for: '{sentence[:50]}' | "
+                            f"channel_keys={list(channel_data.keys())} alt_keys={list(alt.keys())} "
+                            f"top_keys={[k for k in data.keys() if k not in ('channel',)]}"
+                        )
 
                     # Latching Heuristic
                     if not is_final:
