@@ -67,13 +67,14 @@ class Transcriber(STTProvider):
 
     async def connect(self):
         from contracts.config import config
+        _endpointing_ms = int(os.getenv("DEEPGRAM_ENDPOINTING_MS", "800"))
         params = [
             f"model={self.model}",
             f"encoding={self.encoding}",
             f"sample_rate={self.sample_rate}",
             "interim_results=true",
             "smart_format=true",
-            "endpointing=500",
+            f"endpointing={_endpointing_ms}",
             f"language={config.deepgram_language}",
         ]
         # Phase 1: detect_language=true with language=en gives us acoustic-level
@@ -160,9 +161,18 @@ class Transcriber(STTProvider):
                     sentence = alt.get("transcript", "")
                     conf = alt.get("confidence", 0)
                     is_final = data.get("is_final", False)
-                    # With detect_language=true, Deepgram returns the detected language
-                    # in channel_data["detected_language"]. Fall back to top-level "language".
-                    detected_lang = channel_data.get("detected_language") or data.get("language")
+                    # Deepgram returns detected_language in several possible locations depending
+                    # on model and API version. Check all of them in priority order.
+                    detected_lang = (
+                        channel_data.get("detected_language") or  # Nova-2 language=multi (channel level)
+                        alt.get("detected_language") or            # Some models return it per-alternative
+                        data.get("detected_language") or           # Top-level fallback
+                        data.get("language")                       # Legacy top-level field
+                    )
+                    if detected_lang:
+                        logger.info(f"[STT-LANG] Deepgram detected_language='{detected_lang}' conf={conf:.2f} for: '{sentence[:50]}'")
+                    elif is_final and sentence:
+                        logger.debug(f"[STT-LANG] No detected_language from Deepgram for: '{sentence[:50]}'")
 
                     # Latching Heuristic
                     if not is_final:

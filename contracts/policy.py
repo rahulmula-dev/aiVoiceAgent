@@ -1,7 +1,8 @@
 from .schemas import EscalationEvent, CallContext
 import logging
 import re
-from langdetect import detect_langs
+from langdetect import detect_langs, DetectorFactory
+DetectorFactory.seed = 0  # Deterministic results — without this langdetect is non-deterministic
 
 # Module-level logger for Policy Engine
 logger = logging.getLogger("Policy")
@@ -141,6 +142,18 @@ class ResponsePolicyEngine:
         "of", "to", "in", "and", "or", "but", "if", "for", "with", "at", "by", "from",
         "on", "up", "out", "into", "over", "after", "before", "about", "than", "as",
         "not", "also", "just", "then", "so", "too",
+        "outside", "inside", "between", "around", "through", "without", "within",
+        "near", "behind", "below", "above", "across", "along", "among", "during",
+        "since", "until", "towards", "against",
+        # Numbers (six-five already covered above)
+        "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+        "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+        "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+        "hundred", "thousand", "million",
+        # Common colloquial contractions / fillers
+        "gonna", "wanna", "gotta", "kinda", "sorta", "lemme", "gimme", "cause",
+        "check", "got", "getting", "looking", "trying", "talking", "asking",
+        "want", "wanted", "needs", "needed", "came", "let",
         # Question words
         "what", "where", "how", "when", "why", "who", "which",
         # Demonstratives / location
@@ -165,8 +178,6 @@ class ResponsePolicyEngine:
         "name", "time", "year", "week", "month", "day", "number", "phone", "email",
         "something", "anything", "nothing", "someone", "anyone", "everyone",
         "now", "today", "doing", "going", "waiting", "listening", "speaking",
-        "gmail", "great", "sure", "maybe", "logic", "uh", "um", "hmm", "ah", "mhm",
-        "so", "yeah", "thank", "thanks", "wait", "welcome",
         # College-specific domain
         "admission", "admissions", "course", "courses", "college", "fees", "fee", "cost",
         "available", "program", "programs", "certificate", "diploma", "degree",
@@ -181,39 +192,31 @@ class ResponsePolicyEngine:
         "internship", "graduation", "alumni", "transcript", "enrollment", "enroll",
         "enrolled", "join", "joining", "registration", "exam", "test", "grade",
         "morning", "afternoon", "evening", "night",
-        "continue", "restart", "give", "list", "kill", "people", "common", "india",
-        "us", "africa", "america", "visa", "status",
-        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage", "esthetics",
+        "continue", "restart", "give", "list", "people", "india",
+        "africa", "america", "visa", "status",
+        "hospital", "beauty", "cosmetology", "makeup", "hairstyling", "massage",
         "business", "marketing", "portfolio", "interview", "preparation",
-        "gender", "genders", "skills", "mission", "vision", "values", "career", "vocational",
+        "skills", "mission", "vision", "values", "career", "vocational",
         "issue", "question", "help", "know", "about", "speak", "call",
-        "empower", "empowers", "empowering", "financial", "independence",
+        "gmail", "logic", "empower", "financial", "independence",
+        # Common nouns/verbs missing from list (causing false positives on valid English)
+        "job", "jobs", "gap", "gap", "career", "work", "life", "age", "year", "years",
+        "point", "place", "thing", "things", "way", "part", "right", "left",
+        "side", "area", "city", "town", "state", "country", "world",
+        "money", "cost", "pay", "paid", "free", "price", "rate", "data",
+        "type", "kind", "form", "format", "level", "size", "set", "group",
+        "key", "note", "plan", "idea", "goal", "focus", "step", "steps",
+        "open", "close", "end", "full", "main", "major", "total", "local",
+        "real", "clear", "early", "later", "better", "best", "well", "past",
+        "long", "short", "small", "large", "big", "little", "young", "own",
+        "both", "same", "different", "possible", "important", "able",
+        "line", "week", "month", "read", "write", "learn", "study", "class",
+        "offer", "provide", "include", "access", "use", "used", "using",
+        "interest", "interested", "available", "option", "options", "choice",
         "requirement", "requirements", "specific", "international", "aid",
         "instructor", "instructors", "professor", "professors", "department",
         "facility", "workshop", "qualification", "examination", "assessment",
-        "results", "approvals", "measured", "payments", "timetable", "laboratory",
-        # Common English verbs frequently used in questions
-        "explain", "explained", "describing", "describe", "offer", "offers", "offered", "providing", "provide", "provided",
-        "compare", "comparing", "choose", "choosing", "select", "selecting", "find", "finding", "complete", "completing",
-        "understand", "understanding", "look", "looking", "think", "thinking", "try", "trying", "make", "making",
-        "take", "taking", "come", "coming", "say", "saying", "use", "using",
-        "seem", "seeming", "feel", "feeling", "work", "working", "read", "reading", "change", "changing",
-        "show", "showing", "hear", "hearing", "consider", "considering", "check", "checking", "include", "including",
-        # Common English prepositions and connectives
-        "between", "among", "before", "after", "during", "while", "though", "although", "because", "also",
-        "then", "than", "until", "unless", "since", "within", "without", "through", "against", "along",
-        # Common English adjectives and adverbs
-        "quite", "high", "actually", "very", "much", "many", "little", "few", "most", "none", "only", "just", "really",
-        "almost", "already", "soon", "often", "sometimes", "always", "never", "again", "together", "probably",
-        "definitely", "basically", "literally", "honestly", "personally", "totally", "absolutely", "entirely",
-        "completely", "mostly", "partially", "slightly", "fairly", "pretty", "rather", "somewhat", "instead", "otherwise",
-        "meanwhile", "anyway", "besides", "moreover", "furthermore", "however", "nevertheless", "nonetheless", "therefore",
-        "consequently", "accordingly", "thus", "hence", "namely", "specifically", "especially", "particularly", "notably", "primarily", "mainly", "largely",
-        "different", "difference", "similar", "full", "part", "both", "either", "neither", "several",
-        "enough", "early", "late", "long", "short", "free", "open", "close", "right", "left", "own",
-        "could", "should", "will", "shall", "might", "must", "let",
-        # Common modifiers and filler words used in spoken English
-        "interested", "wondering", "wanted", "needed", "hoping", "planning",
+        "results", "approvals", "measured",
     }
 
     def _contains_word(self, text: str, keyword: str) -> bool:
@@ -239,11 +242,13 @@ class ResponsePolicyEngine:
     def _is_english(self, text: str, detected_lang: str = None) -> bool:
         """
         [GOVERNANCE] Language gate — Phase 1: English-only.
+        Hardened to handle non-Latin characters (Hindi/Bengali) without crashing.
 
         Detection priority:
           1. Deepgram acoustic detection (detected_lang) — PRIMARY
-          2. Density check against COMMON_ENGLISH_WORDS  — SECONDARY
-          3. langdetect probabilistic model              — TERTIARY (fallback)
+          2. Non-Latin script check                      — FAST-PATH
+          3. langdetect + density COMBINED                — SECONDARY (≥3 words)
+          4. Density fallback                             — TERTIARY (short inputs)
 
         Phase 2: rename to _is_supported_language() and check against
         config.supported_languages for multi-language support.
@@ -262,25 +267,44 @@ class ResponsePolicyEngine:
 
         lower_text = text.lower()
 
-        # ── UNIVERSAL BYPASSES (run before any detection) ──────────────────
-        # Name-introduction phrases should never trigger language strikes.
+        # SPECIAL CASE: Name-introduction phrases should never trigger language strikes.
         intro_regex = r"^(hi|hello)?[\s.,!]*?(my name is|i am|this is|it's)\b"
         if re.search(intro_regex, lower_text):
             return True
 
         words = re.findall(r'\b\w+\b', lower_text)
 
-        # Single alphabetical word (likely a name like "Akansha", "Leila")
+        # Single-word purely alphabetical — could be a name (Akansha) or a foreign word (Hola, Theek).
+        # Run langdetect to distinguish: block if non-English with high confidence.
         if len(words) == 1 and words[0].isalpha():
-            return True
+            if words[0] in self.COMMON_ENGLISH_WORDS:
+                return True  # Known English word — pass immediately
+            try:
+                detected_langs = detect_langs(text)
+                if detected_langs:
+                    top = detected_langs[0]
+                    if top.lang != 'en' and top.prob >= 0.85:
+                        policy_logger.warning(f"[GOVERNANCE] Single-word non-English: {top.lang} ({top.prob:.2f}): '{text}'")
+                        return False
+            except Exception:
+                pass
+            return True  # Unknown single word — treat as name/affirmation
         if not words:
             return True
 
-        # Precompute density — used by multiple gates below
         common_words_found = [w for w in words if w in self.COMMON_ENGLISH_WORDS]
         num_common = len(common_words_found)
         density = num_common / len(words)
+
+        # Short purely-alphabetical inputs (≤2 words) are likely names
         is_name_like = len(words) <= 2 and all(w.isalpha() for w in words)
+
+        # Fast-path: non-Latin script (Hindi, Arabic, CJK) — no English chars
+        if len(text) >= 3:
+            clean_text_alpha = re.sub(r'[^a-zA-Z]', '', text)
+            if clean_text_alpha and len(re.findall(r'[a-zA-Z]', clean_text_alpha)) / len(clean_text_alpha) < 0.4:
+                policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
+                return False
 
         # ── PRIMARY GATE: Deepgram acoustic language detection ─────────────
         # With detect_language=true, Deepgram reports the language it detected
@@ -335,81 +359,87 @@ class ResponsePolicyEngine:
         # These run only when detected_lang is None OR when Deepgram said
         # English but density was suspiciously low.
 
-        # 1. Density Check
-        threshold = 0.60 if len(words) >= 3 else 0.40
-        is_mixed_danger = density <= threshold
-        if is_mixed_danger and not is_name_like:
-            if not re.search(intro_regex, lower_text):
-                policy_logger.warning(
-                    f"[GOVERNANCE] Blocked via Density "
-                    f"({density:.2f} <= {threshold}): '{text}'"
-                )
-                return False
+        # --- MULTI-WORD PATH (≥3 words): langdetect + density COMBINED ---
+        # langdetect alone is unreliable for short colloquial English — it frequently
+        # misidentifies English as Welsh (cy), Somali (so), German (de), Portuguese (pt), etc.
+        # Key insight: real non-English sentences (Spanish, Hindi) have near-zero English word
+        # density, while English sentences (even with slang) have decent density.
+        # Therefore: only BLOCK if langdetect says non-English AND density is very low (< 0.50).
+        # If density >= 0.50, the sentence contains mostly English words → treat as English.
+        if len(words) >= 3:
+            try:
+                detected_langs = detect_langs(text)
+                policy_logger.debug(f"[GOVERNANCE] Langdetect Raw: {detected_langs}")
+                if detected_langs:
+                    top = detected_langs[0]
+                    if top.lang == 'en':
+                        policy_logger.debug(f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'")
+                        return True
+                    if top.lang != 'en' and top.prob >= 0.60:
+                        # Non-English detected with moderate-high confidence.
+                        # Only block if density is also low — sentences with >= 50% English words
+                        # are likely English that langdetect got wrong (cy/so/de false positives).
+                        if density >= 0.50:
+                            policy_logger.info(
+                                f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) — "
+                                f"density={density:.2f} >= 0.50 indicates English. Text='{text}'"
+                            )
+                            return True
+                        policy_logger.warning(
+                            f"[GOVERNANCE] Non-English detected: {top.lang} ({top.prob:.2f}), "
+                            f"density={density:.2f} < 0.50. Blocking. Text='{text}'"
+                        )
+                        return False
+                    # Weak non-English signal (0.40–0.59) but near-zero English word density —
+                    # virtually no English words in the sentence → almost certainly non-English.
+                    if top.lang != 'en' and top.prob >= 0.40 and density < 0.15:
+                        policy_logger.warning(
+                            f"[GOVERNANCE] Very-low-density ({density:.2f}) + weak non-English signal "
+                            f"({top.lang}: {top.prob:.2f}). Blocking. Text='{text}'"
+                        )
+                        return False
+                    # langdetect low-confidence (< 0.60): don't block on its signal alone.
+                    # langdetect is very unreliable on short/ambiguous text — it routinely
+                    # returns Hungarian, Slovenian, Somali, etc. for valid English phrases
+                    # like "A job gap". Only the moderate-confidence path (>= 0.60) is actionable.
+            except Exception as e:
+                policy_logger.error(f"[GOVERNANCE] langdetect failed: {e}")
+                return True  # Fail-safe: don't penalize if detection crashes
 
+            # langdetect uncertain or low-confidence — density as last resort.
+            # Use a very low threshold (0.20) so short English sentences with uncommon nouns
+            # (e.g. "A job gap" density=0.33) are not penalised. Only block near-zero density
+            # which indicates virtually no English words at all.
+            policy_logger.debug(f"[GOVERNANCE] Langdetect uncertain, density fallback ({density:.2f}): '{text}'")
+            return density >= 0.20
+
+        # --- SHORT PATH (<3 words) ---
         if len(text) < 3:
             return True
 
-        # 2. Non-Latin script check (catches Devanagari, Bengali, Arabic, CJK)
-        clean_text_alpha = re.sub(r'[^a-zA-Z]', '', text)
-        if not clean_text_alpha or len(re.findall(r'[a-zA-Z]', clean_text_alpha)) / len(clean_text_alpha) < 0.4:
-            policy_logger.warning(f"[GOVERNANCE] Blocked via Non-Latin Check: '{text}'")
-            return False
-
-        # 3. Short input handling (< 3 words) — langdetect is unreliable here
-        if len(words) < 3:
-            policy_logger.debug(f"[GOVERNANCE] Short input ({len(words)} words): '{text}'")
-            if is_name_like:
-                if num_common >= 1:
-                    policy_logger.debug(f"[GOVERNANCE] Permitting short input (has English word): '{text}'")
-                    return True
-                try:
-                    detected_langs = detect_langs(text)
-                    if detected_langs:
-                        top = detected_langs[0]
-                        if top.lang != 'en' and top.prob >= 0.70:
-                            policy_logger.warning(
-                                f"[GOVERNANCE] 2-word non-English by langdetect "
-                                f"({top.lang} {top.prob:.2f}): '{text}'"
-                            )
-                            return False
-                except Exception:
-                    pass
-                policy_logger.debug(f"[GOVERNANCE] Permitting 2-word name-like input: '{text}'")
+        if is_name_like:
+            if num_common >= 1:
+                policy_logger.debug(f"[GOVERNANCE] Permitting short input (has English word): '{text}'")
                 return True
-            return density >= 0.50
+            # density=0: both words unknown — could be a name or a foreign phrase
+            try:
+                detected_langs = detect_langs(text)
+                if detected_langs:
+                    top = detected_langs[0]
+                    if top.lang != 'en' and top.prob >= 0.55:
+                        policy_logger.warning(f"[GOVERNANCE] 2-word non-English by langdetect ({top.lang} {top.prob:.2f}): '{text}'")
+                        return False
+                    # Even weak signal (≥0.45) with zero density → block
+                    if top.lang != 'en' and top.prob >= 0.45 and density == 0:
+                        policy_logger.warning(f"[GOVERNANCE] 2-word zero-density non-English ({top.lang} {top.prob:.2f}): '{text}'")
+                        return False
+            except Exception:
+                pass
+            policy_logger.debug(f"[GOVERNANCE] Permitting 2-word name-like input: '{text}'")
+            return True
 
-        # 4. Tertiary: langdetect probabilistic check (3+ words, no Deepgram signal)
-        try:
-            detected_langs = detect_langs(text)
-            policy_logger.debug(f"[GOVERNANCE] Langdetect Raw: {detected_langs}")
-
-            if detected_langs:
-                top = detected_langs[0]
-
-                if top.lang != 'en' and top.prob >= 0.70:
-                    if density >= 0.90:
-                        policy_logger.info(
-                            f"[GOVERNANCE] Overriding langdetect={top.lang} ({top.prob:.2f}) "
-                            f"due to English Density ({density:.2f} >= 0.90): '{text}'"
-                        )
-                        return True
-                    policy_logger.warning(
-                        f"[GOVERNANCE] Non-English by langdetect: {top.lang} ({top.prob:.2f}), "
-                        f"density={density:.2f}. Blocking (Phase 1 English-only): '{text}'"
-                    )
-                    return False
-
-                if top.lang == 'en':
-                    policy_logger.debug(
-                        f"[GOVERNANCE] PASSED (en={top.prob:.2f}, density={density:.2f}): '{text}'"
-                    )
-                    return True
-
-            return density >= 0.85
-
-        except Exception as e:
-            policy_logger.error(f"[GOVERNANCE] langdetect failed: {e}")
-            return True  # Fail-open: detection crash ≠ a violation
+        # Very short non-name strings: require at least one English word
+        return density >= 0.50
 
     def validate_response(self, context: CallContext, response_text: str) -> bool:
         """
@@ -442,7 +472,8 @@ class ResponsePolicyEngine:
         #   b) Latin-script foreign language slow-path (Spanish, French, German)
         if response_text:
             try:
-                from langdetect import detect_langs
+                from langdetect import detect_langs, DetectorFactory
+                DetectorFactory.seed = 0
 
                 # 4a. Fast ASCII ratio check — catches Devanagari / CJK / Arabic instantly
                 ascii_ratio = sum(c.isascii() for c in response_text) / len(response_text)
