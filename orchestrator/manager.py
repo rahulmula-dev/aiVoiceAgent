@@ -95,6 +95,7 @@ class VoiceOrchestrator:
         self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
         self._last_partial = ""           # [MUTATION] Last partial transcript seen
         self._partial_mutations = 0       # [MUTATION] Count of content changes within one utterance
+        self._incomplete_utterance = ""   # [ENDPOINTING] Buffered dangling fragment to combine with next final
 
 
     def _create_task_with_log(self, coro):
@@ -216,13 +217,27 @@ class VoiceOrchestrator:
 
             # [MUTATION TRACKER] Track content changes in partials — Hindi hallucinations
             # mutate mid-stream (words change), real English only grows (words added).
+            # Compare WORD LISTS not raw strings — punctuation flicker (. ↔ ?) must not
+            # count as a mutation. Only actual word-level changes count.
             if raw_text:
-                last = self._last_partial.rstrip('.?! ')
-                cur = raw_text.rstrip('.?! ')
-                if last and not cur.startswith(last) and not last.startswith(cur):
-                    # Neither is a prefix of the other → content changed, not just grown
-                    self._partial_mutations += 1
-                    logger.debug(f"[MUTATION] Partial changed ({self._partial_mutations}x): '{last[:40]}' → '{cur[:40]}'")
+                last_words = re.findall(r'\b\w+\b', self._last_partial.lower())
+                cur_words = re.findall(r'\b\w+\b', raw_text.lower())
+                if last_words and cur_words != last_words:
+                    # Words changed — check if it's just growth or actual content change
+                    is_pure_growth = (cur_words[:len(last_words)] == last_words or
+                                      last_words[:len(cur_words)] == cur_words)
+                    if not is_pure_growth:
+                        # Count how many word positions actually differ
+                        diff_count = sum(1 for a, b in zip(last_words, cur_words) if a != b)
+                        diff_count += abs(len(last_words) - len(cur_words))
+                        # Single-word oscillations in long sentences (≥4 words) are normal
+                        # Deepgram disambiguation between acoustically similar English words
+                        # (e.g., "courses" ↔ "posters"). Don't count as Hindi hallucination.
+                        if diff_count <= 1 and len(last_words) >= 4:
+                            logger.debug(f"[MUTATION] Single-word swap ignored: '{self._last_partial[:40]}' → '{raw_text[:40]}'")
+                        else:
+                            self._partial_mutations += 1
+                            logger.debug(f"[MUTATION] Partial changed ({self._partial_mutations}x, {diff_count}w diff): '{self._last_partial[:40]}' → '{raw_text[:40]}'")
                 self._last_partial = raw_text
             else:
                 self._last_partial = ""
@@ -238,13 +253,26 @@ class VoiceOrchestrator:
         self._last_partial = ""
 
         if raw_text:
+            # [INTRO BYPASS] Name introductions must NEVER trigger any language guard.
+            # "My name is X", "Hi I am X", "This is X" are always English regardless of
+            # confidence, mutation count, or density. Check this first before all guards.
+            _intro_regex = r"(?:^|\b)(my name is|i am|this is|i'm|i'm)\b"
+            _is_introduction = bool(re.search(_intro_regex, raw_text.lower()))
+
             # [MUTATION GUARD] Hindi hallucinations mutate partial content mid-stream
             # (words change, not just grow). Real English only accumulates words.
-            # >= 2 mutations + conf < 0.85 + >= 4 words = hallucinated non-English.
+            # NOTE: confidence gate intentionally REMOVED — Nova-2 assigns conf >= 0.85
+            # to hallucinated monosyllables like "yeah I would say he" (density=1.00).
+            # Mutation count alone is the reliable signal.
             _mutation_guard_triggered = False
-            if _mutations >= 2 and confidence < 0.85 and len(raw_text.split()) >= 4:
-                logger.warning(f"[GOVERNANCE] Transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
-                _mutation_guard_triggered = True
+            if not _is_introduction:
+                if _mutations >= 2 and len(raw_text.split()) >= 4:
+                    logger.warning(f"[GOVERNANCE] Transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
+                    _mutation_guard_triggered = True
+                elif _mutations >= 3 and len(raw_text.split()) >= 2:
+                    # Heavy mutation tier: catches short finals like "Comentista. Spanish." (3 mutations, 2 words)
+                    logger.warning(f"[GOVERNANCE] Heavy transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
+                    _mutation_guard_triggered = True
 
             # [CONF-LANG-GUARD] Nova-2 force-maps non-English phonemes to English words,
             # but always with LOW confidence. Real English scores 0.85+ consistently.
@@ -257,7 +285,7 @@ class VoiceOrchestrator:
             _density_limit = 0.80  # Fixed — never escalates
 
             _conf_guard_triggered = False
-            if not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
+            if not _is_introduction and not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
                 _words = re.findall(r'\b\w+\b', raw_text.lower())
                 if _words:
                     _common = sum(1 for w in _words if w in self.policy.COMMON_ENGLISH_WORDS)
@@ -266,7 +294,7 @@ class VoiceOrchestrator:
                         logger.warning(f"[GOVERNANCE] Low-conf non-English heuristic (strike={_strikes}): conf={confidence:.2f}<{_conf_limit:.2f}, density={_density:.2f}<{_density_limit:.2f}: '{raw_text}'")
                         _conf_guard_triggered = True
 
-            is_eng = False if (_mutation_guard_triggered or _conf_guard_triggered) else self.policy._is_english(raw_text, detected_lang=detected_lang)
+            is_eng = True if _is_introduction else (False if (_mutation_guard_triggered or _conf_guard_triggered) else self.policy._is_english(raw_text, detected_lang=detected_lang))
             
             if not is_eng:
                 logger.warning(f"[ORCHESTRATOR] Language violation caught: '{raw_text}'")
@@ -280,11 +308,6 @@ class VoiceOrchestrator:
                         meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE_EARLY"},
                     )
                 
-                # User WAS active (spoke something, even if non-English) — reset silence stage
-                # so that after the refusal plays the 30s silence clock starts fresh.
-                self.silence_stage = 0
-                self.last_interaction_time = time.time()
-
                 # Increment strike counter and persist to session as warning_count
                 self.language_strike_count += 1
                 if self.session:
@@ -522,6 +545,28 @@ class VoiceOrchestrator:
             )
             return
         
+        # [ENDPOINTING BUFFER] Deepgram sometimes finalizes a sentence prematurely when the
+        # user pauses mid-thought (e.g. "Tell me about" before completing "...the admission process").
+        # If the final ends with a dangling function word, buffer it and wait for the next final
+        # to combine into one complete utterance before sending to the LLM.
+        _DANGLING_WORDS = {
+            "about", "the", "a", "an", "of", "for", "to", "in", "on", "at", "with",
+            "from", "by", "and", "or", "but", "that", "this", "these", "those",
+            "what", "which", "how", "when", "where", "who", "why", "if",
+        }
+        _last_word = raw_text.rstrip(".,!?").rsplit(None, 1)[-1].lower() if raw_text else ""
+        if raw_text and _last_word in _DANGLING_WORDS and len(raw_text.split()) <= 8:
+            # Fragment too short and ends on a function word — likely incomplete
+            self._incomplete_utterance = (self._incomplete_utterance + " " + raw_text).strip()
+            logger.debug(f"[ENDPOINTING] Buffered incomplete utterance: '{self._incomplete_utterance}'")
+            return  # Wait for continuation before processing
+        elif self._incomplete_utterance:
+            # Combine buffered fragment with this continuation
+            text = (self._incomplete_utterance + " " + text).strip()
+            raw_text = text
+            logger.debug(f"[ENDPOINTING] Combined with buffer: '{raw_text}'")
+            self._incomplete_utterance = ""
+
         # STATE: Transcribing / Input Received
         # [BARGE-IN FIX] Capture state BEFORE transitioning so the barge-in check below
         # can detect if the AI was SPEAKING when this transcript arrived.
@@ -570,10 +615,6 @@ class VoiceOrchestrator:
             
             # --- TASK 3.4: STRIKE TRACKING ---
             if intent == "HARD_REFUSAL_LANGUAGE":
-                # User was active (spoke something) — reset silence stage so the 30s silence
-                # clock starts fresh after the refusal plays, not from wherever it was before.
-                self.silence_stage = 0
-                self.last_interaction_time = time.time()
                 self.language_strike_count += 1
                 logger.warning(f"Language Strike: {self.language_strike_count}/3 (Input: '{text}')")
 
@@ -835,7 +876,7 @@ class VoiceOrchestrator:
                 context_text=context_text,
                 trace_id=trace_id
             )
-            logger.info(f"[AUDIT] Grounded Barge-In generated (Classification: {classification}). Trace: {trace_id}")
+            logger.info(f"[AUDIT] Barge-In classification: {classification}. Trace: {trace_id}")
             
             # Aggregate any metadata from barge-in classification too
             if self.session:
@@ -848,13 +889,21 @@ class VoiceOrchestrator:
                 if rag_score > 0:
                     self.session.confidence_scores.append(rag_score)
 
+            # STEP D — If LLM completely failed, fall back to the normal generation path
+            # which has its own multi-model retry logic. Better than speaking a useless filler.
+            if classification == "FAILED":
+                logger.warning("[BARGE-IN] LLM race failed — routing to generate_and_speak fallback.")
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                await self.generate_and_speak(caller_input, trace_id=trace_id)
+                return
+
             # STEP D — Update Interrupted Turn
             if classification == "NEW_TOPIC" and prev_turn:
                 prev_turn.agent_response_status = "abandoned"
-                
+
             if prev_turn:
                 prev_turn.barge_in_classification = classification
-                
+
             # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
             if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
                 # Append soft offer to the end of the new response
@@ -862,7 +911,7 @@ class VoiceOrchestrator:
                 response += " I can also finish walking you through the remaining steps if that's helpful."
                 self.session.continuation_offered = True
 
-            # STEP D — Create New Turn Entry
+            # STEP E — Create New Turn Entry
             new_id = len(self.session.structured_turns) + 1
             new_turn = BargeInTurn(
                 turn_id=new_id,
@@ -945,9 +994,20 @@ class VoiceOrchestrator:
             logger.error(f"Error in speak_immediate_response: {e}")
         finally:
             self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
-            # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
-            if not is_cancelled and self.state.get_state() != CallState.CALL_END:
-                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            
+            # [GOVERNANCE] Auto-terminate if the response concludes the call
+            import string
+            normalized_text = text.strip().lower().rstrip(string.punctuation).strip()
+            
+            if not is_cancelled and normalized_text.endswith("goodbye"):
+                logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in immediate response. Initiating graceful shutdown.")
+                # We skip resetting to LISTENING since we are hanging up
+                self._create_task_with_log(self._delayed_call_end(delay=1.0))
+            else:
+                # CRITICAL: Only go back to Listening if we are NOT already terminating nor cancelled
+                if not is_cancelled and self.state.get_state() != CallState.CALL_END:
+                    self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+            
             self.last_interaction_time = time.time()
 
     async def _send_clear_message(self):
@@ -1690,6 +1750,14 @@ class VoiceOrchestrator:
                 await audio_queue.put(None)
                 await worker_task
                 
+                # [GOVERNANCE] Auto-terminate if the response concludes the call
+                if full_ai_text:
+                    import string
+                    normalized_text = full_ai_text.strip().lower().rstrip(string.punctuation).strip()
+                    if normalized_text.endswith("goodbye"):
+                        logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in AI response. Initiating graceful shutdown.")
+                        self._create_task_with_log(self._delayed_call_end(delay=1.0))
+                
             except asyncio.CancelledError:
                 logger.debug("generate_and_speak cancelled. Cleaning up worker...")
                 worker_task.cancel()
@@ -1863,9 +1931,6 @@ class VoiceOrchestrator:
         self._cleanup_done = True
 
         sid = self.session.session_id if self.session else getattr(self, "_early_sid", "unknown")
-        # Log the full call stack so we can identify what triggered cleanup/CALL_END prematurely
-        import traceback
-        logger.warning(f"[CLEANUP] Triggered for session {sid}. Call stack:\n{''.join(traceback.format_stack())}")
         logger.info(f"Cleanup started for session {sid}.")
 
         # Reset wrap-up tracking so the orchestrator is clean for the next session
