@@ -161,6 +161,18 @@ def _get_lingua_detector():
     return _lingua_detector
 
 
+# ── Module-level fast-path word set ────────────────────────────────────────────
+# Defined here (not inside validate_language) so it is built exactly once per
+# process rather than re-created on every STT frame call.
+SINGLE_WORD_ENGLISH: frozenset = frozenset({
+    "ok", "okay", "yes", "yeah", "yep", "yup", "no", "nope", "hi", "hey",
+    "hello", "thanks", "thank", "sure", "right", "fine", "good", "great",
+    "alright", "correct", "exactly", "agreed", "understood", "got", "noted",
+    "bye", "goodbye", "later", "wait", "hold", "stop", "go", "help",
+    "please", "sorry", "pardon", "what", "how", "when", "where", "why",
+    "who", "which", "hmm", "uh", "um", "ah", "oh", "mhm", "mhmm",
+})
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 class LanguageValidationResult:
@@ -245,18 +257,10 @@ def validate_language(text: str) -> LanguageValidationResult:
     # ── Fast-path: common single-word English inputs ───────────────────────────
     # Language detectors are unreliable on single words. "okay", "yes", "hi"
     # are valid in many languages, causing false non-English classifications
-    # (e.g. Lingua classifies "okay" as Tagalog). Hard-code the unambiguous
-    # English affirmations and fillers that a voice caller commonly says alone.
-    _SINGLE_WORD_ENGLISH = {
-        "ok", "okay", "yes", "yeah", "yep", "yup", "no", "nope", "hi", "hey",
-        "hello", "thanks", "thank", "sure", "right", "fine", "good", "great",
-        "alright", "correct", "exactly", "agreed", "understood", "got", "noted",
-        "bye", "goodbye", "later", "wait", "hold", "stop", "go", "help",
-        "please", "sorry", "pardon", "what", "how", "when", "where", "why",
-        "who", "which", "hmm", "uh", "um", "ah", "oh", "mhm", "mhmm",
-    }
+    # (e.g. Lingua classifies "okay" as Tagalog). Use the module-level constant
+    # (built once per process, not per call).
     stripped = text.strip().lower().rstrip(".,!?")
-    if stripped in _SINGLE_WORD_ENGLISH:
+    if stripped in SINGLE_WORD_ENGLISH:
         return LanguageValidationResult(
             is_english=True,
             predicted_label="en",
