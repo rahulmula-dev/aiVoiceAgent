@@ -22,6 +22,17 @@ COPY requirements.txt .
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install FastText language detection (Linux wheel available in slim image)
+RUN pip install --no-cache-dir fasttext-wheel
+
+# Download FastText language identification model (lid.176.ftz ~126MB)
+RUN mkdir -p /app/models && \
+    curl -fSL https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz \
+         -o /app/models/lid.176.ftz
+
+# Point the language guard at the model file
+ENV FASTTEXT_MODEL_PATH=/app/models/lid.176.ftz
+
 # Copy the current directory contents into the container at /app
 COPY . .
 
