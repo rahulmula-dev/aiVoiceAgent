@@ -8,6 +8,12 @@ asyncpg>=0.29.0
 pgvector>=0.3.0
 pydantic
 langdetect
+lingua-language-detector
 redis
 boto3>=1.34.0
 tenacity>=8.2.0
+# fasttext-wheel        # EC2/Linux only — Windows has no pre-built wheel for Python 3.13
+#                       # EC2 setup: pip install fasttext-wheel
+#                       #            wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz \
+#                       #                 -O models/lid.176.ftz
+#                       # Then set env var: FASTTEXT_MODEL_PATH=models/lid.176.ftz

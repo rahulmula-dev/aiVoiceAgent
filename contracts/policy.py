@@ -22,10 +22,10 @@ class PRDScripts:
     REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
     REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
     REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
-    # Task 3: Hard Language Refusal Scripts
-    REFUSAL_LANGUAGE_1 = "I am currently designed to support English only. Please continue in English."
-    REFUSAL_LANGUAGE_2 = "I can only understand English. If the next input is not in English, I will have to end the call."
-    REFUSAL_LANGUAGE_3 = "I am ending the call now as I can only assist in English. Goodbye."
+    # 3-Strike Language Refusal Scripts (PRD §Language Governance)
+    REFUSAL_LANGUAGE_1 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
+    REFUSAL_LANGUAGE_2 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
+    REFUSAL_LANGUAGE_3 = "I'm sorry, since I can only assist in English, I will have to end this call now. Please call back when you are ready to proceed in English. Goodbye."
     REFUSAL_KB_MISS = "I'm sorry, I don't have that specific information right now. Let me have an admissions officer follow up with you to provide more details. I can, however, help with general information about programs and admissions!"
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
     
