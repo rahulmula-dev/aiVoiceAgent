@@ -5,9 +5,11 @@ import json
 import os
 import logging as std_logging
 import re
+import string
 import time
 import uuid
 from datetime import datetime
+from contracts.language_interceptor import LanguageGovernanceInterceptor
 from orchestrator.brain import Brain
 from orchestrator.interfaces import STTProvider, TTSProvider
 from tts.synthesizer import TTSException
@@ -62,6 +64,11 @@ class VoiceOrchestrator:
         # Mode: 'audio' (default) or 'text'
         self.mode = "audio"
         self.sid = "unknown" # Default session ID before call starts
+
+        # Language Governance Interceptor — one instance per call, created here so
+        # it can be reset via self._lang_interceptor.reset() when a new call begins.
+        self._lang_interceptor = LanguageGovernanceInterceptor(session_id=self.sid)
+
         self.last_refusal_time = 0  # Cooldown tracker for non-English refusals
         self.last_empty_frame_time = 0 # Debounce tracker for STT burst artifacts
         self.consecutive_empty_frames = 0  # Counter for sustained non-English detection
@@ -96,6 +103,7 @@ class VoiceOrchestrator:
         self._last_partial = ""           # [MUTATION] Last partial transcript seen
         self._partial_mutations = 0       # [MUTATION] Count of content changes within one utterance
         self._incomplete_utterance = ""   # [ENDPOINTING] Buffered dangling fragment to combine with next final
+        self._buffer_flush_task = None    # [ENDPOINTING] Timer to flush stale buffer after 3 s of silence
 
 
     def _create_task_with_log(self, coro):
@@ -253,59 +261,19 @@ class VoiceOrchestrator:
         self._last_partial = ""
 
         if raw_text:
-            # [INTRO BYPASS] Name introductions must NEVER trigger any language guard.
-            # "My name is X", "Hi I am X", "This is X" are always English regardless of
-            # confidence, mutation count, or density. Check this first before all guards.
-            _intro_regex = r"(?:^|\b)(my name is|i am|this is|i'm|i'm)\b"
-            _is_introduction = bool(re.search(_intro_regex, raw_text.lower()))
+            # [GOVERNANCE] Language gate — delegate all detection to LanguageGovernanceInterceptor.
+            # Detection priority: empty fast-path → common-word fast-path → name-intro regex →
+            # Deepgram acoustic (PRIMARY) → FastText lid.176.ftz (EC2) → Lingua (fallback).
+            # This replaces the legacy mutation-guard, conf-guard, and inline _is_english()
+            # heuristics with a single, testable, well-documented detector.
+            lang_result = self._lang_interceptor.check(raw_text, deepgram_lang=detected_lang)
 
-            # [DEEPGRAM BYPASS] When Deepgram's acoustic detection confirms a supported
-            # language, trust it over the mutation/confidence heuristics below. These
-            # heuristics were designed before detect_language=true and can false-block
-            # low-confidence but valid English audio.
-            from contracts.policy import ResponsePolicyEngine
-            _dg_lang_normalised = ResponsePolicyEngine._normalise_lang_code(detected_lang) if detected_lang else None
-            _dg_confirms_supported = _dg_lang_normalised in self.config.supported_languages if _dg_lang_normalised else False
+            if not lang_result.proceed_to_llm:
+                logger.warning(
+                    f"[ORCHESTRATOR] Language violation caught via {lang_result.detection_method}: '{raw_text}'"
+                )
 
-            # [MUTATION GUARD] Hindi hallucinations mutate partial content mid-stream
-            # (words change, not just grow). Real English only accumulates words.
-            # NOTE: confidence gate intentionally REMOVED — Nova-2 assigns conf >= 0.85
-            # to hallucinated monosyllables like "yeah I would say he" (density=1.00).
-            # Mutation count alone is the reliable signal.
-            # SKIPPED when intro detected OR Deepgram confirms a supported language.
-            _mutation_guard_triggered = False
-            if not _is_introduction and not _dg_confirms_supported:
-                if _mutations >= 2 and len(raw_text.split()) >= 4:
-                    logger.warning(f"[GOVERNANCE] Transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
-                    _mutation_guard_triggered = True
-                elif _mutations >= 3 and len(raw_text.split()) >= 2:
-                    # Heavy mutation tier: catches short finals like "Comentista. Spanish." (3 mutations, 2 words)
-                    logger.warning(f"[GOVERNANCE] Heavy transcript instability ({_mutations} mutations, conf={confidence:.2f}): '{raw_text}'")
-                    _mutation_guard_triggered = True
-
-            # [CONF-LANG-GUARD] Nova-2 force-maps non-English phonemes to English words,
-            # but always with LOW confidence. Real English scores 0.85+ consistently.
-            # SKIPPED when Deepgram acoustic detection confirms a supported language.
-            _strikes = self.language_strike_count
-            _conf_limit = min(0.65 + (_strikes * 0.08), 0.82)
-            _density_limit = 0.80  # Fixed — never escalates
-
-            _conf_guard_triggered = False
-            if not _is_introduction and not _dg_confirms_supported and not _mutation_guard_triggered and confidence < _conf_limit and len(raw_text.split()) >= 4:
-                _words = re.findall(r'\b\w+\b', raw_text.lower())
-                if _words:
-                    _common = sum(1 for w in _words if w in self.policy.COMMON_ENGLISH_WORDS)
-                    _density = _common / len(_words)
-                    if _density < _density_limit:
-                        logger.warning(f"[GOVERNANCE] Low-conf non-English heuristic (strike={_strikes}): conf={confidence:.2f}<{_conf_limit:.2f}, density={_density:.2f}<{_density_limit:.2f}: '{raw_text}'")
-                        _conf_guard_triggered = True
-
-            is_eng = True if _is_introduction else (False if (_mutation_guard_triggered or _conf_guard_triggered) else self.policy._is_english(raw_text, detected_lang=detected_lang))
-            
-            if not is_eng:
-                logger.warning(f"[ORCHESTRATOR] Language violation caught: '{raw_text}'")
-                
-                # FORENSIC: Log the exact text that was blocked so we don't have invisible strikes
+                # Forensic log — always visible in call timeline
                 if self.call_logger:
                     self.call_logger.log_event(
                         "stt",
@@ -313,23 +281,22 @@ class VoiceOrchestrator:
                         latency_ms=int(stt_latency * 1000),
                         meta={"text": raw_text, "confidence": confidence, "note": "BLOCKED_LANGUAGE_EARLY"},
                     )
-                
-                # Increment strike counter and persist to session as warning_count
+
+                # Increment master strike counter and persist to session
                 self.language_strike_count += 1
                 if self.session:
-                    current = getattr(self.session, "language_warning_count", 0)
-                    self.session.language_warning_count = current + 1
+                    self.session.language_warning_count = self.language_strike_count
                     try:
                         self.session_manager.save_session(self.session)
                     except Exception as e:
                         logger.debug(f"Failed to persist language_warning_count: {e}")
 
-                # Create CRM ticket for this non-English instance
+                # CRM ticket on every non-English strike
                 call_id = (self.session.crm_call_id or self.session.session_id) if self.session else "language_violation"
                 self._create_task_with_log(
                     self.crm.create_ticket(
-                        transcript=f"[LANG_GOV] Non-English input blocked (early guard): '{raw_text}'",
-                        summary=f"Language Governance Violation (Strike {self.language_strike_count}/3 - Early Guard)",
+                        transcript=f"[LANG_GOV] Non-English input blocked (interceptor/{lang_result.detection_method}): '{raw_text}'",
+                        summary=f"Language Governance Violation (Strike {self.language_strike_count}/3 - Interceptor)",
                         sentiment="SECURITY_ALERT",
                         call_logger=self.call_logger,
                         call_id=call_id,
@@ -337,21 +304,24 @@ class VoiceOrchestrator:
                         session_obj=self.session
                     )
                 )
-                                             
-                # TRIGGER 3-STRIKE REFUSAL AUDIO (Dynamic based on count)
+
+                # [STATE FIX] Reset silence state so the silence timer does not fire
+                # during or immediately after the refusal audio is played.
+                self.silence_stage = 0
+                self.last_interaction_time = time.time()
+
                 trace_id = str(uuid.uuid4())
                 if self.language_strike_count == 1:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
                 elif self.language_strike_count == 2:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_2
-                else: # Strike 3+
+                else:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_3
 
-                # 🟢 S4 Hardening: Hard LLM Bypass
                 if self.response_task and not self.response_task.done():
                     self.response_task.cancel()
                     logger.debug("[GOVERNANCE] Cancelled pending LLM task for Hard Bypass (Text Strike).")
-                
+
                 self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
 
                 if self.language_strike_count >= 3:
@@ -359,8 +329,8 @@ class VoiceOrchestrator:
                     self.response_task = asyncio.create_task(self._language_termination_flow(refusal_text, trace_id))
                 else:
                     self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
-                
-                return # CRITICAL: Return so it never hits the LLM
+
+                return  # CRITICAL: Return so it never hits the LLM
         
         # ... proceed with English processing ...
         # Task 3 & 4: Start Turn Timer (Include STT Latency)
@@ -485,6 +455,11 @@ class VoiceOrchestrator:
                         self.consecutive_empty_frames = 0
                         self.non_english_run_start = time.time()  # Reset to NOW, not 0.0
 
+                        # [STATE FIX] Reset silence state so the timer does not interrupt
+                        # the refusal audio that is about to play.
+                        self.silence_stage = 0
+                        self.last_interaction_time = time.time()
+
                         # Pick refusal script by strike number
                         if self.language_strike_count == 1:
                             refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
@@ -578,9 +553,19 @@ class VoiceOrchestrator:
             # Fragment too short and ends on a function word — likely incomplete
             self._incomplete_utterance = (self._incomplete_utterance + " " + raw_text).strip()
             logger.debug(f"[ENDPOINTING] Buffered incomplete utterance: '{self._incomplete_utterance}'")
+            # Schedule a 3-second flush so the buffer never starves if the caller
+            # goes quiet without sending a continuation final.
+            if self._buffer_flush_task and not self._buffer_flush_task.done():
+                self._buffer_flush_task.cancel()
+            self._buffer_flush_task = self._create_task_with_log(
+                self._flush_incomplete_utterance(3.0, detected_lang=detected_lang)
+            )
             return  # Wait for continuation before processing
         elif self._incomplete_utterance:
-            # Combine buffered fragment with this continuation
+            # Combine buffered fragment with this continuation; cancel pending flush
+            if self._buffer_flush_task and not self._buffer_flush_task.done():
+                self._buffer_flush_task.cancel()
+                self._buffer_flush_task = None
             text = (self._incomplete_utterance + " " + text).strip()
             raw_text = text
             logger.debug(f"[ENDPOINTING] Combined with buffer: '{raw_text}'")
@@ -660,6 +645,10 @@ class VoiceOrchestrator:
                     )
                 )
                 
+                # [STATE FIX] Reset silence state so the timer does not interrupt the refusal.
+                self.silence_stage = 0
+                self.last_interaction_time = time.time()
+
                 if self.language_strike_count == 1:
                     refusal_text = PRDScripts.REFUSAL_LANGUAGE_1
                 elif self.language_strike_count == 2:
@@ -1015,9 +1004,8 @@ class VoiceOrchestrator:
             self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
             
             # [GOVERNANCE] Auto-terminate if the response concludes the call
-            import string
             normalized_text = text.strip().lower().rstrip(string.punctuation).strip()
-            
+
             if not is_cancelled and normalized_text.endswith("goodbye"):
                 logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in immediate response. Initiating graceful shutdown.")
                 # We skip resetting to LISTENING since we are hanging up
@@ -1040,6 +1028,28 @@ class VoiceOrchestrator:
                 logger.debug(f"[TELEPHONY] Sent 'clear' event to client {target_sid}")
             except Exception as e:
                 logger.error(f"Failed to send clear message: {e}")
+
+    async def _flush_incomplete_utterance(self, delay: float, detected_lang: str = None):
+        """
+        [ENDPOINTING] Flush the _incomplete_utterance buffer after `delay` seconds of
+        silence.  Called when the user says a dangling fragment (e.g. "Tell me about")
+        and then stops talking without sending a continuation final transcript.
+
+        Re-enters _on_transcript with the buffered text so normal processing applies.
+        """
+        await asyncio.sleep(delay)
+        text = self._incomplete_utterance
+        if text:
+            self._incomplete_utterance = ""
+            self._buffer_flush_task = None
+            logger.debug(f"[ENDPOINTING] Flushing buffered utterance after {delay:.0f}s timeout: '{text}'")
+            await self._on_transcript(
+                text,
+                confidence=0.9,
+                stt_latency=0.0,
+                is_final=True,
+                detected_lang=detected_lang,
+            )
 
     async def handle_audio_stream(self, websocket, mode: str = "audio", call_id: str = None, caller_id: str = None):
         """
@@ -1771,7 +1781,6 @@ class VoiceOrchestrator:
                 
                 # [GOVERNANCE] Auto-terminate if the response concludes the call
                 if full_ai_text:
-                    import string
                     normalized_text = full_ai_text.strip().lower().rstrip(string.punctuation).strip()
                     if normalized_text.endswith("goodbye"):
                         logger.info(f"[CALL-TERMINATION] 'Goodbye' detected in AI response. Initiating graceful shutdown.")
