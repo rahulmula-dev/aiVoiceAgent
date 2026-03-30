@@ -23,7 +23,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install FastText language detection (Linux wheel available in slim image)
-RUN pip install --no-cache-dir fasttext-wheel
+# Pin numpy<2.0 — fasttext-wheel uses np.array(copy=False) which breaks in NumPy 2.x
+RUN pip install --no-cache-dir "numpy<2.0" fasttext-wheel
 
 # Download FastText language identification model (lid.176.ftz ~126MB)
 RUN mkdir -p /app/models && \
