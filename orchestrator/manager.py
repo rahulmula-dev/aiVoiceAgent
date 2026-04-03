@@ -97,6 +97,7 @@ class VoiceOrchestrator:
         self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
         self._vad_safety_task = None     # Tracker for Echo Trap recovery
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
+        self._post_tts_ingress_logged = False    # [STAB-02] Arms Log Point 4 after each TTS completion
         self._watchdog_check_time = time.time()  # Throttler for watchdog
         self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
         self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
@@ -810,12 +811,16 @@ class VoiceOrchestrator:
                     self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
                 )
                 return
-            elif current_state == CallState.TRANSCRIBING:
+            elif current_state == CallState.TRANSCRIBING and pre_transition_state in [CallState.SPEAKING, CallState.INTERRUPTED]:
                 # [BARGE-IN FIX]: Dev-Phone / environments that don't send Twilio VAD 'speech' events
                 # never flip state SPEAKING -> INTERRUPTED before the STT final arrives.
                 # By the time we reach here, state has already raced to TRANSCRIBING, but the
                 # response_task is still running (TTS may still be streaming buffered audio).
                 # We must stop TTS output now and answer the user's actual question.
+                # [STAB-02 FIX]: Guard added — pre_transition_state must be SPEAKING or INTERRUPTED.
+                # Without this, a Deepgram continuation final arriving during INTENT_EVAL (agent
+                # thinking, not speaking) would route here, trigger handle_barge_in → INTERRUPTED,
+                # and cause 5-6s of active silence. The else branch below handles that case cleanly.
                 logger.info(f">>> LATE BARGE-IN (state=TRANSCRIBING): Stopping residual TTS for: '{raw_text}'")
                 partial_text = self.synthesizer.stop_current_speech(self.sid)
                 self._create_task_with_log(self._send_clear_message())
@@ -1317,6 +1322,17 @@ class VoiceOrchestrator:
                         try:
                             await self.transcriber.send_audio(payload)
                             self._last_stt_packet_time = time.time()  # [WATCHDOG] Audio delivered → connection is live
+                            # [STAB-02] Log Point 4: first audio frame forwarded to Deepgram post-TTS
+                            if self.state.get_state() == CallState.LISTENING and not self._post_tts_ingress_logged:
+                                self._post_tts_ingress_logged = True
+                                _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                                if self.call_logger:
+                                    self.call_logger.log_event(
+                                        "stab02", "stt_ingress_first_frame_post_tts",
+                                        meta={"turn_number": _turn_num, "state": CallState.LISTENING.value},
+                                        trace_id=getattr(self, '_current_trace_id', None)
+                                    )
+                                logger.info(f"[STAB-02][stt_ingress_first_frame_post_tts] turn={_turn_num} — Deepgram receiving audio post-TTS")
                         except Exception as stt_err:
                             logger.error(f"[FAILOVER] STT send failed: {stt_err}. Attempting recovery...")
                             # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
@@ -1534,6 +1550,21 @@ class VoiceOrchestrator:
                             f"chars={len(sentence)} total_so_far={total_chars} trace={trace_id}"
                         )
 
+                        # [STAB-02] Log Point 1: TTS Entry
+                        _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                        if self.call_logger:
+                            self.call_logger.log_event(
+                                "stab02", "tts_entry",
+                                meta={
+                                    "turn_number": _turn_num,
+                                    "state_before_speaking": self.state.get_state().value,
+                                    "sentence_idx": sentence_idx,
+                                    "text_preview": sentence[:60],
+                                },
+                                trace_id=trace_id
+                            )
+                        logger.info(f"[STAB-02][tts_entry] turn={_turn_num} state={self.state.get_state().value} sentence={sentence_idx} trace={trace_id}")
+
                         # STATE: Speaking
                         self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
                         
@@ -1595,16 +1626,46 @@ class VoiceOrchestrator:
                         logger.debug(f"[TTS-WORKER] Sleeping {remaining_time:.1f}s to align with client playback.")
                         await asyncio.sleep(remaining_time)
                 except asyncio.CancelledError:
-                    logger.info(f"[TTS-WORKER] Cancelled mid-stream (sentence #{sentence_idx}) trace={trace_id}")
+                    # [STAB-02] Log Point 2: TTS completion source — task cancelled
+                    _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab02", "tts_completion_source",
+                            meta={"source": "task_cancelled", "turn_number": _turn_num, "sentence_idx": sentence_idx},
+                            trace_id=trace_id
+                        )
+                    logger.info(f"[STAB-02][tts_completion_source] source=task_cancelled turn={_turn_num} sentence={sentence_idx} trace={trace_id}")
 
                 finally:
                     self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
                     # Back to Listening when done speaking (if not escalated)
                     # [FIX]: Don't overwrite state if user already started INTERRUPTED, TRANSCRIBING, or if AI is generating
-                    if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED, CallState.TRANSCRIBING, CallState.INTENT_EVAL, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
+                    _state_at_finally = self.state.get_state()
+                    _guard_states = [
+                        CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED,
+                        CallState.TRANSCRIBING, CallState.INTENT_EVAL,
+                        CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION
+                    ]
+                    _guard_blocked = _state_at_finally in _guard_states
+                    _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                    # [STAB-02] Log Point 3: SPEAKING → LISTENING transition decision
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab02", "speaking_to_listening_decision",
+                            meta={
+                                "turn_number": _turn_num,
+                                "state_at_finally": _state_at_finally.value,
+                                "guard_blocked": _guard_blocked,
+                                "will_transition": not _guard_blocked,
+                            },
+                            trace_id=trace_id
+                        )
+                    logger.info(f"[STAB-02][speaking_to_listening_decision] turn={_turn_num} state_at_finally={_state_at_finally.value} guard_blocked={_guard_blocked} trace={trace_id}")
+                    if not _guard_blocked and not self._cleanup_done:
                         self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
                         # Reset interaction time so silence monitor starts counting from NOW
                         self.last_interaction_time = time.time()
+                        self._post_tts_ingress_logged = False  # Arm Log Point 4 for next turn
                     logger.info(
                         f"[TTS-WORKER] Done. final_state={self.state.get_state().value} "
                         f"sentences={sentence_idx} total_chars={total_chars} trace={trace_id}"
@@ -2179,7 +2240,11 @@ class VoiceOrchestrator:
         next 10-20s silence -> prompt #2
         continued silence -> termination
         """
-        logger.info("[SILENCE-TIMER] Monitor started")
+        # [STAB-02] Log Point 5a: Silence timer started
+        _sid = self.session.session_id if self.session else "unknown"
+        if self.call_logger:
+            self.call_logger.log_event("stab02", "silence_timer_started", meta={"session_id": _sid})
+        logger.info(f"[STAB-02][silence_timer_started] session={_sid}")
         _last_tick_log = 0.0
         try:
             while not self.stop_event.is_set():
@@ -2270,9 +2335,17 @@ class VoiceOrchestrator:
                 # Periodic tick log every 5s so gaps are always visible in logs
                 _now = time.time()
                 if _now - _last_tick_log >= 5.0:
-                    logger.debug(
-                        f"[SILENCE-TIMER] Tick: gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}"
-                    )
+                    # [STAB-02] Log Point 5b: Silence timer periodic tick
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab02", "silence_timer_tick",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "stage": self.silence_stage,
+                                "state": current_call_state.value,
+                            }
+                        )
+                    logger.info(f"[STAB-02][silence_timer_tick] gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}")
                     _last_tick_log = _now
 
                 # [SILENCE-ISS-158] Contextual Silence Machine
@@ -2280,7 +2353,10 @@ class VoiceOrchestrator:
                 # Stage 1 → 2: Second warning after another 10s
                 # Stage 2 → 3: Termination after another 10s
                 if silence_gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"[SILENCE-TIMER] FIRE stage=1 (first warning) gap={silence_gap:.1f}s")
+                    # [STAB-02] Log Point 5c: Stage fire
+                    if self.call_logger:
+                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 1, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
+                    logger.info(f"[STAB-02][silence_timer_fire] stage=1 gap={silence_gap:.1f}s state={current_call_state.value}")
                     self.silence_stage = 1
                     self.last_interaction_time = time.time() # Reset timer for next stage
                     msg = PRDScripts.SILENCE_1
@@ -2288,7 +2364,9 @@ class VoiceOrchestrator:
 
                 # Stage 2: Secondary Warning
                 elif silence_gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"[SILENCE-TIMER] FIRE stage=2 (second warning) gap={silence_gap:.1f}s")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 2, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
+                    logger.info(f"[STAB-02][silence_timer_fire] stage=2 gap={silence_gap:.1f}s state={current_call_state.value}")
                     self.silence_stage = 2
                     self.last_interaction_time = time.time()
                     msg = PRDScripts.SILENCE_2
@@ -2296,7 +2374,9 @@ class VoiceOrchestrator:
 
                 # Stage 3: Termination
                 elif silence_gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"[SILENCE-TIMER] FIRE stage=3 (termination) gap={silence_gap:.1f}s total≈30s")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 3, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
+                    logger.warning(f"[STAB-02][silence_timer_fire] stage=3 (termination) gap={silence_gap:.1f}s state={current_call_state.value}")
                     await self._trigger_silence_termination()
                     break
 
@@ -2305,7 +2385,9 @@ class VoiceOrchestrator:
         except Exception as e:
             logger.error(f"[SILENCE-TIMER] Error in monitor: {e}", exc_info=True)
         finally:
-            logger.info("[SILENCE-TIMER] Monitor stopped")
+            if self.call_logger:
+                self.call_logger.log_event("stab02", "silence_timer_stopped", meta={"session_id": _sid})
+            logger.info(f"[STAB-02][silence_timer_stopped] session={_sid}")
 
     async def _trigger_silence_termination(self):
         """
