@@ -187,7 +187,7 @@ class CRMClient(CRMEngine):
         except httpx.RequestError as e:
             raise CRMConnectionError(f"Connection Failed: {e}")
 
-    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None, session_obj=None):
+    async def create_ticket(self, transcript, summary, sentiment="Neutral", call_logger=None, call_id=None, title=None, structured_turns=None, session_obj=None, **kwargs):
         """
         Creates a ticket in LeadSquared for the interaction.
         Arguments:
@@ -252,6 +252,7 @@ class CRMClient(CRMEngine):
             "priority": priority,
             "metadata": enhanced_metadata
         }
+        ticket_data.update(kwargs)
         
         try:
             # 2. ATTEMPT CREATION WITH RETRY LOGIC (Pillar 2: Reliability)

@@ -1,9 +1,11 @@
-from .schemas import EscalationEvent, CallContext
 import logging
 import re
+import asyncio
+from enum import Enum
+from typing import Optional
+from .schemas import EscalationEvent, CallContext
 from langdetect import detect_langs, DetectorFactory
 DetectorFactory.seed = 0  # Deterministic results — without this langdetect is non-deterministic
-
 # Module-level logger for Policy Engine
 logger = logging.getLogger("Policy")
 
@@ -14,11 +16,6 @@ class PRDScripts:
     
     # Refusals
     REFUSAL_SENSITIVE = "I cannot continue this conversation due to a violation of our safety policy. Goodbye."
-    REFUSAL_IMMIGRATION = "As an AI for GD College, I cannot provide immigration or visa advice. Please contact a specialized consultant."
-    REFUSAL_MEDICAL = "I am not authorized to provide medical advice. Please consult a healthcare professional."
-    REFUSAL_LEGAL = "I cannot offer legal advice. Please contact a qualified attorney."
-    REFUSAL_INTERNAL_STAFF = "I cannot discuss internal staff or HR matters."
-    REFUSAL_POLITICS = "I cannot discuss political opinions."
     REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
     REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
     REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
@@ -66,11 +63,6 @@ class ResponsePolicyEngine:
 
     # --- 2. HARD REFUSAL CATEGORIES (Polite Refusal - No Retrieval) ---
     HARD_REFUSAL_KEYWORDS = {
-        "immigration": ["visa", "immigration", "permit", "greencard", "pr", "citizenship"],
-        "medical": ["medical", "doctor", "diagnosis", "treatment", "prescription", "health advice"],
-        "legal": ["legal", "lawyer", "sue", "court", "attorney", "contract"],
-        "internal_staff": ["salary", "hr", "staff issues", "employee", "paycheck", "hiring"],
-        "politics": ["politics", "political", "election", "government opinion", "democrat", "republican", "liberal", "conservative"],
         "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
         "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"],
         # T4 fix: Catch explicit jailbreak translation commands before they reach the LLM.
@@ -586,23 +578,8 @@ class ResponsePolicyEngine:
         if intent == "SENSITIVE":
             return PRDScripts.REFUSAL_SENSITIVE
             
-        if intent == "HARD_REFUSAL_IMMIGRATION":
-            return PRDScripts.REFUSAL_IMMIGRATION
-            
-        if intent == "HARD_REFUSAL_MEDICAL":
-            return PRDScripts.REFUSAL_MEDICAL
-            
-        if intent == "HARD_REFUSAL_LEGAL":
-            return PRDScripts.REFUSAL_LEGAL
-            
         if intent == "HARD_REFUSAL_LANGUAGE":
             return PRDScripts.REFUSAL_LANGUAGE
-            
-        if intent == "HARD_REFUSAL_INTERNAL_STAFF":
-            return PRDScripts.REFUSAL_INTERNAL_STAFF
-            
-        if intent == "HARD_REFUSAL_POLITICS":
-            return PRDScripts.REFUSAL_POLITICS
             
         if intent == "HARD_REFUSAL_COMPETITORS":
             return PRDScripts.REFUSAL_COMPETITORS
@@ -618,3 +595,107 @@ class ResponsePolicyEngine:
             return PRDScripts.REFUSAL_LANGUAGE
 
         return PRDScripts.REFUSAL_DEFAULT
+
+# ======================
+# RESTRICTED TOPIC ENUMS
+# ======================
+class RestrictedTopicResult:
+    def __init__(self, is_restricted: bool, category: Optional[str]):
+        self.is_restricted = is_restricted
+        self.category = category
+
+# ======================
+# DETECTION LOGIC
+# ======================
+def detect_restricted_topic(user_input: str) -> RestrictedTopicResult:
+    if not user_input:
+        return RestrictedTopicResult(False, None)
+        
+    text = user_input.lower()
+    
+    # hr_salary
+    if ("how much do" in text and "staff" in text) or ("salary" in text) or ("paid" in text and "staff" in text):
+        return RestrictedTopicResult(True, "hr_salary")
+        
+    # medical_advice
+    if ("medical" in text) or ("medication" in text) or ("prescription" in text) or ("anxiety" in text and "advice" in text):
+        return RestrictedTopicResult(True, "medical_advice")
+        
+    # immigration_guarantee
+    if ("guarantee" in text and "permit" in text) or ("guarantee" in text and "visa" in text) or ("promise" in text and "immigration" in text) or ("guarantee" in text and "enrol" in text):
+        return RestrictedTopicResult(True, "immigration_guarantee")
+        
+    # internal_dispute
+    if "dispute" in text and "staff" in text:
+        return RestrictedTopicResult(True, "internal_dispute")
+        
+    # internal_staff_issue
+    if "staff issue" in text or ("staff" in text and "fired" in text):
+        return RestrictedTopicResult(True, "internal_staff_issue")
+        
+    # political_opinion
+    if "political" in text and ("opinion" in text or "view" in text):
+        return RestrictedTopicResult(True, "political_opinion")
+        
+    # legal_interpretation
+    if "legal interpretation" in text or ("legal" in text and "meaning" in text) or ("interpret" in text and "law" in text):
+        return RestrictedTopicResult(True, "legal_interpretation")
+        
+    return RestrictedTopicResult(False, None)
+
+# ======================
+# HANDLER LOGIC
+# ======================
+async def handle_restricted_topic(context, category: str):
+    logger.info("restricted_topic_detected=true")
+    logger.info(f"restricted_category={category}")
+    logger.info("pre_retrieval_block=true")
+    logger.info("kb_query_attempted=false")
+    
+    exact_response = "I'm not able to help with that topic. I'll arrange for a team member to follow up."
+    
+    session = getattr(context, "session", None)
+    sid = getattr(context, "sid", "unknown_call_id")
+    call_id = session.crm_call_id or session.session_id if session else sid
+    
+    context._create_task_with_log(
+        context.crm.create_ticket(
+            transcript=f"System interjected a restricted topic query: {category}",
+            summary=f"Restricted Topic Blocked - {category}",
+            sentiment="SECURITY_ALERT",
+            call_logger=context.call_logger,
+            call_id=str(call_id),
+            title=f"Restricted Topic - {category}",
+            session_obj=session,
+            callback_required=True,
+            hard_refusal_category=category,
+            sensitive_topic_flag=True
+        )
+    )
+    logger.info("crm_ticket_created=true")
+    
+    if getattr(context, "response_task", None) and not context.response_task.done():
+        context.response_task.cancel()
+        
+    trace_id = f"restricted_topic_term_{category}"
+    from contracts.state import CallState
+    if hasattr(context.state, "transition_to"):
+        context.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+        
+    async def termination_flow():
+        await context.speak_immediate_response(exact_response, trace_id=trace_id)
+        
+        if hasattr(context, "wait_for_tts_flush"):
+            await context.wait_for_tts_flush()
+        else:
+            await asyncio.sleep(len(exact_response) * 0.06)  # dynamic fallback
+            
+        if hasattr(context, "close_connection"):
+            await context.close_connection()
+        else:
+            await context.cleanup()
+            
+        logger.info("call_terminated=true")
+        
+    context._language_termination_active = True
+    context.response_task = asyncio.create_task(termination_flow())

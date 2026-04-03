@@ -183,6 +183,31 @@ class VoiceOrchestrator:
         self._last_stt_packet_time = time.time()  # [CALL-CPR] Reset watchdog
         raw_text = text.strip() if text else ""
         
+        # --- STRICT RESTRICTED TOPIC GATE (Pre-Retrieval) ---
+        if is_final and raw_text:
+            if not hasattr(self, "session_state") or self.session_state is None:
+                self.session_state = {}
+
+            if self.session_state.get("restricted_handled") or self.session_state.get("terminate_session"):
+                return
+
+            from contracts.policy import detect_restricted_topic, handle_restricted_topic
+            rest_result = detect_restricted_topic(raw_text)
+            if rest_result.is_restricted:
+                self.session_state["restricted_handled"] = True
+                self.session_state["terminate_session"] = True
+
+                if not hasattr(self, "flags") or self.flags is None:
+                    self.flags = {}
+                self.flags["block_retrieval"] = True
+
+                await handle_restricted_topic(self, rest_result.category)
+                return
+
+        # Double guarantee: if terminate_session is set, block ALL future text
+        if getattr(self, "session_state", {}).get("terminate_session"):
+            return
+        
         # 1. AGGRESSIVE LOGGING: We must see what the STT actually heard
         # [STT RAW] is used by the Expert Debugger to diagnose "deafness" or "hallucinations"
         # Progress counter added for better forensic visibility
@@ -210,6 +235,9 @@ class VoiceOrchestrator:
 
             # STREAM BUFFERING: Pre-fetch RAG context for partial transcripts
             if len(raw_text) > 15 and self.session:
+                if getattr(self, "flags", {}).get("block_retrieval"):
+                    return
+                    
                 # 🛡️ SECURITY GATE: Prevent policy-violating partial transcripts from hitting external Vector DB
                 intent = self.policy.classify_intent(raw_text, detected_lang=detected_lang)
                 if intent == "PROCEED":
@@ -1642,6 +1670,9 @@ class VoiceOrchestrator:
                     # Use persistent context
                     active_context = self.session.call_context if self.session else None
                     
+                    if getattr(self, "flags", {}).get("block_retrieval"):
+                        return
+                        
                     # Use pre-fetched context if available
                     prefetched_task = getattr(self.session, 'prefetched_context_task', None)
                     if prefetched_task:
@@ -2013,7 +2044,9 @@ class VoiceOrchestrator:
                 
             # LAYERED FALLBACK: Null-Safe Ticket Data (DLQ-wrapped for exception safety)
             try:
-                if self.session and self.session.conversation_history:
+                if getattr(self, "session_state", {}).get("restricted_handled"):
+                    logger.debug("Cleanup: Skipping CRM full session logging (restricted topic already logged).")
+                elif self.session and self.session.conversation_history:
                     logger.debug("Cleanup: Logging full session to CRM")
                     history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
                     

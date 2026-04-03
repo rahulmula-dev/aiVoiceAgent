@@ -58,7 +58,8 @@ class CRMEngine(Protocol):
         transcript: str, 
         summary: str, 
         sentiment: str,
-        structured_turns: Optional[List[Dict[str, Any]]] = None
+        structured_turns: Optional[List[Dict[str, Any]]] = None,
+        **kwargs
     ) -> Any: ...
 
     async def log_call(
