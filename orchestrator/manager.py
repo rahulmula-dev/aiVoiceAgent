@@ -201,8 +201,10 @@ class VoiceOrchestrator:
                     self.flags = {}
                 self.flags["block_retrieval"] = True
 
-                await handle_restricted_topic(self, rest_result.category)
-                return
+                # Synchronous dispatch safety: ensure CRM dispatch before anything else
+                should_block = await handle_restricted_topic(self, rest_result.category, confidence=rest_result.confidence)
+                if should_block:
+                    return
 
         # Double guarantee: if terminate_session is set, block ALL future text
         if getattr(self, "session_state", {}).get("terminate_session"):

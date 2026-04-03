@@ -25,7 +25,9 @@ class PRDScripts:
     REFUSAL_LANGUAGE_3 = "I'm sorry, since I can only assist in English, I will have to end this call now. Please call back when you are ready to proceed in English. Goodbye."
     REFUSAL_KB_MISS = "I'm sorry, I don't have that specific information right now. Let me have an admissions officer follow up with you to provide more details. I can, however, help with general information about programs and admissions!"
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
-    
+    SENSITIVE_REFUSAL_MESSAGE = "That's something our team will need to review. I'll arrange a follow-up."
+    RESTRICTED_REFUSAL_MESSAGE = "I'm not able to help with that topic. I'll arrange for a team member to follow up."
+
     # Apologies
     APOLOGY_CLARIFICATION = "I didn't quite catch that. Could you please repeat?"
     APOLOGY_OVERLOADED = "I am currently overloaded with requests. Please try again in a few seconds."
@@ -64,7 +66,6 @@ class ResponsePolicyEngine:
     # --- 2. HARD REFUSAL CATEGORIES (Polite Refusal - No Retrieval) ---
     HARD_REFUSAL_KEYWORDS = {
         "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
-        "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"],
         # T4 fix: Catch explicit jailbreak translation commands before they reach the LLM.
         # "translate", "en español", "traduce" etc. are injection vectors, not college queries.
         "language_bypass": [
@@ -91,8 +92,6 @@ class ResponsePolicyEngine:
     ANGER_KEYWORDS = [
         "unacceptable",
         "this is unacceptable",
-        "complaint",
-        "file a complaint",
         "frustrated",
         "angry",
         "very angry",
@@ -583,9 +582,6 @@ class ResponsePolicyEngine:
             
         if intent == "HARD_REFUSAL_COMPETITORS":
             return PRDScripts.REFUSAL_COMPETITORS
-            
-        if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES":
-            return PRDScripts.REFUSAL_FINANCIAL_DISPUTES
 
         if intent == "AMBIGUOUS":
             return PRDScripts.APOLOGY_CLARIFICATION
@@ -600,9 +596,10 @@ class ResponsePolicyEngine:
 # RESTRICTED TOPIC ENUMS
 # ======================
 class RestrictedTopicResult:
-    def __init__(self, is_restricted: bool, category: Optional[str]):
+    def __init__(self, is_restricted: bool, category: Optional[str], confidence: str = "high"):
         self.is_restricted = is_restricted
         self.category = category
+        self.confidence = confidence
 
 # ======================
 # DETECTION LOGIC
@@ -613,6 +610,52 @@ def detect_restricted_topic(user_input: str) -> RestrictedTopicResult:
         
     text = user_input.lower()
     
+    # Deterministic Priority: REFUND > FEE_DISPUTE
+    
+    # 1. Refund (Strengthened Semantic Detection)
+    # Synonyms: reimbursement, cashback, return payment, tuition back, get money back
+    refund_synonyms = ["refund", "reimbursement", "cashback", "return my payment", "money back", "pay me back"]
+    if any(s in text for s in refund_synonyms) and any(ctx in text for ctx in ["tuition", "payment", "fee", "college", "course"]):
+        # False Positive Guard: "what is the refund policy"
+        if "what is" in text or "explain" in text or "tell me about" in text or "how do" in text:
+             logger.info(f"[ESCALATION_SKIP] potential_refund_query_detected_but_classified_safe: '{text}'")
+             pass 
+        else:
+            return RestrictedTopicResult(True, "SENSITIVE_REFUND")
+        
+        
+        
+    # 2. Fee dispute (Strengthened Semantic Detection)
+    # Synonyms: overcharged, wrong amount, billing error, incorrect charge
+    dispute_synonyms = ["fee dispute", "overcharg", "incorrect charge", "wrong amount", "billing error", "dispute my fee"]
+    if any(s in text for s in dispute_synonyms):
+        return RestrictedTopicResult(True, "SENSITIVE_FEE_DISPUTE")
+        
+    # 3. Immigration advisory (Strengthened Semantic Detection)
+    # Synonyms: study permit, visa, work permit, residency, citizenship, border
+    immigration_synonyms = ["immigration", "study permit", "visa", "work permit", "residency", "permit renewal", "border services"]
+    if any(s in text for s in immigration_synonyms) and any(act in text for act in ["advice", "help", "legal", "how to", "process", "right"]):
+        # False Positive Guard: "explain visa process" or generic "immigration" mentions
+        if "process" in text and ("explain" in text or "tell me about" in text):
+            logger.info(f"[ESCALATION_SKIP] potential_immigration_query_detected_but_classified_safe: '{text}'")
+            pass
+        else:
+            return RestrictedTopicResult(True, "SENSITIVE_IMMIGRATION")
+        
+        
+        
+    # 4. Legal (Strengthened Semantic Detection)
+    # Synonyms: lawyer, attorney, suing, court, litigation, rights, unlawful
+    legal_synonyms = ["legal right", "lawyer", "attorney", "sue", "suing", "court", "litigation", "unlawful", "lawsuit"]
+    if any(s in text for s in legal_synonyms):
+        return RestrictedTopicResult(True, "SENSITIVE_LEGAL")
+        
+    # 5. Complaint / grievance (Strengthened Semantic Detection)
+    # Synonyms: formal complaint, report, grievance, misconduct, faculty issue
+    complaint_synonyms = ["complaint", "grievance", "misconduct", "report a teacher", "faculty member", "file a report"]
+    if any(s in text for s in complaint_synonyms) and any(act in text for act in ["file", "submit", "against", "official"]):
+        return RestrictedTopicResult(True, "SENSITIVE_COMPLAINT")
+
     # hr_salary
     if ("how much do" in text and "staff" in text) or ("salary" in text) or ("paid" in text and "staff" in text):
         return RestrictedTopicResult(True, "hr_salary")
@@ -646,33 +689,63 @@ def detect_restricted_topic(user_input: str) -> RestrictedTopicResult:
 # ======================
 # HANDLER LOGIC
 # ======================
-async def handle_restricted_topic(context, category: str):
+async def handle_restricted_topic(context, category: str, confidence: str = "high"):
+    # 3. Idempotency safeguard
+    if getattr(context, "_escalation_active", False):
+        return True
+
+    # 4. Production Logging
+    logger.info(f"[ESCALATION] category={category}, confidence={confidence}, sid={getattr(context, 'sid', 'unknown')}")
+    
     logger.info("restricted_topic_detected=true")
     logger.info(f"restricted_category={category}")
     logger.info("pre_retrieval_block=true")
     logger.info("kb_query_attempted=false")
     
-    exact_response = "I'm not able to help with that topic. I'll arrange for a team member to follow up."
-    
+    # Context extraction for CRM
     session = getattr(context, "session", None)
     sid = getattr(context, "sid", "unknown_call_id")
     call_id = session.crm_call_id or session.session_id if session else sid
+
+    # Enum validation guard
+    VALID_SENSITIVE_ENUMS = [
+        "SENSITIVE_REFUND", "SENSITIVE_FEE_DISPUTE", 
+        "SENSITIVE_IMMIGRATION", "SENSITIVE_LEGAL", "SENSITIVE_COMPLAINT"
+    ]
     
-    context._create_task_with_log(
-        context.crm.create_ticket(
-            transcript=f"System interjected a restricted topic query: {category}",
-            summary=f"Restricted Topic Blocked - {category}",
-            sentiment="SECURITY_ALERT",
-            call_logger=context.call_logger,
-            call_id=str(call_id),
-            title=f"Restricted Topic - {category}",
-            session_obj=session,
-            callback_required=True,
-            hard_refusal_category=category,
-            sensitive_topic_flag=True
-        )
-    )
-    logger.info("crm_ticket_created=true")
+    # 3. Enum Safety Check (Fail-closed)
+    # Allows legacy enums but ensures the 5 core sensitive enums trigger the flag.
+    # If it's a completely unrecognized enum, log error and treat it as a restricted topic but without the 'sensitive' flag.
+    KNOWN_RESTRICTED_ENUMS = VALID_SENSITIVE_ENUMS + [
+        "hr_salary", "medical_advice", "immigration_guarantee", 
+        "internal_dispute", "internal_staff_issue", "political_opinion", "legal_interpretation"
+    ]
+    
+    if category not in KNOWN_RESTRICTED_ENUMS:
+        logger.error(f"[RESTRICTED] Invalid enum detected: {category}. Falling back to default restricted handling.")
+        # Do not return False, because we still want to block it, but with safe metadata.
+        category = "UNCLASSIFIED_RESTRICTED"
+
+    ticket_metadata = {
+        "transcript": f"System interjected a restricted topic query: {category} (Conf: {confidence})",
+        "summary": f"Restricted Topic Blocked - {category}",
+        "sentiment": "SECURITY_ALERT",
+        "call_logger": context.call_logger,
+        "call_id": str(call_id),
+        "title": f"Restricted Topic - {category}",
+        "session_obj": session,
+        "callback_required": True,
+        "hard_refusal_category": category,
+        "sensitive_topic_flag": category in VALID_SENSITIVE_ENUMS,
+        "escalation_confidence": confidence # 1. Confidence tagging
+    }
+
+    # 2. CRM Ordering Guarantee: Dispatch synchronously BEFORE termination
+    try:
+        await context.crm.create_ticket(**ticket_metadata)
+        logger.info("crm_ticket_created=true")
+    except Exception as e:
+        logger.error(f"CRM dispatch failed before termination: {e}")
     
     if getattr(context, "response_task", None) and not context.response_task.done():
         context.response_task.cancel()
@@ -683,12 +756,19 @@ async def handle_restricted_topic(context, category: str):
         context.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
         
     async def termination_flow():
-        await context.speak_immediate_response(exact_response, trace_id=trace_id)
+        script_to_use = (
+            PRDScripts.SENSITIVE_REFUSAL_MESSAGE 
+            if category in VALID_SENSITIVE_ENUMS 
+            else PRDScripts.RESTRICTED_REFUSAL_MESSAGE
+        )
+        # Immediate refusal script playback
+        await context.speak_immediate_response(script_to_use, trace_id=trace_id)
         
+        # Flush and disconnect
         if hasattr(context, "wait_for_tts_flush"):
             await context.wait_for_tts_flush()
         else:
-            await asyncio.sleep(len(exact_response) * 0.06)  # dynamic fallback
+            await asyncio.sleep(len(script_to_use) * 0.06)  # dynamic fallback
             
         if hasattr(context, "close_connection"):
             await context.close_connection()
@@ -699,3 +779,7 @@ async def handle_restricted_topic(context, category: str):
         
     context._language_termination_active = True
     context.response_task = asyncio.create_task(termination_flow())
+    
+    # CRITICAL: Prevent ANY further orchestration execution
+    context._escalation_active = True
+    return True # Signal that high-level orchestration MUST stop immediately
