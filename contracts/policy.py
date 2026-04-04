@@ -51,6 +51,11 @@ class PRDScripts:
     WRAP_UP = "Before we wrap up, is there anything else I can help with?"
     WRAP_UP_TERMINATION = "Our maximum session time has been reached. Thank you for calling GD College. Goodbye."
 
+    # Barge-In Continuation Offer (STAB-03)
+    # Spoken ONCE per session when a multi-step answer is abandoned via a NEW_TOPIC barge-in.
+    # Only injected programmatically — the LLM is explicitly forbidden from generating this spontaneously.
+    CONTINUATION_OFFERED = "I can also finish walking you through the remaining steps if that's helpful."
+
 class ResponsePolicyEngine:
     """
     Standard implementation of Policy Engine.

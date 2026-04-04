@@ -229,6 +229,22 @@ class VoiceOrchestrator:
                         self.state.transition_to(CallState.INTERRUPTED)
                         halt_ms = int((asyncio.get_event_loop().time() - halt_start) * 1000)
                         logger.info(f">>> BARGE-IN (Partial, ~{halt_ms}ms halt): '{raw_text}'")
+                        # [STAB-03] Latency instrumentation — AC requires stop_current_speech delta < 300ms
+                        _pass = halt_ms < 300
+                        if self.call_logger:
+                            self.call_logger.log_event(
+                                "stab03", "latency_check",
+                                latency_ms=halt_ms,
+                                meta={
+                                    "check": "stop_current_speech_delta",
+                                    "pass": _pass,
+                                    "threshold_ms": 300,
+                                    "partial_text_preview": raw_text[:40],
+                                },
+                                trace_id=getattr(self, '_current_trace_id', None)
+                            )
+                        if not _pass:
+                            logger.warning(f"[STAB-03][latency_check] FAIL halt={halt_ms}ms > 300ms threshold")
 
             # Reset silence timer on partials — but ONLY when the agent is not speaking.
             # During SPEAKING, Twilio echoes TTS audio back as partial transcripts (non-final),
@@ -943,16 +959,26 @@ class VoiceOrchestrator:
             # STEP D — Update Interrupted Turn
             if classification == "NEW_TOPIC" and prev_turn:
                 prev_turn.agent_response_status = "abandoned"
+                # [STAB-03] Clear stale RAG context so the LLM cannot hallucinate the old topic
+                # into the new answer. prefetched_context_task and retrieved_chunks_cache are
+                # turn-scoped — they must not bleed across a topic boundary.
+                if self.session:
+                    self.session.prefetched_context_task = None
+                    self.session.retrieved_chunks_cache = []
+                    self.session.last_intent = None
 
             if prev_turn:
                 prev_turn.barge_in_classification = classification
 
-            # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+            # [STAB-03] Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+            # Fires ONCE per session when a multi-step answer is abandoned (NEW_TOPIC barge-in).
+            # Uses PRDScripts.CONTINUATION_OFFERED so the script is centrally managed.
+            _continuation_was_offered = False
             if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
-                # Append soft offer to the end of the new response
                 if response and not response.endswith(("?", ".")): response += "."
-                response += " I can also finish walking you through the remaining steps if that's helpful."
+                response += f" {PRDScripts.CONTINUATION_OFFERED}"
                 self.session.continuation_offered = True
+                _continuation_was_offered = True
 
             # STEP E — Create New Turn Entry
             new_id = len(self.session.structured_turns) + 1
@@ -964,7 +990,7 @@ class VoiceOrchestrator:
                 agent_partial_response=None,
                 barge_in_classification=None,
                 is_multi_step=is_multi_step,
-                continuation_offered=False
+                continuation_offered=_continuation_was_offered  # [STAB-03] accurately reflects whether offer was appended
             )
             self.session.structured_turns.append(new_turn)
             self.session.current_speaking_turn_id = new_id

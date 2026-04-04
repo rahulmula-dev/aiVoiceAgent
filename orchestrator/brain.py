@@ -46,12 +46,18 @@ class Brain(LLMEngine):
             RESPONSE RULES:
             - Always answer directly and naturally. Never start your response with labels like 'RETRIEVE:', 'GUARD:', 'N/A', or any internal tags.
             - Base your answers on the provided [KB CONTEXT].
-            - If the context does not contain the answer, politely inform the user you don't have that specific detail yet and offer to help with other topics (programs, location, etc.). 
+            - If the context does not contain the answer, politely inform the user you don't have that specific detail yet and offer to help with other topics (programs, location, etc.).
             - Use the script ONLY if the query is totally unrelated or invalid: "{self.KB_MISS_SCRIPT}"
             - Only speak English. If a non-English query is detected, say: "{PRDScripts.REFUSAL_LANGUAGE}"
             - If the user's input contains significant non-English words or phrases mixed into English sentences (e.g. Hinglish, Franglais, or code-switching), respond only with: "{PRDScripts.REFUSAL_LANGUAGE}" and do not answer the underlying question.
             - Keep responses concise (1-2 sentences maximum), professional, and warm.
             - Use the caller's name if you know it, to make the conversation feel personal.
+
+            BARGE-IN BEHAVIOR (when the caller interrupts):
+            - Category A — NEW_TOPIC: The caller has switched subjects entirely. Respond directly to their new question. Make zero reference to the previous topic or interrupted sentence.
+            - Category B — SAME_TOPIC: The caller wants clarification or continuation on the same topic. Incorporate their clarification naturally and continue without restarting from scratch.
+            - Category C — AMBIGUOUS: Intent is unclear. Respond to the most likely interpretation of their input. NEVER ask meta-questions such as "Should I continue from where I left off?" or "Would you like me to finish?". Just answer.
+            - The soft continuation offer ("I can also finish walking you through the remaining steps...") is inserted by the system automatically when appropriate — you must never generate it spontaneously.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -132,9 +138,17 @@ class Brain(LLMEngine):
         USER INPUT (Barge-in): {caller_input}
         {context_block}
 
-        RULES:
-        - Provide a direct, standalone response to the user's new query using only the context below. Ignore the previous interrupted sentence.
-        - ALWAYS prioritize the [KNOWLEDGE BASE CONTEXT] for your answers if it is provided.
+        CLASSIFICATION DEFINITIONS:
+        - NEW_TOPIC: The caller has switched to an entirely different subject with no connection to the previous response.
+        - SAME_TOPIC: The caller is seeking clarification, more detail, or continuation on the same subject that was being discussed.
+        - AMBIGUOUS: The intent could plausibly fit either category, or is too short to determine with confidence.
+
+        RESPONSE RULES BY CLASSIFICATION:
+        - NEW_TOPIC: Respond directly and completely to the new query. Make zero reference to the previous topic or interrupted sentence.
+        - SAME_TOPIC: Incorporate the caller's clarification naturally. Continue from the interrupted exchange without restarting from the beginning.
+        - AMBIGUOUS: Respond to the most likely interpretation of the input. Do NOT ask meta-questions such as "Should I continue from where I left off?" — just answer directly.
+
+        ALWAYS prioritize the [KNOWLEDGE BASE CONTEXT] for factual answers. Keep the response concise (1-2 sentences), warm, and professional.
 
         You must respond in VALID JSON format ONLY:
         {{

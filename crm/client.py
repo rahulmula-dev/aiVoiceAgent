@@ -227,12 +227,25 @@ class CRMClient(CRMEngine):
         # Forensic Metadata Enrichment (Task 6)
         enhanced_metadata = {}
         if structured_turns:
-            # [FIX] Pydantic models are not JSON serializable by default. 
+            # [FIX] Pydantic models are not JSON serializable by default.
             # Convert the list of models to a list of dicts.
-            enhanced_metadata["structured_turns"] = [
-                turn.model_dump() if hasattr(turn, 'model_dump') else turn.dict() if hasattr(turn, 'dict') else turn 
+            turns_serialized = [
+                turn.model_dump() if hasattr(turn, 'model_dump') else turn.dict() if hasattr(turn, 'dict') else turn
                 for turn in structured_turns
             ]
+            enhanced_metadata["structured_turns"] = turns_serialized
+
+            # [STAB-03] Surface barge-in classification fields as top-level CRM metadata
+            # so CRM dashboards can filter/aggregate without parsing the nested turns array.
+            barge_in_turns = [t for t in turns_serialized if t.get("barge_in_classification")]
+            if barge_in_turns:
+                enhanced_metadata["barge_in_summary"] = {
+                    "total_barge_ins": len(barge_in_turns),
+                    "classifications": [t["barge_in_classification"] for t in barge_in_turns],
+                    "any_continuation_offered": any(t.get("continuation_offered") for t in barge_in_turns),
+                    "any_multi_step_interrupted": any(t.get("is_multi_step") for t in barge_in_turns),
+                    "abandoned_turns": sum(1 for t in turns_serialized if t.get("agent_response_status") == "abandoned"),
+                }
         
         if session_obj:
             if session_obj.interruption_snapshot:
