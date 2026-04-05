@@ -94,6 +94,7 @@ class VoiceOrchestrator:
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
         self.last_response_was_question = False
+        self._last_ai_question_text = ""    # [STAB-04] Stores last AI response when it ended with "?"
         self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
         self._vad_safety_task = None     # Tracker for Echo Trap recovery
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
@@ -1922,6 +1923,8 @@ class VoiceOrchestrator:
                     worker_task.cancel()
             logger.info(f"AI: {full_ai_text.strip()}")
             self.last_response_was_question = full_ai_text.strip().endswith("?")
+            if self.last_response_was_question:
+                self._last_ai_question_text = full_ai_text.strip()  # [STAB-04] For post-clarification repeat
             # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
@@ -2260,42 +2263,53 @@ class VoiceOrchestrator:
 
     async def _monitor_silence(self):
         """
-        Background task to monitor user silence and trigger re-engagement prompts.
-        Implements Story S4-2 logic:
-        10-20s silence -> prompt #1
-        next 10-20s silence -> prompt #2
-        continued silence -> termination
+        [STAB-04] PRD §6.4-compliant silence monitor — 2-stage, 0.5 s tick.
+
+        Three contexts:
+          Post-Response:      10 s → soft prompt (SILENCE_1); 20 s total → graceful termination.
+          Post-Clarification: Same 10/20 cadence; stage-1 prompt repeats the clarifying question
+                              instead of the generic SILENCE_1 script.
+          Mid-Query Grace:    3 s grace period applied when caller exits TRANSCRIBING without
+                              a final transcript (e.g. clears throat, stops mid-sentence).
+
+        Tick interval is 0.5 s to stay within PRD's ±1 s tolerance.
+        Thresholds are read from config (env-overridable: SILENCE_SOFT_PROMPT_S / SILENCE_TERMINATION_S).
         """
-        # [STAB-02] Log Point 5a: Silence timer started
         _sid = self.session.session_id if self.session else "unknown"
         if self.call_logger:
-            self.call_logger.log_event("stab02", "silence_timer_started", meta={"session_id": _sid})
-        logger.info(f"[STAB-02][silence_timer_started] session={_sid}")
+            self.call_logger.log_event("stab04", "silence_timer_started", meta={"session_id": _sid})
+        logger.info(f"[STAB-04][silence_timer_started] session={_sid}")
+
         _last_tick_log = 0.0
+        _midquery_grace_until = 0.0  # future timestamp: silence counting resumes after this
+
         try:
             while not self.stop_event.is_set():
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
-                # 1. State Guard: DO NOT count silence while AI is busy.
-                # If we are speaking, thinking, or transcribing, the user is 'interacting' or waiting.
-                # Includes INTERRUPTED, RETRIEVAL, and VALIDATION states.
+                # ── 1. State Guard ────────────────────────────────────────────────────
+                # Don't count silence while AI is actively processing or speaking.
                 current_call_state = self.state.get_state()
                 if current_call_state in [
                     CallState.SPEAKING,
                     CallState.INTENT_EVAL,
-                    CallState.TRANSCRIBING,
                     CallState.ESCALATION,
                     CallState.RETRIEVAL,
-                    CallState.RESPONSE_VALIDATION
+                    CallState.RESPONSE_VALIDATION,
                 ]:
-                    # Keep the 'interaction' timestamp fresh so we don't 'timeout' mid-thought.
                     self.last_interaction_time = time.time()
                     logger.debug(f"[SILENCE-TIMER] Suppressed (state={current_call_state.value}), resetting timer")
                     continue
 
-                # 2. Maximum Session Limit check (6 minutes)
+                # Mid-Query Grace: while transcribing, keep interaction time fresh AND
+                # arm a 3 s forward grace window so silence counting doesn't resume the
+                # instant the partial stops (e.g. caller pauses mid-sentence).
+                if current_call_state == CallState.TRANSCRIBING:
+                    self.last_interaction_time = time.time()
+                    _midquery_grace_until = time.time() + 3.0
+                    continue
 
-                # 2. Session Duration / Wrap-up Guard
+                # ── 2. Session Duration / Wrap-up Guard ──────────────────────────────
                 elapsed = None
                 if self.session_start_wall_time is not None:
                     elapsed = time.time() - self.session_start_wall_time
@@ -2305,13 +2319,11 @@ class VoiceOrchestrator:
                     except Exception:
                         elapsed = None
 
-                # Trigger wrap-up notification at 5.0 minutes (300s)
                 if elapsed is not None and elapsed >= 300.0 and not self.wrapup_triggered:
                     logger.info(f"Wrap-up prompt triggered at {elapsed:.1f}s.")
                     self.wrapup_triggered = True
                     if self.session:
                         try:
-                            # Create a lightweight CRM ticket for wrap-up
                             await self.crm.create_ticket(
                                 transcript="[System]: Session approaching 6-minute limit. Wrap-up prompt played.",
                                 summary="Session Wrap-up Triggered",
@@ -2322,26 +2334,19 @@ class VoiceOrchestrator:
                             )
                         except Exception as e:
                             logger.error(f"Failed to create Session Wrap-up CRM ticket: {e}")
-
-                    # Speak wrap-up script to caller
                     try:
                         await self.speak_immediate_response(PRDScripts.WRAP_UP)
                     except Exception as e:
                         logger.error(f"Error speaking WRAP_UP prompt: {e}")
 
-                # Hard stop at 6 minutes
                 if elapsed is not None and elapsed >= 360.0:
                     logger.warning(f"Session duration limit reached ({elapsed:.1f}s). Initiating wrap-up termination.")
                     if self.session:
                         self.session.termination_reason = "wrapup_timeout"
-                    
-                    # Speak termination script first
                     try:
                         await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
                     except Exception as e:
                         logger.error(f"Error speaking WRAP_UP_TERMINATION prompt: {e}")
-                        
-                    # Transition to CALL_END and cleanup
                     try:
                         self.state.transition_to(CallState.CALL_END)
                     except Exception:
@@ -2349,60 +2354,79 @@ class VoiceOrchestrator:
                     await self.cleanup()
                     break
 
-                # 1.5 Auto-Recovery for False Interruptions
+                # ── 1.5 Auto-Recovery for False Interruptions ─────────────────────────
                 if current_call_state == CallState.INTERRUPTED:
                     if time.time() - self.last_interaction_time > 5.0:
                         logger.info("[RECOVERY] False interruption or noise detected. Reverting INTERRUPTED -> LISTENING.")
                         self.state.transition_to(CallState.LISTENING)
 
-                # 2. Silence Stage Logic
-                silence_gap = time.time() - self.last_interaction_time
+                # ── 3. Silence Gap (mid-query grace applied) ─────────────────────────
+                # effective_last: whichever is later — true last interaction OR grace window end.
+                # silence_gap is clamped to ≥ 0 so negative values (grace still active) are safe.
+                effective_last = max(self.last_interaction_time, _midquery_grace_until)
+                silence_gap = max(0.0, time.time() - effective_last)
 
-                # Periodic tick log every 5s so gaps are always visible in logs
+                soft_s = self.config.silence_soft_prompt_s          # PRD default: 10 s
+                stage2_s = self.config.silence_termination_s - soft_s  # PRD default: 10 s after prompt
+
+                # Periodic tick log every 5 s
                 _now = time.time()
                 if _now - _last_tick_log >= 5.0:
-                    # [STAB-02] Log Point 5b: Silence timer periodic tick
                     if self.call_logger:
                         self.call_logger.log_event(
-                            "stab02", "silence_timer_tick",
+                            "stab04", "silence_timer_tick",
                             meta={
                                 "gap_s": round(silence_gap, 2),
                                 "stage": self.silence_stage,
                                 "state": current_call_state.value,
+                                "grace_active": _midquery_grace_until > _now,
                             }
                         )
-                    logger.info(f"[STAB-02][silence_timer_tick] gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}")
+                    logger.info(
+                        f"[STAB-04][silence_timer_tick] gap={silence_gap:.1f}s "
+                        f"stage={self.silence_stage} state={current_call_state.value} "
+                        f"grace={'yes' if _midquery_grace_until > _now else 'no'}"
+                    )
                     _last_tick_log = _now
 
-                # [SILENCE-ISS-158] Contextual Silence Machine
-                # Stage 0 → 1: First warning at 10s (fires before phoneme path's 16s)
-                # Stage 1 → 2: Second warning after another 10s
-                # Stage 2 → 3: Termination after another 10s
-                if silence_gap > 10.0 and self.silence_stage == 0:
-                    # [STAB-02] Log Point 5c: Stage fire
+                # ── Stage 0 → 1: Soft prompt at soft_s (PRD: 10 s) ──────────────────
+                if silence_gap > soft_s and self.silence_stage == 0:
                     if self.call_logger:
-                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 1, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
-                    logger.info(f"[STAB-02][silence_timer_fire] stage=1 gap={silence_gap:.1f}s state={current_call_state.value}")
+                        self.call_logger.log_event(
+                            "stab04", "soft_prompt_fired",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "was_question": self.last_response_was_question,
+                                "state": current_call_state.value,
+                            }
+                        )
+                    logger.info(
+                        f"[STAB-04][soft_prompt_fired] gap={silence_gap:.1f}s "
+                        f"was_question={self.last_response_was_question} state={current_call_state.value}"
+                    )
                     self.silence_stage = 1
-                    self.last_interaction_time = time.time() # Reset timer for next stage
-                    msg = PRDScripts.SILENCE_1
-                    await self.speak_immediate_response(msg)
+                    self.last_interaction_time = time.time()  # Reset timer for stage 2
+                    # Post-clarification path: repeat the question so caller has full context.
+                    # Generic path: standard "Are you still there?" prompt.
+                    if self.last_response_was_question and self._last_ai_question_text:
+                        prompt = self._last_ai_question_text
+                    else:
+                        prompt = PRDScripts.SILENCE_1
+                    await self.speak_immediate_response(prompt)
 
-                # Stage 2: Secondary Warning
-                elif silence_gap > 10.0 and self.silence_stage == 1:
+                # ── Stage 1 → Termination at stage2_s after the prompt (PRD: 20 s total) ─
+                elif silence_gap > stage2_s and self.silence_stage == 1:
                     if self.call_logger:
-                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 2, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
-                    logger.info(f"[STAB-02][silence_timer_fire] stage=2 gap={silence_gap:.1f}s state={current_call_state.value}")
-                    self.silence_stage = 2
-                    self.last_interaction_time = time.time()
-                    msg = PRDScripts.SILENCE_2
-                    await self.speak_immediate_response(msg)
-
-                # Stage 3: Termination
-                elif silence_gap > 10.0 and self.silence_stage == 2:
-                    if self.call_logger:
-                        self.call_logger.log_event("stab02", "silence_timer_fire", meta={"stage": 3, "gap_s": round(silence_gap, 2), "state": current_call_state.value})
-                    logger.warning(f"[STAB-02][silence_timer_fire] stage=3 (termination) gap={silence_gap:.1f}s state={current_call_state.value}")
+                        self.call_logger.log_event(
+                            "stab04", "graceful_termination",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "state": current_call_state.value,
+                            }
+                        )
+                    logger.warning(
+                        f"[STAB-04][graceful_termination] gap={silence_gap:.1f}s state={current_call_state.value}"
+                    )
                     await self._trigger_silence_termination()
                     break
 
@@ -2412,16 +2436,44 @@ class VoiceOrchestrator:
             logger.error(f"[SILENCE-TIMER] Error in monitor: {e}", exc_info=True)
         finally:
             if self.call_logger:
-                self.call_logger.log_event("stab02", "silence_timer_stopped", meta={"session_id": _sid})
-            logger.info(f"[STAB-02][silence_timer_stopped] session={_sid}")
+                self.call_logger.log_event("stab04", "silence_timer_stopped", meta={"session_id": _sid})
+            logger.info(f"[STAB-04][silence_timer_stopped] session={_sid}")
 
     async def _trigger_silence_termination(self):
         """
-        [MEDIUM-P5-04] Preemption: Kill hanging tasks before speaking final refusal.
+        [STAB-04] PRD §6.4 graceful termination.
+        1. CRM callback ticket if any turns were left interrupted/abandoned.
+        2. Preemptive cleanup (kills hanging Brain/RAG tasks).
+        3. Speak SILENCE_TERMINATION farewell.
         """
-        self.silence_stage = 3 # Prevent loops
+        self.silence_stage = 3  # Prevent re-entry
         if self.session:
             self.session.termination_reason = "silence_termination"
+
+        # [STAB-04] CRM callback — only when the caller was mid-conversation (incomplete turns).
+        # Fire-and-forget via _create_task_with_log so cleanup is not blocked.
+        if self.session and self.crm:
+            incomplete_turns = [
+                t for t in getattr(self.session, "structured_turns", [])
+                if getattr(t, "agent_response_status", None) in ("interrupted", "abandoned")
+            ]
+            if incomplete_turns:
+                try:
+                    self._create_task_with_log(self.crm.create_ticket(
+                        transcript="[System]: Call ended due to silence. One or more turns were left incomplete.",
+                        summary="Silence Termination — Incomplete Turns",
+                        sentiment="Negative",
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or self.session.session_id,
+                        title="Silence_Termination_Incomplete",
+                        structured_turns=self.session.structured_turns,
+                        session_obj=self.session,
+                    ))
+                    logger.info(
+                        f"[STAB-04] CRM silence callback fired — {len(incomplete_turns)} incomplete turn(s)"
+                    )
+                except Exception as e:
+                    logger.error(f"[STAB-04] CRM silence callback failed: {e}")
 
         # Preemptive Cleanup: Kills hanging Brain/RAG tasks immediately
         await self.cleanup()
@@ -2429,8 +2481,9 @@ class VoiceOrchestrator:
         # Speak final termination while socket is in CALL_END state but still open
         try:
             self.state.transition_to(CallState.CALL_END)
-        except: pass
-        
+        except Exception:
+            pass
+
         goodbye = PRDScripts.SILENCE_TERMINATION
         await self.speak_immediate_response(goodbye)
 

@@ -184,5 +184,25 @@ class FeatureConfig:
             return 10
         return int(os.getenv("DEEPGRAM_MIN_CONNECTIONS", "2"))
 
+    # --- SILENCE TIMER THRESHOLDS (PRD §6.4) ---
+
+    @property
+    def silence_soft_prompt_s(self) -> float:
+        """
+        Silence duration before the soft re-engagement prompt (PRD §6.4: 10 s).
+        Override via SILENCE_SOFT_PROMPT_S env var.
+        """
+        return float(os.getenv("SILENCE_SOFT_PROMPT_S", "10"))
+
+    @property
+    def silence_termination_s(self) -> float:
+        """
+        Total silence duration before graceful call termination (PRD §6.4: 20 s total).
+        Timer resets at the soft-prompt stage, so the second stage is
+        (silence_termination_s - silence_soft_prompt_s) seconds after the prompt plays.
+        Override via SILENCE_TERMINATION_S env var.
+        """
+        return float(os.getenv("SILENCE_TERMINATION_S", "20"))
+
 # Global instance for easy access if needed, though injection is preferred
 config = FeatureConfig()
