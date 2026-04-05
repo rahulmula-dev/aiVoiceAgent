@@ -6,9 +6,9 @@ Verifies PRD §4.1 / Escalation Spec v1.1 §6.2 compliance:
   AC1 — Low-confidence RAG score yields verbatim LOW_CONFIDENCE_FALLBACK (no LLM call)
   AC2 — Verbatim phrase is exactly "I don't have that information right now."
   AC3 — CALLBACK_OFFER is spoken immediately after the fallback
-  AC4 — Caller says "Yes" → CRM ticket created with callback_required, call ends
+  AC4 — Caller says "Yes" → CRM ticket created with Callback_Required_KB_Miss, call ends
   AC5 — Caller says "No" → ANYTHING_ELSE spoken, call remains in LISTENING
-  AC6 — Category-specific threshold: fee query at score 0.59 (< 0.60 threshold) triggers fallback
+  AC6 — Category-specific threshold: fee query at score 0.59 (< 0.60) triggers fallback
   AC7 — High-confidence score (>= threshold) does NOT trigger fallback (LLM path taken)
 
 Run:
@@ -19,18 +19,54 @@ import sys
 import os
 import asyncio
 import unittest
-from unittest.mock import MagicMock, AsyncMock, patch, call
+from unittest.mock import MagicMock, AsyncMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from orchestrator.manager import VoiceOrchestrator
 from contracts.state import CallState
 from contracts.policy import PRDScripts
-from models.schemas import StandardTurn
 
 
 # ---------------------------------------------------------------------------
-# Fixture helpers
+# Async generator helpers — must be *functions* (called per-test), not objects
+# ---------------------------------------------------------------------------
+
+def _kb_miss_gen(
+    caller_query="What are the tuition fees?",
+    rag_score=0.42,
+    threshold=0.58,
+):
+    """Returns an async-generator *function* that yields one KB miss tuple."""
+    async def _gen(*args, **kwargs):
+        yield (
+            PRDScripts.LOW_CONFIDENCE_FALLBACK,
+            {
+                "error": "kb_miss",
+                "has_grounding": False,
+                "rag_score": rag_score,
+                "category_threshold": threshold,
+                "caller_query": caller_query,
+            },
+        )
+    return _gen
+
+
+def _normal_gen(text="Here is what you need to know about our programs."):
+    """Returns an async-generator *function* that yields one normal LLM response."""
+    async def _gen(*args, **kwargs):
+        yield (text, {"rag_score": 0.80, "has_grounding": True, "topic": "Programs"})
+    return _gen
+
+
+async def _null_speak_gen(*args, **kwargs):
+    """Async generator that yields nothing — stands in for synthesizer.speak()."""
+    return
+    yield  # Makes it an async generator without yielding audio chunks
+
+
+# ---------------------------------------------------------------------------
+# Fixture helper
 # ---------------------------------------------------------------------------
 
 def _make_mgr():
@@ -42,7 +78,7 @@ def _make_mgr():
     stt.set_listener_error_callback = MagicMock()
 
     tts = MagicMock()
-    tts.speak = AsyncMock()
+    tts.speak = _null_speak_gen          # async generator — no chunks, returns immediately
     tts.stop_current_speech = MagicMock(return_value="")
     tts.close = AsyncMock()
 
@@ -57,10 +93,13 @@ def _make_mgr():
     session.crm_call_id = "stab05_crm"
     session.conversation_history = []
     session.structured_turns = []
+    session.current_speaking_turn_id = 0
     session.call_context = MagicMock()
     session.call_context.kb_version_id = None
     session.call_context.chunk_ids_used = []
     session.call_context.caller_number = "+10000000000"
+    session.call_context.last_intents = []
+    session.call_context.retrieved_chunks_snapshot = None
     session.confidence_scores = []
     session.continuation_offered = False
     session.prefetched_context_task = None
@@ -86,30 +125,38 @@ def _make_mgr():
     return mgr
 
 
-def _kb_miss_stream(caller_query="What are the tuition fees?", rag_score=0.42, threshold=0.58):
+async def _run_generate_and_speak(mgr, text, gen_fn):
     """
-    Async generator that mimics brain.generate_stream() yielding a KB miss tuple.
-    The caller_query is injected into the error_meta so the manager can store it.
+    Drive generate_and_speak() with a controlled async-generator mock for brain.generate_stream.
+    Captures all speak_immediate_response calls.
     """
-    async def _gen():
-        yield (
-            PRDScripts.LOW_CONFIDENCE_FALLBACK,
-            {
-                "error": "kb_miss",
-                "has_grounding": False,
-                "rag_score": rag_score,
-                "category_threshold": threshold,
-                "caller_query": caller_query,
-            }
+    spoken = []
+
+    async def mock_speak_immediate(text, **_):
+        spoken.append(text)
+
+    # tts_worker sleeps `remaining_time` = chars/10 - generation_time.
+    # Patch asyncio.sleep inside generate_and_speak scope to return immediately.
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *a, **kw):
+        # Only skip the tts_worker's playback sleep (> 0.1 s); keep yields (0 s) intact.
+        if delay > 0.1:
+            return
+        await original_sleep(0)
+
+    mgr.brain.generate_stream = gen_fn
+
+    with patch.object(mgr, "speak_immediate_response", side_effect=mock_speak_immediate), \
+         patch("asyncio.sleep", side_effect=fast_sleep), \
+         patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock), \
+         patch.object(mgr, "_send_response_chunk", new_callable=AsyncMock):
+        await asyncio.wait_for(
+            mgr.generate_and_speak(text, trace_id="stab05_trace"),
+            timeout=10.0
         )
-    return _gen()
 
-
-def _normal_stream(text="Here is what you need to know about our programs."):
-    """Async generator mimicking a normal LLM response (no kb_miss)."""
-    async def _gen():
-        yield (text, {"rag_score": 0.75, "has_grounding": True, "topic": "Programs"})
-    return _gen()
+    return spoken
 
 
 # ---------------------------------------------------------------------------
@@ -119,73 +166,64 @@ def _normal_stream(text="Here is what you need to know about our programs."):
 class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
 
     # -----------------------------------------------------------------------
-    # AC1 + AC2 — Low-confidence score yields verbatim fallback, LLM not called
+    # AC1 — Low-confidence score yields verbatim fallback, LLM not called
     # -----------------------------------------------------------------------
     async def test_low_confidence_yields_verbatim_fallback(self):
         """
-        When brain.generate_stream yields a kb_miss tuple, the spoken response
-        must be exactly PRDScripts.LOW_CONFIDENCE_FALLBACK — no LLM paraphrase.
+        When generate_stream yields a kb_miss tuple, the spoken output must include
+        PRDScripts.LOW_CONFIDENCE_FALLBACK — the LLM is bypassed entirely.
         """
         mgr = _make_mgr()
         mgr.state.transition_to(CallState.LISTENING)
 
-        spoken = []
-        async def mock_speak(text, trace_id=None):
-            spoken.append(text)
+        spoken = await _run_generate_and_speak(
+            mgr, "What are the tuition fees?", _kb_miss_gen()
+        )
 
-        with patch.object(mgr.brain, "generate_stream", return_value=_kb_miss_stream()), \
-             patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock):
-            await mgr.generate_and_speak("What are the tuition fees?", trace_id="t1")
-
-        # The verbatim fallback must be in the audio queue output
         all_spoken = " ".join(spoken)
         self.assertIn(
             PRDScripts.LOW_CONFIDENCE_FALLBACK, all_spoken,
-            "FAIL (AC1/AC2): Verbatim LOW_CONFIDENCE_FALLBACK not spoken."
+            "FAIL (AC1): LOW_CONFIDENCE_FALLBACK not spoken on KB miss."
         )
 
     # -----------------------------------------------------------------------
-    # AC2 — Exact string match
+    # AC2 — Verbatim phrase exact match
     # -----------------------------------------------------------------------
     def test_verbatim_phrase_exact_match(self):
-        """
-        PRDScripts.LOW_CONFIDENCE_FALLBACK must be EXACTLY the required string.
-        Any variation is a PRD violation.
-        """
+        """PRDScripts.LOW_CONFIDENCE_FALLBACK must match the PRD §4.1 required string exactly."""
         required = "I don't have that information right now."
         self.assertEqual(
             PRDScripts.LOW_CONFIDENCE_FALLBACK, required,
-            f"FAIL (AC2): Verbatim phrase mismatch. Got: '{PRDScripts.LOW_CONFIDENCE_FALLBACK}'"
+            f"FAIL (AC2): Verbatim mismatch. Got: '{PRDScripts.LOW_CONFIDENCE_FALLBACK}'"
         )
 
     # -----------------------------------------------------------------------
-    # AC3 — CALLBACK_OFFER spoken immediately after fallback
+    # AC3 — CALLBACK_OFFER spoken after fallback, in correct order
     # -----------------------------------------------------------------------
     async def test_callback_offer_spoken_after_fallback(self):
         """
         After the KB miss fallback is spoken, speak_immediate_response must be called
-        with PRDScripts.CALLBACK_OFFER — the mandatory "Would you like me to arrange a callback?"
+        with PRDScripts.CALLBACK_OFFER — and it must come AFTER the fallback.
         """
         mgr = _make_mgr()
         mgr.state.transition_to(CallState.LISTENING)
 
-        spoken = []
-        async def mock_speak(text, trace_id=None):
-            spoken.append(text)
-
-        with patch.object(mgr.brain, "generate_stream", return_value=_kb_miss_stream()), \
-             patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock):
-            await mgr.generate_and_speak("What are the tuition fees?", trace_id="t1")
+        spoken = await _run_generate_and_speak(
+            mgr, "What are the tuition fees?", _kb_miss_gen()
+        )
 
         self.assertIn(
             PRDScripts.CALLBACK_OFFER, spoken,
             "FAIL (AC3): CALLBACK_OFFER not spoken after KB miss fallback."
         )
-        # Offer must come AFTER the fallback
-        fallback_idx = next((i for i, s in enumerate(spoken) if PRDScripts.LOW_CONFIDENCE_FALLBACK in s), -1)
-        offer_idx = next((i for i, s in enumerate(spoken) if s == PRDScripts.CALLBACK_OFFER), -1)
+
+        # Order check: fallback before offer
+        fallback_idx = next(
+            (i for i, s in enumerate(spoken) if PRDScripts.LOW_CONFIDENCE_FALLBACK in s), -1
+        )
+        offer_idx = next(
+            (i for i, s in enumerate(spoken) if s == PRDScripts.CALLBACK_OFFER), -1
+        )
         if fallback_idx >= 0 and offer_idx >= 0:
             self.assertGreater(
                 offer_idx, fallback_idx,
@@ -198,8 +236,8 @@ class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
     async def test_yes_response_creates_crm_ticket_and_ends_call(self):
         """
         When _pending_callback_offer=True and caller says "Yes", the manager must:
-        1. Create a CRM ticket with 'Callback_Required_KB_Miss' in the title.
-        2. Set _pending_callback_offer back to False.
+        1. Create a CRM ticket titled 'Callback_Required_KB_Miss'.
+        2. Clear _pending_callback_offer.
         3. Schedule call end.
         """
         mgr = _make_mgr()
@@ -208,35 +246,39 @@ class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
         mgr.state.transition_to(CallState.LISTENING)
 
         spoken = []
-        async def mock_speak(text, trace_id=None):
+
+        async def mock_speak(text, **_):
             spoken.append(text)
 
         with patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock) as mock_end:
-            # Simulate final transcript "Yes"
+             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock) as mock_end, \
+             patch.object(mgr, "_send_response_chunk", new_callable=AsyncMock):
             await mgr._on_transcript("Yes", confidence=0.95, is_final=True, detected_lang="en")
+
+            # Allow fire-and-forget tasks to complete
+            await asyncio.sleep(0)
 
         self.assertFalse(
             mgr._pending_callback_offer,
             "FAIL (AC4): _pending_callback_offer not cleared after 'Yes'."
         )
         mgr.crm.create_ticket.assert_called()
-        call_args = mgr.crm.create_ticket.call_args
         self.assertIn(
-            "Callback_Required_KB_Miss", str(call_args),
+            "Callback_Required_KB_Miss",
+            str(mgr.crm.create_ticket.call_args),
             "FAIL (AC4): CRM ticket title 'Callback_Required_KB_Miss' missing."
         )
         mock_end.assert_called()
 
     # -----------------------------------------------------------------------
-    # AC5 — Caller says "No" → ANYTHING_ELSE spoken, stays in LISTENING
+    # AC5 — Caller says "No" → ANYTHING_ELSE spoken, no CRM, no call end
     # -----------------------------------------------------------------------
     async def test_no_response_speaks_anything_else(self):
         """
         When _pending_callback_offer=True and caller says "No", the manager must:
         1. Speak PRDScripts.ANYTHING_ELSE.
         2. NOT create a CRM ticket.
-        3. NOT end the call.
+        3. NOT schedule call end.
         """
         mgr = _make_mgr()
         mgr._pending_callback_offer = True
@@ -244,12 +286,15 @@ class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
         mgr.state.transition_to(CallState.LISTENING)
 
         spoken = []
-        async def mock_speak(text, trace_id=None):
+
+        async def mock_speak(text, **_):
             spoken.append(text)
 
         with patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock) as mock_end:
+             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock) as mock_end, \
+             patch.object(mgr, "_send_response_chunk", new_callable=AsyncMock):
             await mgr._on_transcript("No", confidence=0.95, is_final=True, detected_lang="en")
+            await asyncio.sleep(0)
 
         self.assertFalse(mgr._pending_callback_offer)
         self.assertIn(
@@ -260,32 +305,25 @@ class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
         mock_end.assert_not_called()
 
     # -----------------------------------------------------------------------
-    # AC6 — Fee query at 0.59 (below 0.60 fee threshold) triggers fallback
+    # AC6 — Fee query at 0.59 (below 0.60 threshold) arms the callback offer
     # -----------------------------------------------------------------------
     async def test_fee_query_below_threshold_triggers_fallback(self):
         """
-        A fee-related query with rag_score=0.59 must trigger the KB miss path
-        because the FEE_DETAILS threshold is 0.60.
-        The _pending_callback_offer flag must be armed after generate_and_speak.
+        A fee-related query with rag_score=0.59 must trigger KB miss (threshold=0.60).
+        After generate_and_speak: _pending_callback_offer is True, fallback was spoken.
         """
         mgr = _make_mgr()
         mgr.state.transition_to(CallState.LISTENING)
 
-        spoken = []
-        async def mock_speak(text, trace_id=None):
-            spoken.append(text)
-
-        # score=0.59 < 0.60 (FEE_DETAILS threshold)
-        fee_miss_stream = _kb_miss_stream(
-            caller_query="How much is the tuition fee?",
-            rag_score=0.59,
-            threshold=0.60,
+        spoken = await _run_generate_and_speak(
+            mgr,
+            "How much is the tuition fee?",
+            _kb_miss_gen(
+                caller_query="How much is the tuition fee?",
+                rag_score=0.59,
+                threshold=0.60,
+            ),
         )
-
-        with patch.object(mgr.brain, "generate_stream", return_value=fee_miss_stream), \
-             patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock):
-            await mgr.generate_and_speak("How much is the tuition fee?", trace_id="t1")
 
         self.assertTrue(
             mgr._pending_callback_offer,
@@ -301,28 +339,27 @@ class TestStab05FallbackCompliance(unittest.IsolatedAsyncioTestCase):
     # -----------------------------------------------------------------------
     async def test_high_confidence_score_does_not_trigger_fallback(self):
         """
-        A score of 0.80 (well above all thresholds) must NOT yield the KB miss fallback.
-        The normal LLM response path must be taken.
+        A score of 0.80 (above all thresholds) must NOT arm the callback offer
+        and must NOT speak CALLBACK_OFFER or LOW_CONFIDENCE_FALLBACK.
         """
         mgr = _make_mgr()
         mgr.state.transition_to(CallState.LISTENING)
 
-        spoken = []
-        async def mock_speak(text, trace_id=None):
-            spoken.append(text)
-
-        with patch.object(mgr.brain, "generate_stream", return_value=_normal_stream()), \
-             patch.object(mgr, "speak_immediate_response", side_effect=mock_speak), \
-             patch.object(mgr, "_delayed_call_end", new_callable=AsyncMock):
-            await mgr.generate_and_speak("Tell me about the programs.", trace_id="t1")
+        spoken = await _run_generate_and_speak(
+            mgr, "Tell me about the programs.", _normal_gen()
+        )
 
         self.assertFalse(
             mgr._pending_callback_offer,
-            "FAIL (AC7): _pending_callback_offer armed for a high-confidence response."
+            "FAIL (AC7): _pending_callback_offer armed for high-confidence response."
         )
         self.assertNotIn(
             PRDScripts.CALLBACK_OFFER, spoken,
-            "FAIL (AC7): CALLBACK_OFFER spoken for a high-confidence response."
+            "FAIL (AC7): CALLBACK_OFFER spoken for high-confidence response."
+        )
+        self.assertNotIn(
+            PRDScripts.LOW_CONFIDENCE_FALLBACK, " ".join(spoken),
+            "FAIL (AC7): LOW_CONFIDENCE_FALLBACK spoken for high-confidence response."
         )
 
 

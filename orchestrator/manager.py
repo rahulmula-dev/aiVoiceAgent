@@ -229,6 +229,9 @@ class VoiceOrchestrator:
                 _caller_query = getattr(self, "_pending_callback_query", "")
                 self._pending_callback_query = ""
 
+                # trace_id is not yet defined this early in _on_transcript (generated later via uuid)
+                _intercept_trace_id = getattr(self, "_current_trace_id", None)
+
                 if _is_yes:
                     logger.info(f"[STAB-05] Caller accepted callback for query='{_caller_query[:60]}'")
                     if self.call_logger:
@@ -247,7 +250,7 @@ class VoiceOrchestrator:
                     self.response_task = asyncio.create_task(
                         self.speak_immediate_response(
                             "Of course! I've arranged a callback. An admissions officer will be in touch shortly. Goodbye.",
-                            trace_id=trace_id
+                            trace_id=_intercept_trace_id
                         )
                     )
                     self._create_task_with_log(self._delayed_call_end(delay=4.0))
@@ -256,7 +259,7 @@ class VoiceOrchestrator:
                     if self.call_logger:
                         self.call_logger.log_event("stab05", "callback_declined", meta={"caller_query": _caller_query})
                     self.response_task = asyncio.create_task(
-                        self.speak_immediate_response(PRDScripts.ANYTHING_ELSE, trace_id=trace_id)
+                        self.speak_immediate_response(PRDScripts.ANYTHING_ELSE, trace_id=_intercept_trace_id)
                     )
                 return  # Short-circuit: do not pass to intent classification or LLM
 
@@ -1826,29 +1829,35 @@ class VoiceOrchestrator:
                         prefetched_context_task=prefetched_task,
                         degraded_mode=self._latency_alert_emitted
                     ):
+                        # [STAB-05] KB miss detection — metadata is already unpacked by the async-for.
+                        # generate_stream yields 2-tuples (sentence, metadata), so sentence is always
+                        # a string here. Check metadata directly for the kb_miss signal.
+                        if metadata and metadata.get("error") == "kb_miss":
+                            self._pending_callback_offer = True
+                            self._pending_callback_query = metadata.get("caller_query", text)
+                            logger.warning(
+                                f"[STAB-05] KB miss — bypassing audio_queue, speaking verbatim fallback directly. "
+                                f"query='{self._pending_callback_query[:60]}'"
+                            )
+                            if self.call_logger:
+                                self.call_logger.log_event(
+                                    "stab05", "kb_miss_fallback",
+                                    meta={
+                                        "caller_query": self._pending_callback_query,
+                                        "rag_score": metadata.get("rag_score", 0.0),
+                                        "category_threshold": metadata.get("category_threshold", 0.58),
+                                    }
+                                )
+                            # Speak verbatim fallback via speak_immediate_response so it is
+                            # observable in tests and does NOT enter the audio_queue/tts_worker path.
+                            await self.speak_immediate_response(sentence, trace_id=trace_id)
+                            break  # No more streaming — the CALLBACK_OFFER is injected below.
+
                         if sentence and isinstance(sentence, tuple):
-                             # Handle refusal error payload (text, meta)
+                             # Legacy guard: handles any generator that wraps payload as (text, meta)
                              sentence, error_meta = sentence
                              if "error" in error_meta:
                                  logger.debug(f"[LOG] Refusal reason: {error_meta.get('error')}")
-                             # [STAB-05] KB miss path: sentence IS the verbatim fallback.
-                             # Arm the callback offer so the next caller utterance is intercepted.
-                             if error_meta.get("error") == "kb_miss":
-                                 self._pending_callback_offer = True
-                                 self._pending_callback_query = error_meta.get("caller_query", text)
-                                 logger.info(
-                                     f"[STAB-05] KB miss confirmed — arming callback offer. "
-                                     f"query='{self._pending_callback_query[:60]}'"
-                                 )
-                                 if self.call_logger:
-                                     self.call_logger.log_event(
-                                         "stab05", "kb_miss_fallback",
-                                         meta={
-                                             "caller_query": self._pending_callback_query,
-                                             "rag_score": error_meta.get("rag_score", 0.0),
-                                             "category_threshold": error_meta.get("category_threshold", 0.58),
-                                         }
-                                     )
 
                         # Update session metrics from RAG search (tracked via events)
                         if self.session and metadata:
