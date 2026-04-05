@@ -5,7 +5,7 @@ from google.api_core.exceptions import ResourceExhausted  # Add this import
 import logging
 import asyncio
 from typing import List, Dict, Any, Optional
-from retrieval.vector_store import KnowledgeBase  # New RAG module
+from retrieval.vector_store import KnowledgeBase, get_threshold  # New RAG module
 from dotenv import load_dotenv
 
 # Configure logging
@@ -24,8 +24,8 @@ RAG_TIMEOUT = config.rag_search_timeout
 # ----------------------------------------
 
 class Brain(LLMEngine):
-    # 1. DEFINE SOURCE OF TRUTH FOR REFUSAL SCRIPT
-    KB_MISS_SCRIPT = PRDScripts.REFUSAL_KB_MISS
+    # [STAB-05] PRD §4.1 — verbatim fallback, no paraphrasing.
+    KB_MISS_SCRIPT = PRDScripts.LOW_CONFIDENCE_FALLBACK
 
     def __init__(self, call_logger=None, crm_client=None):
         self.api_key = os.getenv("GEMINI_API_KEY")
@@ -58,6 +58,12 @@ class Brain(LLMEngine):
             - Category B — SAME_TOPIC: The caller wants clarification or continuation on the same topic. Incorporate their clarification naturally and continue without restarting from scratch.
             - Category C — AMBIGUOUS: Intent is unclear. Respond to the most likely interpretation of their input. NEVER ask meta-questions such as "Should I continue from where I left off?" or "Would you like me to finish?". Just answer.
             - The soft continuation offer ("I can also finish walking you through the remaining steps...") is inserted by the system automatically when appropriate — you must never generate it spontaneously.
+
+            ANTI-SPECULATION CONSTRAINT (mandatory, non-negotiable):
+            - If the provided [KB CONTEXT] does not contain a clear answer to the user's question, you MUST NOT guess, infer, or extrapolate.
+            - You MUST NOT use phrases like "I think", "I believe", "maybe", "probably", "it's possible that", "I'm not sure but", or any other hedging language.
+            - You MUST NOT speculate about fees, deadlines, eligibility criteria, or program details that are not explicitly stated in the [KB CONTEXT].
+            - If you are unsure, say nothing beyond the fallback phrase. The system will handle the callback offer automatically.
             """
 
             # 3. SAFETY SETTINGS (Relaxed to prevent blocked responses for harmless RAG queries)
@@ -447,38 +453,38 @@ class Brain(LLMEngine):
             logger.info(log_str)
             # --------------------------------------------------
 
-            # ── [GROUNDING-ISS-121] MANDATORY 0.58 THRESHOLD ───────────────────────────
-            # S4 Refinement Fix: Hard gate to prevent hallucination.
-            # If rag_score < 0.58 and no CRM hit, yield KB_MISS_SCRIPT.
+            # ── [STAB-05] CATEGORY-AWARE CONFIDENCE GATE (PRD §4.1 / Escalation Spec v1.1 §6.2) ─
+            # Threshold is resolved from rag_thresholds.json based on the detected topic/intent.
+            # Defaults: fees=0.60, eligibility=0.62, deadlines=0.65, default=0.58.
+            # If the ensemble score is below the category threshold, the LLM is NOT called —
+            # the verbatim LOW_CONFIDENCE_FALLBACK is yielded directly (no-speculation guarantee).
             # EXCEPTION: Short conversational inputs (≤5 words) like "Hello?", "Hi", "What?"
             # have no KB match by design — let the LLM respond naturally to them.
             is_conversational = len(text.strip().split()) <= 5 and not any(
                 kw in text.lower() for kw in ["fee", "program", "admission", "course", "eligibil", "deadline", "intake", "campus", "apply", "document"]
             )
-            
-            if (rag_score < 0.58) and not crm_hit and not is_conversational:
-                # 1. Create the CRM callback ticket
-                if self.crm_client and call_context:
-                    try:
-                        await self.crm_client.create_ticket(
-                            transcript=f"User Query: {text}\nStatus: Knowledge Base Miss (Score: {rag_score})",
-                            summary="Callback Required: KB Miss",
-                            sentiment="Neutral",
-                            call_logger=self.call_logger,
-                            call_id=call_context.session_id,
-                            title="Callback Required: Unanswered User Query"
-                        )
-                        # [STORY-DUMMY-CRM] Trigger Callback for KB Miss
-                        await self.crm_client.create_callback(
-                            ticket_id=call_context.session_id,
-                            phone_number=call_context.caller_number,
-                            reason=f"Missing Information: Could not answer '{text}' from Knowledge Base."
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to create callback ticket for KB miss: {e}")
+            category_threshold = get_threshold(
+                hard_refusal_category=None,
+                general_category=rag_topic or (intent if intent else None),
+            )
+            logger.info(
+                f"[STAB-05] Confidence gate: score={rag_score:.3f} threshold={category_threshold:.2f} "
+                f"topic='{rag_topic}' intent='{intent}'"
+            )
 
-                # 2. Deterministically yield the refusal and bypass the LLM entirely
-                yield (self.KB_MISS_SCRIPT, {"error": "kb_miss", "has_grounding": has_grounding, "rag_score": rag_score})
+            if (rag_score < category_threshold) and not crm_hit and not is_conversational:
+                # [STAB-05] No LLM call. Yield verbatim fallback; manager handles callback offer.
+                logger.warning(
+                    f"[STAB-05] KB miss — score {rag_score:.3f} < {category_threshold:.2f} "
+                    f"for query '{text[:60]}'. Yielding LOW_CONFIDENCE_FALLBACK."
+                )
+                yield (self.KB_MISS_SCRIPT, {
+                    "error": "kb_miss",
+                    "has_grounding": False,
+                    "rag_score": rag_score,
+                    "category_threshold": category_threshold,
+                    "caller_query": text,
+                })
                 return
             elif (rag_score < 0.50) and not crm_hit and is_conversational:
                 logger.info(f"[BRAIN] Conversational input '{text}' exempt from hard gate — passing to LLM.")

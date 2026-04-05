@@ -23,7 +23,13 @@ class PRDScripts:
     REFUSAL_LANGUAGE_1 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
     REFUSAL_LANGUAGE_2 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
     REFUSAL_LANGUAGE_3 = "I'm sorry, since I can only assist in English, I will have to end this call now. Please call back when you are ready to proceed in English. Goodbye."
-    REFUSAL_KB_MISS = "I'm sorry, I don't have that specific information right now. Let me have an admissions officer follow up with you to provide more details. I can, however, help with general information about programs and admissions!"
+    # [STAB-05] PRD §4.1 verbatim fallback — must match exactly. Do NOT paraphrase.
+    LOW_CONFIDENCE_FALLBACK = "I don't have that information right now."
+    # [STAB-05] Mandatory callback offer appended immediately after LOW_CONFIDENCE_FALLBACK.
+    CALLBACK_OFFER = "Would you like me to arrange a callback?"
+    # [STAB-05] Spoken when the caller declines the callback offer.
+    ANYTHING_ELSE = "Is there anything else I can help you with?"
+    REFUSAL_KB_MISS = "I don't have that information right now."
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
     SENSITIVE_REFUSAL_MESSAGE = "That's something our team will need to review. I'll arrange a follow-up."
     RESTRICTED_REFUSAL_MESSAGE = "I'm not able to help with that topic. I'll arrange for a team member to follow up."

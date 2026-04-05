@@ -95,6 +95,8 @@ class VoiceOrchestrator:
         self._cleanup_done = False
         self.last_response_was_question = False
         self._last_ai_question_text = ""    # [STAB-04] Stores last AI response when it ended with "?"
+        self._pending_callback_offer = False  # [STAB-05] True when awaiting Yes/No after LOW_CONFIDENCE_FALLBACK
+        self._pending_callback_query = ""     # [STAB-05] Original caller query that triggered the KB miss
         self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
         self._vad_safety_task = None     # Tracker for Echo Trap recovery
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
@@ -211,7 +213,53 @@ class VoiceOrchestrator:
         # Double guarantee: if terminate_session is set, block ALL future text
         if getattr(self, "session_state", {}).get("terminate_session"):
             return
-        
+
+        # [STAB-05] Callback Offer Intercept — must happen before intent classification.
+        # When the agent just asked "Would you like me to arrange a callback?" we intercept
+        # the caller's Yes/No response and route directly, bypassing the normal LLM pipeline.
+        if is_final and raw_text and getattr(self, "_pending_callback_offer", False):
+            _yes_tokens = {"yes", "yeah", "yep", "sure", "please", "ok", "okay", "go ahead", "do it", "correct", "affirmative"}
+            _no_tokens = {"no", "nope", "nah", "don't", "no thanks", "not now", "skip", "never mind", "nevermind", "that's fine"}
+            _reply_lower = raw_text.lower().strip().rstrip(".,!?")
+            _is_yes = any(_reply_lower == t or _reply_lower.startswith(t) for t in _yes_tokens)
+            _is_no = any(_reply_lower == t or _reply_lower.startswith(t) for t in _no_tokens)
+
+            if _is_yes or _is_no:
+                self._pending_callback_offer = False
+                _caller_query = getattr(self, "_pending_callback_query", "")
+                self._pending_callback_query = ""
+
+                if _is_yes:
+                    logger.info(f"[STAB-05] Caller accepted callback for query='{_caller_query[:60]}'")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab05", "callback_accepted", meta={"caller_query": _caller_query})
+                    if self.session and self.crm:
+                        self._create_task_with_log(self.crm.create_ticket(
+                            transcript=f"[STAB-05] Caller requested callback.\nOriginal query: {_caller_query}",
+                            summary="Callback Requested: KB Miss",
+                            sentiment="Neutral",
+                            call_logger=self.call_logger,
+                            call_id=self.session.crm_call_id or self.session.session_id,
+                            title="Callback_Required_KB_Miss",
+                            structured_turns=self.session.structured_turns,
+                            session_obj=self.session,
+                        ))
+                    self.response_task = asyncio.create_task(
+                        self.speak_immediate_response(
+                            "Of course! I've arranged a callback. An admissions officer will be in touch shortly. Goodbye.",
+                            trace_id=trace_id
+                        )
+                    )
+                    self._create_task_with_log(self._delayed_call_end(delay=4.0))
+                else:
+                    logger.info("[STAB-05] Caller declined callback — returning to LISTENING.")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab05", "callback_declined", meta={"caller_query": _caller_query})
+                    self.response_task = asyncio.create_task(
+                        self.speak_immediate_response(PRDScripts.ANYTHING_ELSE, trace_id=trace_id)
+                    )
+                return  # Short-circuit: do not pass to intent classification or LLM
+
         # 1. AGGRESSIVE LOGGING: We must see what the STT actually heard
         # [STT RAW] is used by the Expert Debugger to diagnose "deafness" or "hallucinations"
         # Progress counter added for better forensic visibility
@@ -1783,6 +1831,24 @@ class VoiceOrchestrator:
                              sentence, error_meta = sentence
                              if "error" in error_meta:
                                  logger.debug(f"[LOG] Refusal reason: {error_meta.get('error')}")
+                             # [STAB-05] KB miss path: sentence IS the verbatim fallback.
+                             # Arm the callback offer so the next caller utterance is intercepted.
+                             if error_meta.get("error") == "kb_miss":
+                                 self._pending_callback_offer = True
+                                 self._pending_callback_query = error_meta.get("caller_query", text)
+                                 logger.info(
+                                     f"[STAB-05] KB miss confirmed — arming callback offer. "
+                                     f"query='{self._pending_callback_query[:60]}'"
+                                 )
+                                 if self.call_logger:
+                                     self.call_logger.log_event(
+                                         "stab05", "kb_miss_fallback",
+                                         meta={
+                                             "caller_query": self._pending_callback_query,
+                                             "rag_score": error_meta.get("rag_score", 0.0),
+                                             "category_threshold": error_meta.get("category_threshold", 0.58),
+                                         }
+                                     )
 
                         # Update session metrics from RAG search (tracked via events)
                         if self.session and metadata:
@@ -1899,7 +1965,13 @@ class VoiceOrchestrator:
 
                 await audio_queue.put(None)
                 await worker_task
-                
+
+                # [STAB-05] KB Miss Callback Offer — appended after verbatim fallback is spoken.
+                # Must NOT be part of the LLM response stream; injected deterministically here.
+                if self._pending_callback_offer:
+                    logger.info("[STAB-05] Appending mandatory callback offer after LOW_CONFIDENCE_FALLBACK.")
+                    await self.speak_immediate_response(PRDScripts.CALLBACK_OFFER, trace_id=trace_id)
+
                 # [GOVERNANCE] Auto-terminate if the response concludes the call
                 if full_ai_text:
                     normalized_text = full_ai_text.strip().lower().rstrip(string.punctuation).strip()
