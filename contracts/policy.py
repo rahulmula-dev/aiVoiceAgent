@@ -76,7 +76,10 @@ class ResponsePolicyEngine:
 
     # --- 2. HARD REFUSAL CATEGORIES (Polite Refusal - No Retrieval) ---
     HARD_REFUSAL_KEYWORDS = {
-        "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
+        "competitor_query": [
+            "better", "worse", "compare", "vs", "versus", "other college", "other university", "than any other",
+            "humber", "sheridan", "seneca", "george brown", "centennial", "conestoga", "mohawk", "fanshawe", "durham college", "st. lawrence"
+        ],
         # T4 fix: Catch explicit jailbreak translation commands before they reach the LLM.
         # "translate", "en español", "traduce" etc. are injection vectors, not college queries.
         "language_bypass": [
@@ -218,8 +221,28 @@ class ResponsePolicyEngine:
         "requirement", "requirements", "specific", "international", "aid",
         "instructor", "instructors", "professor", "professors", "department",
         "facility", "workshop", "qualification", "examination", "assessment",
+        # results from earlier tests
         "results", "approvals", "measured",
     }
+
+    def validate_no_comparison(self, text: str) -> bool:
+        """
+        Safety Guard: Ensures outgoing response does NOT contain comparative keywords or value positioning.
+        """
+        # 1. Direct Keywords
+        comparative_keywords = ["better", "best", "cheaper", "higher", "lower", "ranking", "rankings", "evaluation", "versus", " vs "]
+        # 2. Indirect Positioning Phrases (STAB-07 hardening)
+        positioning_phrases = ["focus on quality", "affordable programs", "student-centric", "superior", "premium", "top-tier"]
+        
+        lower_text = text.lower()
+        
+        for kw in comparative_keywords:
+            if f" {kw} " in f" {lower_text} ": return False
+            
+        for phrase in positioning_phrases:
+            if phrase in lower_text: return False
+            
+        return True
 
     def _contains_word(self, text: str, keyword: str) -> bool:
         """
@@ -591,7 +614,7 @@ class ResponsePolicyEngine:
         if intent == "HARD_REFUSAL_LANGUAGE":
             return PRDScripts.REFUSAL_LANGUAGE
             
-        if intent == "HARD_REFUSAL_COMPETITORS":
+        if intent == "HARD_REFUSAL_COMPETITOR_QUERY":
             return PRDScripts.REFUSAL_COMPETITORS
 
         if intent == "AMBIGUOUS":

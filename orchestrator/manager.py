@@ -197,6 +197,18 @@ class VoiceOrchestrator:
 
             from contracts.policy import detect_restricted_topic, handle_restricted_topic
             rest_result = detect_restricted_topic(raw_text)
+            
+            # --- STAB-07: Isolated Competitor Refusal Path (Global Gate) ---
+            # This ensures no competitor query reaches the Brain or is logged in the CRM
+            # before any fallback or escalation paths can interfere.
+            intent_early = self.policy.classify_intent(raw_text)
+            if intent_early == "HARD_REFUSAL_COMPETITOR_QUERY":
+                # [STAB-07] Generate fresh trace_id at the gate if none exists
+                trace_id = getattr(self, "_current_trace_id", str(uuid.uuid4()))
+                self._current_trace_id = trace_id
+                await self.handle_competitor_refusal(trace_id=trace_id)
+                return
+
             if rest_result.is_restricted:
                 self.session_state["restricted_handled"] = True
                 self.session_state["terminate_session"] = True
@@ -782,7 +794,7 @@ class VoiceOrchestrator:
                 
                 # [P5-01]: Skip CRM noise for purely ambiguous/noisy inputs
                 if intent != "AMBIGUOUS":
-                    # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Competitors, Fees, etc.)
+                    # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Fees, etc.)
                     self._create_task_with_log(self.crm.create_ticket(
                         transcript=text,
                         summary=f"Policy Violation: {intent}",
@@ -805,7 +817,7 @@ class VoiceOrchestrator:
             if self.response_task and not self.response_task.done():
                 self.response_task.cancel()
                 logger.debug(f"[GOVERNANCE] Cancelled pending LLM task for Hard Bypass ({intent}).")
-            
+
             self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
 
             # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
@@ -1074,6 +1086,30 @@ class VoiceOrchestrator:
             if self.state.get_state() == CallState.INTERRUPTED:
                 logger.debug("Barge-in task cleanup: Reverting INTERRUPTED -> LISTENING")
                 self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+
+    async def handle_competitor_refusal(self, trace_id=None):
+        """
+        STAB-07: Isolated handler for competitor queries.
+        Ensures polite refusal without CRM ticket or call termination.
+        """
+        # [STAB-07] STRICT: Use pre-approved static response only.
+        # No dynamic templating, no variables, no LLM drift possible.
+        refusal_text = PRDScripts.REFUSAL_COMPETITORS
+        
+        # Safety Guard: Ensure no dynamic content/comparisons/positioning (redundant but safe)
+        if not self.policy.validate_no_comparison(refusal_text):
+            logger.error(f"[STAB-07] Safety Guard Failure: Competitor refusal script contained prohibited comparisons!")
+            refusal_text = "I can only provide information about GD College and cannot compare us with other institutions."
+
+        # Speak it
+        # [GUARD] competitor_refusal_triggered=true
+        logger.info(f"[STAB-07] Competitor refusal triggered (trace_id={trace_id})")
+        
+        # [GOVERNANCE] Ensure any pending tasks are cancelled before speaking static refusal
+        if self.response_task and not self.response_task.done():
+            self.response_task.cancel()
+            
+        self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
 
     async def speak_immediate_response(self, text, trace_id=None):
         """
