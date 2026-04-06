@@ -246,6 +246,8 @@ class VoiceOrchestrator:
                             title="Callback_Required_KB_Miss",
                             structured_turns=self.session.structured_turns,
                             session_obj=self.session,
+                            callback_required=True,
+                            metadata={"trigger_query": _caller_query},
                         ))
                     self.response_task = asyncio.create_task(
                         self.speak_immediate_response(
@@ -942,14 +944,29 @@ class VoiceOrchestrator:
                 self._create_task_with_log(self._send_clear_message())
             
             self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
-            
+
             # Identify the turn being interrupted
             prev_turn = None
             if self.session.structured_turns:
                 prev_turn = self.session.structured_turns[-1]
                 prev_turn.agent_response_status = "interrupted"
                 prev_turn.agent_partial_response = partial_text
-            
+
+            # [STAB-05] Barge-in Proof: if a KB miss callback offer is still pending,
+            # bypass the entire RAG + LLM path and re-ask the callback question immediately.
+            # The caller interrupted the fallback phrase — the offer must still be made.
+            if getattr(self, "_pending_callback_offer", False):
+                logger.info("[STAB-05] Barge-in during pending callback offer — re-presenting CALLBACK_OFFER.")
+                if self.call_logger:
+                    self.call_logger.log_event(
+                        "stab05", "callback_offer_barge_in_reissued",
+                        meta={"caller_input": caller_input[:60]},
+                        trace_id=trace_id
+                    )
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                await self.speak_immediate_response(PRDScripts.CALLBACK_OFFER, trace_id=trace_id)
+                return
+
             # STEP B — Inject RAG Context for PRD Compliance
             # FAST-PATH: If the input is extremely short (filler/command), skip RAG to reduce latency.
             is_short_input = len(caller_input.split()) <= 2
