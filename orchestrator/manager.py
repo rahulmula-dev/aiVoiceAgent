@@ -2182,6 +2182,11 @@ class VoiceOrchestrator:
         sid = self.session.session_id if self.session else getattr(self, "_early_sid", "unknown")
         logger.info(f"Cleanup started for session {sid}.")
 
+        # [STAB-10] Capture duration BEFORE resetting session_start_wall_time
+        _call_duration_s = None
+        if self.session_start_wall_time is not None:
+            _call_duration_s = round(time.time() - self.session_start_wall_time, 1)
+
         # Reset wrap-up tracking so the orchestrator is clean for the next session
         self.wrapup_triggered = False
         self.session_start_wall_time = None
@@ -2232,58 +2237,95 @@ class VoiceOrchestrator:
             except Exception as e:
                 logger.error(f"Cleanup: Synthesizer close failed: {e}")
                 
-            # LAYERED FALLBACK: Null-Safe Ticket Data (DLQ-wrapped for exception safety)
+            # [STAB-10] UNIVERSAL CRM TICKET — PRD §10: every call produces a ticket, no exceptions.
+            # Previously restricted calls were skipped here; that guard is removed.
+            # Restricted calls already create a SECURITY_ALERT ticket; this creates the session summary.
             try:
-                if getattr(self, "session_state", {}).get("restricted_handled"):
-                    logger.debug("Cleanup: Skipping CRM full session logging (restricted topic already logged).")
-                elif self.session and self.session.conversation_history:
-                    logger.debug("Cleanup: Logging full session to CRM")
-                    history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
-                    
-                    # Pillar 3: Safety Net - Check for system failure
-                    reason = self.session.termination_reason
-                    if reason == "system_failure":
-                        logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
+                reason = (
+                    getattr(self.session, "termination_reason", None) or "user_hangup"
+                ) if self.session else "no_session"
 
+                # Recording URL: local file path fallback (S3 upload happens separately)
+                _recording_url = None
+                if self.recorder and getattr(self.recorder, "filename", None):
+                    _recording_url = self.recorder.filename  # local path; S3 URL if available
+
+                # Derive callback_required and ticket title from termination reason
+                _callback_required = reason in (
+                    "silence_termination", "system_failure", "latency_breach", "wrapup_timeout"
+                )
+                _title_map = {
+                    "user_hangup": "AI Call Summary - Normal",
+                    "silence_termination": "AI Call Summary - Silence Termination",
+                    "system_failure": "AI Call Summary - System Failure",
+                    "latency_breach": "AI Call Summary - Latency Breach",
+                    "wrapup_timeout": "AI Call Summary - Session Limit Reached",
+                    "abandoned_setup": "AI Call Summary - No Audio",
+                    "no_session": "AI Call Summary - Connection Failed",
+                }
+                _ticket_title = _title_map.get(reason, f"AI Call Summary - {reason}")
+                _sentiment = "Negative" if _callback_required else "Positive"
+
+                if self.session and self.session.conversation_history:
+                    logger.info(f"[STAB-10] Cleanup: Writing universal CRM ticket reason={reason} callback={_callback_required}")
+                    history_text = "\n".join(
+                        [f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history]
+                    )
+                    if reason == "system_failure":
+                        logger.warning(f">>> URGENT: High-priority callback ticket for {sid} — system failure.")
                     ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript=history_text,
-                        summary=f"Call Log: {reason} (Session: {sid}) | Type: {ct}",
-                        sentiment="Positive", # Default to positive for successful logs
+                        summary=f"Call Log: {reason} | Type: {ct} | Duration: {_call_duration_s}s",
+                        sentiment=_sentiment,
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
-                        title=f"Completed Session Log ({reason})",
+                        title=_ticket_title,
                         structured_turns=self.session.structured_turns,
-                        session_obj=self.session
+                        session_obj=self.session,
+                        callback_required=_callback_required,
+                        status="Completed",
+                        duration=_call_duration_s,
+                        recording_url=_recording_url,
+                        metadata={"termination_reason": reason, "caller_type": ct},
                     )
                 elif self.session:
-                    logger.debug("Cleanup: Logging early exit (no audio) to CRM")
-                    reason = getattr(self.session, "termination_reason", "abandoned_setup")
+                    logger.info(f"[STAB-10] Cleanup: Early-exit CRM ticket reason={reason}")
                     ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript="[System]: Call ended before user provided audio or during setup.",
-                        summary=f"Completed — No Callback Needed. Type: {ct}",
+                        summary=f"No Conversation — {reason} | Type: {ct}",
                         sentiment="Neutral",
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
-                        title="Abandoned Setup/No Audio",
+                        title=_ticket_title,
                         structured_turns=self.session.structured_turns,
-                        session_obj=self.session
+                        session_obj=self.session,
+                        callback_required=False,
+                        status="Completed",
+                        duration=_call_duration_s,
+                        recording_url=_recording_url,
+                        metadata={"termination_reason": reason, "caller_type": ct},
                     )
                 else:
-                    logger.debug("Cleanup: Logging system error (no session) to CRM")
+                    logger.warning(f"[STAB-10] Cleanup: No session object — writing error ticket for {sid}")
                     await self.crm.create_ticket(
                         transcript="[System]: Connection failed before session could be initialized.",
                         summary="System Error - Early Connection Failure",
                         sentiment="Negative",
                         call_logger=self.call_logger,
                         call_id=sid,
-                        title="System_Error",
+                        title="AI Call Summary - Connection Failed",
                         structured_turns=None,
-                        session_obj=self.session
+                        session_obj=None,
+                        callback_required=True,
+                        status="Failed",
+                        duration=None,
+                        recording_url=None,
+                        metadata={"termination_reason": "no_session"},
                     )
             except Exception as crm_ex:
-                # [DLQ] CRM is unavailable. Log to stderr so the ticket is not silently lost.
+                # [DLQ] CRM unavailable — log to stderr so ticket is not silently lost.
                 import sys
                 print(f"[DLQ] CRITICAL: CRM create_ticket failed during cleanup for {sid}: {crm_ex}", file=sys.stderr)
                 logger.error(f"[DLQ] CRM ticket failed for session {sid}: {crm_ex}", exc_info=True)
