@@ -20,6 +20,7 @@ from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from agent_logging import CallLogger
 from .session_manager import SessionManager, SessionState
+from .session_timer_manager import SessionTimerManager
 from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
 from models.schemas import StandardTurn, BargeInTurn
@@ -87,9 +88,13 @@ class VoiceOrchestrator:
         self.silence_stage = 0  # 0: Normal, 1: Warned once, 2: Warned twice
         self.last_interaction_time = time.time()
 
-        # Session Duration / Wrap-up (Pilot-Ready)
-        self.wrapup_triggered = False
+        # Session Duration / Wrap-up (STAB-12)
+        # Legacy flags kept for STAB-10 compatibility (cleanup() duration capture).
+        self.wrapup_triggered = False          # set True by SessionTimerManager.on_soft_warning
         self.session_start_wall_time = None
+
+        # [STAB-12] Dedicated session timer — started per-call, cancelled in cleanup()
+        self._session_timer: SessionTimerManager | None = None
 
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
@@ -1381,6 +1386,14 @@ class VoiceOrchestrator:
                 # Start Silence Monitor (Story S4-2)
                 self.silence_task = asyncio.create_task(self._monitor_silence())
 
+                # [STAB-12] Start dedicated session timer (independent of silence monitor)
+                self._session_timer = SessionTimerManager(
+                    session_start_wall_time=self.session_start_wall_time
+                )
+                self._session_timer.on_soft_warning = self._on_session_soft_warning
+                self._session_timer.on_hard_end      = self._on_session_hard_end
+                await self._session_timer.start()
+
                 # In PRD, caller_type should dynamically track based on conversation intent.
                 # However, at Call Start, we have no intent yet. 
                 # We start as "unknown_lead", and will update dynamically later based on text.
@@ -1587,7 +1600,15 @@ class VoiceOrchestrator:
             except Exception:
                 self.session_start_wall_time = time.time()
             self.state.transition_to(CallState.CALL_INIT)
-            
+
+            # [STAB-12] Start dedicated session timer for text mode too
+            self._session_timer = SessionTimerManager(
+                session_start_wall_time=self.session_start_wall_time
+            )
+            self._session_timer.on_soft_warning = self._on_session_soft_warning
+            self._session_timer.on_hard_end      = self._on_session_hard_end
+            await self._session_timer.start()
+
             # LOG CALL TO CRM (Text Mode)
             try:
                 crm_id = await self.crm.log_call(
@@ -2207,7 +2228,137 @@ class VoiceOrchestrator:
             logger.debug(f"[ECHO-SUPPRESSION] overlap={overlap:.2f} >= threshold={threshold} — transcript classified as echo")
         return is_echo
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # [STAB-12] Session timer event handlers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_session_soft_warning(self) -> None:
+        """
+        [STAB-12] TC-17: 5-minute soft warning handler.
+        - Speaks EXACTLY PRDScripts.WRAP_UP (single source of truth).
+        - Call remains FULLY functional after this fires.
+        - Does NOT terminate the call.
+        - CRM ticket created for audit trail.
+        - Idempotency guaranteed by SessionTimerManager._soft_warning_fired flag.
+
+        Edge-case (Point 3): if AI is mid-speech when timer fires, we cancel the
+        active response_task first so audio streams do not overlap.  The soft
+        warning is queued safely and the session continues normally.
+        """
+        if self._cleanup_done:
+            logger.debug("[STAB-12][soft_warning] Cleanup already done — skipping.")
+            return
+
+        logger.info("[STAB-12][soft_warning] 5-min soft warning fired.")
+        self.wrapup_triggered = True  # [STAB-10 compat] keep legacy flag in sync
+
+        # ── Stop any active AI speech before speaking the warning (Point 3) ──
+        # Mirrors the same pattern used by all other immediate-response callers.
+        if self.response_task and not self.response_task.done():
+            logger.debug("[STAB-12][soft_warning] Cancelling active response_task before speaking.")
+            self.response_task.cancel()
+            try:
+                await self.response_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Audit CRM ticket (fire-and-forget — soft warning must not block call)
+        if self.session and self.crm:
+            try:
+                self._create_task_with_log(self.crm.create_ticket(
+                    transcript="[STAB-12] Session approaching 6-minute limit. Soft wrap-up prompt played.",
+                    summary="Session Wrap-up Triggered (5-min soft warning)",
+                    sentiment="Neutral",
+                    call_logger=self.call_logger,
+                    call_id=self.session.crm_call_id or self.session.session_id,
+                    title="Session Wrap-up Triggered",
+                ))
+            except Exception as crm_e:
+                logger.error(f"[STAB-12][soft_warning] CRM ticket error: {crm_e}")
+
+        # Speak the SINGLE canonical soft-warning phrase (PRDScripts.WRAP_UP)
+        try:
+            await self.speak_immediate_response(PRDScripts.WRAP_UP)
+        except Exception as tts_e:
+            logger.error(f"[STAB-12][soft_warning] TTS error: {tts_e}")
+
+        if self.call_logger:
+            self.call_logger.log_event(
+                "stab12", "soft_warning_spoken",
+                meta={"phrase": PRDScripts.WRAP_UP}
+            )
+
+    async def _on_session_hard_end(self) -> None:
+        """
+        [STAB-12] TC-18: 6-minute hard end handler.
+        - Delivers polite closing message (PRDScripts.WRAP_UP_TERMINATION).
+        - Gracefully terminates call — no abrupt disconnect.
+        - Triggers CRM update (wrapup_timeout reason).
+        - Flushes logs via cleanup().
+
+        Idempotency (Point 5 — layered guards):
+          Layer 1: SessionTimerManager._hard_end_fired (prevents second invocation).
+          Layer 2: self._hard_end_active flag (prevents concurrent re-entry before
+                   _cleanup_done is set — rare but possible under async race).
+          Layer 3: self._cleanup_done guard in cleanup() itself.
+
+        Edge-case (Point 4): if AI is mid-response when timer fires, we stop the
+        active response_task gracefully so there is no abrupt audio cut-off before
+        the polite closing message plays.
+        """
+        # ── Layer 2 idempotency (Point 5) ─────────────────────────────────────
+        if getattr(self, "_hard_end_active", False):
+            logger.debug("[STAB-12][hard_end] Re-entry blocked by _hard_end_active flag.")
+            return
+        self._hard_end_active = True
+
+        if self._cleanup_done:
+            logger.debug("[STAB-12][hard_end] Cleanup already done — skipping.")
+            self._hard_end_active = False
+            return
+
+        logger.warning("[STAB-12][hard_end] 6-min hard end fired. Initiating graceful termination.")
+
+        if self.call_logger:
+            self.call_logger.log_event(
+                "stab12", "hard_end_triggered",
+                meta={"phrase": PRDScripts.WRAP_UP_TERMINATION}
+            )
+
+        # 1. Mark termination reason BEFORE cleanup so CRM ticket picks it up
+        if self.session:
+            self.session.termination_reason = "wrapup_timeout"
+
+        # 2. Stop any active AI speech gracefully before the closing message (Point 4)
+        #    This prevents audio overlap between an in-progress LLM response and the
+        #    polite goodbye. We DO NOT abruptly close the socket — TTS finishes cleanly.
+        if self.response_task and not self.response_task.done():
+            logger.info("[STAB-12][hard_end] Stopping active response_task for graceful close.")
+            self.response_task.cancel()
+            try:
+                await self.response_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self.synthesizer:
+            self.synthesizer.stop_current_speech(self.sid)
+        await self._send_clear_message()  # flush Twilio client-side audio buffer
+
+        # 3. Polite closing TTS — awaited, so audio fully transmits before socket closes
+        try:
+            await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
+        except Exception as tts_e:
+            logger.error(f"[STAB-12][hard_end] TTS error: {tts_e}")
+
+        # 4. Graceful termination: transition state, then full cleanup.
+        #    cleanup() guarantees: CRM ticket (awaited) + log flush + storage ops.
+        try:
+            self.state.transition_to(CallState.CALL_END)
+        except Exception:
+            pass
+        await self.cleanup()
+
     async def cleanup(self):
+
         """Final session archival and resource release (Pillar 3)."""
         # GUARD: Prevent double-cleanup (e.g. silence termination + WebSocket disconnect both call this)
         if self._cleanup_done:
@@ -2222,6 +2373,14 @@ class VoiceOrchestrator:
         _call_duration_s = None
         if self.session_start_wall_time is not None:
             _call_duration_s = round(time.time() - self.session_start_wall_time, 1)
+
+        # [STAB-12] Cancel dedicated session timer so it does not fire after call ends
+        if self._session_timer is not None:
+            try:
+                await self._session_timer.cancel()
+            except Exception as _st_err:
+                logger.debug(f"[STAB-12] Session timer cancel error (benign): {_st_err}")
+            self._session_timer = None
 
         # Reset wrap-up tracking so the orchestrator is clean for the next session
         self.wrapup_triggered = False
@@ -2486,49 +2645,11 @@ class VoiceOrchestrator:
                     continue
 
                 # ── 2. Session Duration / Wrap-up Guard ──────────────────────────────
-                elapsed = None
-                if self.session_start_wall_time is not None:
-                    elapsed = time.time() - self.session_start_wall_time
-                elif self.session and getattr(self.session, "start_time", None):
-                    try:
-                        elapsed = time.time() - self.session.start_time.timestamp()
-                    except Exception:
-                        elapsed = None
-
-                if elapsed is not None and elapsed >= 300.0 and not self.wrapup_triggered:
-                    logger.info(f"Wrap-up prompt triggered at {elapsed:.1f}s.")
-                    self.wrapup_triggered = True
-                    if self.session:
-                        try:
-                            await self.crm.create_ticket(
-                                transcript="[System]: Session approaching 6-minute limit. Wrap-up prompt played.",
-                                summary="Session Wrap-up Triggered",
-                                sentiment="Neutral",
-                                call_logger=self.call_logger,
-                                call_id=self.session.crm_call_id or self.session.session_id,
-                                title="Session Wrap-up Triggered"
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to create Session Wrap-up CRM ticket: {e}")
-                    try:
-                        await self.speak_immediate_response(PRDScripts.WRAP_UP)
-                    except Exception as e:
-                        logger.error(f"Error speaking WRAP_UP prompt: {e}")
-
-                if elapsed is not None and elapsed >= 360.0:
-                    logger.warning(f"Session duration limit reached ({elapsed:.1f}s). Initiating wrap-up termination.")
-                    if self.session:
-                        self.session.termination_reason = "wrapup_timeout"
-                    try:
-                        await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
-                    except Exception as e:
-                        logger.error(f"Error speaking WRAP_UP_TERMINATION prompt: {e}")
-                    try:
-                        self.state.transition_to(CallState.CALL_END)
-                    except Exception:
-                        pass
-                    await self.cleanup()
-                    break
+                # [STAB-12] Removed: session-duration logic has been moved out of
+                # _monitor_silence() into SessionTimerManager (started in
+                # handle_audio_stream / handle_text_stream).  The SessionTimerManager
+                # fires on_soft_warning (5 min) and on_hard_end (6 min) exactly once
+                # each, completely independently of the silence monitor tick.
 
                 # ── 1.5 Auto-Recovery for False Interruptions ─────────────────────────
                 if current_call_state == CallState.INTERRUPTED:
