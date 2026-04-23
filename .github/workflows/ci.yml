@@ -88,7 +88,7 @@ jobs:
           docker run -d -p 8000:8000 --name test-agent \
             --network host \
             -e LOCAL_TEST=true \
-            -e APP_ENV=production \
+            -e APP_ENV=test \
             -e PORT=8000 \
             -e REDIS_URL=redis://localhost:6379 \
             -e PG_DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@localhost:5432/postgres \
