@@ -109,6 +109,8 @@ jobs:
             cila-ai-agent:test
           sleep 15
           docker logs test-agent
-          curl -f http://localhost:8000/readyz
+          curl -f http://localhost:8000/readyz || CURL_EXIT=$?
+          docker logs test-agent
           docker stop test-agent
           docker rm test-agent
+          exit ${CURL_EXIT:-0}
