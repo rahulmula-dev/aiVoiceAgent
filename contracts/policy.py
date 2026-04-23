@@ -1,9 +1,11 @@
-from .schemas import EscalationEvent, CallContext
 import logging
 import re
+import asyncio
+from enum import Enum
+from typing import Optional
+from .schemas import EscalationEvent, CallContext
 from langdetect import detect_langs, DetectorFactory
 DetectorFactory.seed = 0  # Deterministic results — without this langdetect is non-deterministic
-
 # Module-level logger for Policy Engine
 logger = logging.getLogger("Policy")
 
@@ -14,11 +16,6 @@ class PRDScripts:
     
     # Refusals
     REFUSAL_SENSITIVE = "I cannot continue this conversation due to a violation of our safety policy. Goodbye."
-    REFUSAL_IMMIGRATION = "As an AI for GD College, I cannot provide immigration or visa advice. Please contact a specialized consultant."
-    REFUSAL_MEDICAL = "I am not authorized to provide medical advice. Please consult a healthcare professional."
-    REFUSAL_LEGAL = "I cannot offer legal advice. Please contact a qualified attorney."
-    REFUSAL_INTERNAL_STAFF = "I cannot discuss internal staff or HR matters."
-    REFUSAL_POLITICS = "I cannot discuss political opinions."
     REFUSAL_COMPETITORS = "I can only provide information about GD College and cannot compare us with other institutions."
     REFUSAL_FINANCIAL_DISPUTES = "I cannot assist with fee disputes or refund policies over the phone. A human agent will follow up to assist you."
     REFUSAL_LANGUAGE = "I am currently designed to support English only. Please contact the GD College admissions team for assistance."
@@ -26,9 +23,17 @@ class PRDScripts:
     REFUSAL_LANGUAGE_1 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
     REFUSAL_LANGUAGE_2 = "I'm sorry, I am programmed to assist in English only for the college help desk. Could you please repeat that in English?"
     REFUSAL_LANGUAGE_3 = "I'm sorry, since I can only assist in English, I will have to end this call now. Please call back when you are ready to proceed in English. Goodbye."
-    REFUSAL_KB_MISS = "I'm sorry, I don't have that specific information right now. Let me have an admissions officer follow up with you to provide more details. I can, however, help with general information about programs and admissions!"
+    # [STAB-05] PRD §4.1 verbatim fallback — must match exactly. Do NOT paraphrase.
+    LOW_CONFIDENCE_FALLBACK = "I don't have that information right now."
+    # [STAB-05] Mandatory callback offer appended immediately after LOW_CONFIDENCE_FALLBACK.
+    CALLBACK_OFFER = "Would you like me to arrange a callback?"
+    # [STAB-05] Spoken when the caller declines the callback offer.
+    ANYTHING_ELSE = "Is there anything else I can help you with?"
+    REFUSAL_KB_MISS = "I don't have that information right now."
     REFUSAL_DEFAULT = "I am unable to assist with that specific request. Please contact the GD College admissions team."
-    
+    SENSITIVE_REFUSAL_MESSAGE = "That's something our team will need to review. I'll arrange a follow-up."
+    RESTRICTED_REFUSAL_MESSAGE = "I'm not able to help with that topic. I'll arrange for a team member to follow up."
+
     # Apologies
     APOLOGY_CLARIFICATION = "I didn't quite catch that. Could you please repeat?"
     APOLOGY_OVERLOADED = "I am currently overloaded with requests. Please try again in a few seconds."
@@ -52,6 +57,11 @@ class PRDScripts:
     WRAP_UP = "Before we wrap up, is there anything else I can help with?"
     WRAP_UP_TERMINATION = "Our maximum session time has been reached. Thank you for calling GD College. Goodbye."
 
+    # Barge-In Continuation Offer (STAB-03)
+    # Spoken ONCE per session when a multi-step answer is abandoned via a NEW_TOPIC barge-in.
+    # Only injected programmatically — the LLM is explicitly forbidden from generating this spontaneously.
+    CONTINUATION_OFFERED = "I can also finish walking you through the remaining steps if that's helpful."
+
 class ResponsePolicyEngine:
     """
     Standard implementation of Policy Engine.
@@ -66,13 +76,10 @@ class ResponsePolicyEngine:
 
     # --- 2. HARD REFUSAL CATEGORIES (Polite Refusal - No Retrieval) ---
     HARD_REFUSAL_KEYWORDS = {
-        "immigration": ["visa", "immigration", "permit", "greencard", "pr", "citizenship"],
-        "medical": ["medical", "doctor", "diagnosis", "treatment", "prescription", "health advice"],
-        "legal": ["legal", "lawyer", "sue", "court", "attorney", "contract"],
-        "internal_staff": ["salary", "hr", "staff issues", "employee", "paycheck", "hiring"],
-        "politics": ["politics", "political", "election", "government opinion", "democrat", "republican", "liberal", "conservative"],
-        "competitors": ["better than", "worse than", "compare to", "vs", "versus", "other college", "other university"],
-        "financial_disputes": ["fee dispute", "refund policy", "want my money back", "stole my money", "overcharged"],
+        "competitor_query": [
+            "better", "worse", "compare", "vs", "versus", "other college", "other university", "than any other",
+            "humber", "sheridan", "seneca", "george brown", "centennial", "conestoga", "mohawk", "fanshawe", "durham college", "st. lawrence"
+        ],
         # T4 fix: Catch explicit jailbreak translation commands before they reach the LLM.
         # "translate", "en español", "traduce" etc. are injection vectors, not college queries.
         "language_bypass": [
@@ -99,8 +106,6 @@ class ResponsePolicyEngine:
     ANGER_KEYWORDS = [
         "unacceptable",
         "this is unacceptable",
-        "complaint",
-        "file a complaint",
         "frustrated",
         "angry",
         "very angry",
@@ -216,8 +221,28 @@ class ResponsePolicyEngine:
         "requirement", "requirements", "specific", "international", "aid",
         "instructor", "instructors", "professor", "professors", "department",
         "facility", "workshop", "qualification", "examination", "assessment",
+        # results from earlier tests
         "results", "approvals", "measured",
     }
+
+    def validate_no_comparison(self, text: str) -> bool:
+        """
+        Safety Guard: Ensures outgoing response does NOT contain comparative keywords or value positioning.
+        """
+        # 1. Direct Keywords
+        comparative_keywords = ["better", "best", "cheaper", "higher", "lower", "ranking", "rankings", "evaluation", "versus", " vs "]
+        # 2. Indirect Positioning Phrases (STAB-07 hardening)
+        positioning_phrases = ["focus on quality", "affordable programs", "student-centric", "superior", "premium", "top-tier"]
+        
+        lower_text = text.lower()
+        
+        for kw in comparative_keywords:
+            if f" {kw} " in f" {lower_text} ": return False
+            
+        for phrase in positioning_phrases:
+            if phrase in lower_text: return False
+            
+        return True
 
     def _contains_word(self, text: str, keyword: str) -> bool:
         """
@@ -586,29 +611,11 @@ class ResponsePolicyEngine:
         if intent == "SENSITIVE":
             return PRDScripts.REFUSAL_SENSITIVE
             
-        if intent == "HARD_REFUSAL_IMMIGRATION":
-            return PRDScripts.REFUSAL_IMMIGRATION
-            
-        if intent == "HARD_REFUSAL_MEDICAL":
-            return PRDScripts.REFUSAL_MEDICAL
-            
-        if intent == "HARD_REFUSAL_LEGAL":
-            return PRDScripts.REFUSAL_LEGAL
-            
         if intent == "HARD_REFUSAL_LANGUAGE":
             return PRDScripts.REFUSAL_LANGUAGE
             
-        if intent == "HARD_REFUSAL_INTERNAL_STAFF":
-            return PRDScripts.REFUSAL_INTERNAL_STAFF
-            
-        if intent == "HARD_REFUSAL_POLITICS":
-            return PRDScripts.REFUSAL_POLITICS
-            
-        if intent == "HARD_REFUSAL_COMPETITORS":
+        if intent == "HARD_REFUSAL_COMPETITOR_QUERY":
             return PRDScripts.REFUSAL_COMPETITORS
-            
-        if intent == "HARD_REFUSAL_FINANCIAL_DISPUTES":
-            return PRDScripts.REFUSAL_FINANCIAL_DISPUTES
 
         if intent == "AMBIGUOUS":
             return PRDScripts.APOLOGY_CLARIFICATION
@@ -618,3 +625,195 @@ class ResponsePolicyEngine:
             return PRDScripts.REFUSAL_LANGUAGE
 
         return PRDScripts.REFUSAL_DEFAULT
+
+# ======================
+# RESTRICTED TOPIC ENUMS
+# ======================
+class RestrictedTopicResult:
+    def __init__(self, is_restricted: bool, category: Optional[str], confidence: str = "high"):
+        self.is_restricted = is_restricted
+        self.category = category
+        self.confidence = confidence
+
+# ======================
+# DETECTION LOGIC
+# ======================
+def detect_restricted_topic(user_input: str) -> RestrictedTopicResult:
+    if not user_input:
+        return RestrictedTopicResult(False, None)
+        
+    text = user_input.lower()
+    
+    # Deterministic Priority: REFUND > FEE_DISPUTE
+    
+    # 1. Refund (Strengthened Semantic Detection)
+    # Synonyms: reimbursement, cashback, return payment, tuition back, get money back
+    refund_synonyms = ["refund", "reimbursement", "cashback", "return my payment", "money back", "pay me back"]
+    if any(s in text for s in refund_synonyms) and any(ctx in text for ctx in ["tuition", "payment", "fee", "college", "course"]):
+        # False Positive Guard: "what is the refund policy"
+        if "what is" in text or "explain" in text or "tell me about" in text or "how do" in text:
+             logger.info(f"[ESCALATION_SKIP] potential_refund_query_detected_but_classified_safe: '{text}'")
+             pass 
+        else:
+            return RestrictedTopicResult(True, "SENSITIVE_REFUND")
+        
+        
+        
+    # 2. Fee dispute (Strengthened Semantic Detection)
+    # Synonyms: overcharged, wrong amount, billing error, incorrect charge
+    dispute_synonyms = ["fee dispute", "overcharg", "incorrect charge", "wrong amount", "billing error", "dispute my fee"]
+    if any(s in text for s in dispute_synonyms):
+        return RestrictedTopicResult(True, "SENSITIVE_FEE_DISPUTE")
+        
+    # 3. Immigration advisory (Strengthened Semantic Detection)
+    # Synonyms: study permit, visa, work permit, residency, citizenship, border
+    immigration_synonyms = ["immigration", "study permit", "visa", "work permit", "residency", "permit renewal", "border services"]
+    if any(s in text for s in immigration_synonyms) and any(act in text for act in ["advice", "help", "legal", "how to", "process", "right"]):
+        # False Positive Guard: "explain visa process" or generic "immigration" mentions
+        if "process" in text and ("explain" in text or "tell me about" in text):
+            logger.info(f"[ESCALATION_SKIP] potential_immigration_query_detected_but_classified_safe: '{text}'")
+            pass
+        else:
+            return RestrictedTopicResult(True, "SENSITIVE_IMMIGRATION")
+        
+        
+        
+    # 4. Legal (Strengthened Semantic Detection)
+    # Synonyms: lawyer, attorney, suing, court, litigation, rights, unlawful
+    legal_synonyms = ["legal right", "lawyer", "attorney", "sue", "suing", "court", "litigation", "unlawful", "lawsuit"]
+    if any(s in text for s in legal_synonyms):
+        return RestrictedTopicResult(True, "SENSITIVE_LEGAL")
+        
+    # 5. Complaint / grievance (Strengthened Semantic Detection)
+    # Synonyms: formal complaint, report, grievance, misconduct, faculty issue
+    complaint_synonyms = ["complaint", "grievance", "misconduct", "report a teacher", "faculty member", "file a report"]
+    if any(s in text for s in complaint_synonyms) and any(act in text for act in ["file", "submit", "against", "official"]):
+        return RestrictedTopicResult(True, "SENSITIVE_COMPLAINT")
+
+    # hr_salary
+    if ("how much do" in text and "staff" in text) or ("salary" in text) or ("paid" in text and "staff" in text):
+        return RestrictedTopicResult(True, "hr_salary")
+        
+    # medical_advice
+    if ("medical" in text) or ("medication" in text) or ("prescription" in text) or ("anxiety" in text and "advice" in text):
+        return RestrictedTopicResult(True, "medical_advice")
+        
+    # immigration_guarantee
+    if ("guarantee" in text and "permit" in text) or ("guarantee" in text and "visa" in text) or ("promise" in text and "immigration" in text) or ("guarantee" in text and "enrol" in text):
+        return RestrictedTopicResult(True, "immigration_guarantee")
+        
+    # internal_dispute
+    if "dispute" in text and "staff" in text:
+        return RestrictedTopicResult(True, "internal_dispute")
+        
+    # internal_staff_issue
+    if "staff issue" in text or ("staff" in text and "fired" in text):
+        return RestrictedTopicResult(True, "internal_staff_issue")
+        
+    # political_opinion
+    if "political" in text and ("opinion" in text or "view" in text):
+        return RestrictedTopicResult(True, "political_opinion")
+        
+    # legal_interpretation
+    if "legal interpretation" in text or ("legal" in text and "meaning" in text) or ("interpret" in text and "law" in text):
+        return RestrictedTopicResult(True, "legal_interpretation")
+        
+    return RestrictedTopicResult(False, None)
+
+# ======================
+# HANDLER LOGIC
+# ======================
+async def handle_restricted_topic(context, category: str, confidence: str = "high"):
+    # 3. Idempotency safeguard
+    if getattr(context, "_escalation_active", False):
+        return True
+
+    # 4. Production Logging
+    logger.info(f"[ESCALATION] category={category}, confidence={confidence}, sid={getattr(context, 'sid', 'unknown')}")
+    
+    logger.info("restricted_topic_detected=true")
+    logger.info(f"restricted_category={category}")
+    logger.info("pre_retrieval_block=true")
+    logger.info("kb_query_attempted=false")
+    
+    # Context extraction for CRM
+    session = getattr(context, "session", None)
+    sid = getattr(context, "sid", "unknown_call_id")
+    call_id = session.crm_call_id or session.session_id if session else sid
+
+    # Enum validation guard
+    VALID_SENSITIVE_ENUMS = [
+        "SENSITIVE_REFUND", "SENSITIVE_FEE_DISPUTE", 
+        "SENSITIVE_IMMIGRATION", "SENSITIVE_LEGAL", "SENSITIVE_COMPLAINT"
+    ]
+    
+    # 3. Enum Safety Check (Fail-closed)
+    # Allows legacy enums but ensures the 5 core sensitive enums trigger the flag.
+    # If it's a completely unrecognized enum, log error and treat it as a restricted topic but without the 'sensitive' flag.
+    KNOWN_RESTRICTED_ENUMS = VALID_SENSITIVE_ENUMS + [
+        "hr_salary", "medical_advice", "immigration_guarantee", 
+        "internal_dispute", "internal_staff_issue", "political_opinion", "legal_interpretation"
+    ]
+    
+    if category not in KNOWN_RESTRICTED_ENUMS:
+        logger.error(f"[RESTRICTED] Invalid enum detected: {category}. Falling back to default restricted handling.")
+        # Do not return False, because we still want to block it, but with safe metadata.
+        category = "UNCLASSIFIED_RESTRICTED"
+
+    ticket_metadata = {
+        "transcript": f"System interjected a restricted topic query: {category} (Conf: {confidence})",
+        "summary": f"Restricted Topic Blocked - {category}",
+        "sentiment": "SECURITY_ALERT",
+        "call_logger": context.call_logger,
+        "call_id": str(call_id),
+        "title": f"Restricted Topic - {category}",
+        "session_obj": session,
+        "callback_required": True,
+        "hard_refusal_category": category,
+        "sensitive_topic_flag": category in VALID_SENSITIVE_ENUMS,
+        "escalation_confidence": confidence # 1. Confidence tagging
+    }
+
+    # 2. CRM Ordering Guarantee: Dispatch synchronously BEFORE termination
+    try:
+        await context.crm.create_ticket(**ticket_metadata)
+        logger.info("crm_ticket_created=true")
+    except Exception as e:
+        logger.error(f"CRM dispatch failed before termination: {e}")
+    
+    if getattr(context, "response_task", None) and not context.response_task.done():
+        context.response_task.cancel()
+        
+    trace_id = f"restricted_topic_term_{category}"
+    from contracts.state import CallState
+    if hasattr(context.state, "transition_to"):
+        context.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
+        
+    async def termination_flow():
+        script_to_use = (
+            PRDScripts.SENSITIVE_REFUSAL_MESSAGE 
+            if category in VALID_SENSITIVE_ENUMS 
+            else PRDScripts.RESTRICTED_REFUSAL_MESSAGE
+        )
+        # Immediate refusal script playback
+        await context.speak_immediate_response(script_to_use, trace_id=trace_id)
+        
+        # Flush and disconnect
+        if hasattr(context, "wait_for_tts_flush"):
+            await context.wait_for_tts_flush()
+        else:
+            await asyncio.sleep(len(script_to_use) * 0.06)  # dynamic fallback
+            
+        if hasattr(context, "close_connection"):
+            await context.close_connection()
+        else:
+            await context.cleanup()
+            
+        logger.info("call_terminated=true")
+        
+    context._language_termination_active = True
+    context.response_task = asyncio.create_task(termination_flow())
+    
+    # CRITICAL: Prevent ANY further orchestration execution
+    context._escalation_active = True
+    return True # Signal that high-level orchestration MUST stop immediately

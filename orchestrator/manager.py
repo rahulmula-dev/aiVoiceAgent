@@ -20,6 +20,7 @@ from contracts.state import StateMachine, CallState
 from audit_logging.recorder import CallRecorder
 from agent_logging import CallLogger
 from .session_manager import SessionManager, SessionState
+from .session_timer_manager import SessionTimerManager
 from orchestrator.context_extractor import ContextManager
 from contracts.config import FeatureConfig
 from models.schemas import StandardTurn, BargeInTurn
@@ -87,16 +88,24 @@ class VoiceOrchestrator:
         self.silence_stage = 0  # 0: Normal, 1: Warned once, 2: Warned twice
         self.last_interaction_time = time.time()
 
-        # Session Duration / Wrap-up (Pilot-Ready)
-        self.wrapup_triggered = False
+        # Session Duration / Wrap-up (STAB-12)
+        # Legacy flags kept for STAB-10 compatibility (cleanup() duration capture).
+        self.wrapup_triggered = False          # set True by SessionTimerManager.on_soft_warning
         self.session_start_wall_time = None
+
+        # [STAB-12] Dedicated session timer — started per-call, cancelled in cleanup()
+        self._session_timer: SessionTimerManager | None = None
 
         # Cleanup guard: prevents double-cleanup from concurrent disconnect + silence termination
         self._cleanup_done = False
         self.last_response_was_question = False
+        self._last_ai_question_text = ""    # [STAB-04] Stores last AI response when it ended with "?"
+        self._pending_callback_offer = False  # [STAB-05] True when awaiting Yes/No after LOW_CONFIDENCE_FALLBACK
+        self._pending_callback_query = ""     # [STAB-05] Original caller query that triggered the KB miss
         self._stt_recovery_lock = False  # Critical: Prevent Death Spiral during hot-swaps
         self._vad_safety_task = None     # Tracker for Echo Trap recovery
         self._last_stt_packet_time = time.time() # [CALL-CPR] Watchdog for silent dropouts
+        self._post_tts_ingress_logged = False    # [STAB-02] Arms Log Point 4 after each TTS completion
         self._watchdog_check_time = time.time()  # Throttler for watchdog
         self.stop_event = asyncio.Event()  # [FIX-1] Required by _monitor_silence loop guard; was missing, causing immediate crash
         self._current_speaking_text = ""  # [ECHO-SUPPRESSION] Tracks active TTS sentence for echo detection
@@ -183,6 +192,96 @@ class VoiceOrchestrator:
         self._last_stt_packet_time = time.time()  # [CALL-CPR] Reset watchdog
         raw_text = text.strip() if text else ""
         
+        # --- STRICT RESTRICTED TOPIC GATE (Pre-Retrieval) ---
+        if is_final and raw_text:
+            if not hasattr(self, "session_state") or self.session_state is None:
+                self.session_state = {}
+
+            if self.session_state.get("restricted_handled") or self.session_state.get("terminate_session"):
+                return
+
+            from contracts.policy import detect_restricted_topic, handle_restricted_topic
+            rest_result = detect_restricted_topic(raw_text)
+            
+            # --- STAB-07: Isolated Competitor Refusal Path (Global Gate) ---
+            # This ensures no competitor query reaches the Brain or is logged in the CRM
+            # before any fallback or escalation paths can interfere.
+            intent_early = self.policy.classify_intent(raw_text)
+            if intent_early == "HARD_REFUSAL_COMPETITOR_QUERY":
+                # [STAB-07] Generate fresh trace_id at the gate if none exists
+                trace_id = getattr(self, "_current_trace_id", str(uuid.uuid4()))
+                self._current_trace_id = trace_id
+                await self.handle_competitor_refusal(trace_id=trace_id)
+                return
+
+            if rest_result.is_restricted:
+                self.session_state["restricted_handled"] = True
+                self.session_state["terminate_session"] = True
+
+                if not hasattr(self, "flags") or self.flags is None:
+                    self.flags = {}
+                self.flags["block_retrieval"] = True
+
+                # Synchronous dispatch safety: ensure CRM dispatch before anything else
+                should_block = await handle_restricted_topic(self, rest_result.category, confidence=rest_result.confidence)
+                if should_block:
+                    return
+
+        # Double guarantee: if terminate_session is set, block ALL future text
+        if getattr(self, "session_state", {}).get("terminate_session"):
+            return
+
+        # [STAB-05] Callback Offer Intercept — must happen before intent classification.
+        # When the agent just asked "Would you like me to arrange a callback?" we intercept
+        # the caller's Yes/No response and route directly, bypassing the normal LLM pipeline.
+        if is_final and raw_text and getattr(self, "_pending_callback_offer", False):
+            _yes_tokens = {"yes", "yeah", "yep", "sure", "please", "ok", "okay", "go ahead", "do it", "correct", "affirmative"}
+            _no_tokens = {"no", "nope", "nah", "don't", "no thanks", "not now", "skip", "never mind", "nevermind", "that's fine"}
+            _reply_lower = raw_text.lower().strip().rstrip(".,!?")
+            _is_yes = any(_reply_lower == t or _reply_lower.startswith(t) for t in _yes_tokens)
+            _is_no = any(_reply_lower == t or _reply_lower.startswith(t) for t in _no_tokens)
+
+            if _is_yes or _is_no:
+                self._pending_callback_offer = False
+                _caller_query = getattr(self, "_pending_callback_query", "")
+                self._pending_callback_query = ""
+
+                # trace_id is not yet defined this early in _on_transcript (generated later via uuid)
+                _intercept_trace_id = getattr(self, "_current_trace_id", None)
+
+                if _is_yes:
+                    logger.info(f"[STAB-05] Caller accepted callback for query='{_caller_query[:60]}'")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab05", "callback_accepted", meta={"caller_query": _caller_query})
+                    if self.session and self.crm:
+                        self._create_task_with_log(self.crm.create_ticket(
+                            transcript=f"[STAB-05] Caller requested callback.\nOriginal query: {_caller_query}",
+                            summary="Callback Requested: KB Miss",
+                            sentiment="Neutral",
+                            call_logger=self.call_logger,
+                            call_id=self.session.crm_call_id or self.session.session_id,
+                            title="Callback_Required_KB_Miss",
+                            structured_turns=self.session.structured_turns,
+                            session_obj=self.session,
+                            callback_required=True,
+                            metadata={"trigger_query": _caller_query},
+                        ))
+                    self.response_task = asyncio.create_task(
+                        self.speak_immediate_response(
+                            "Of course! I've arranged a callback. An admissions officer will be in touch shortly. Goodbye.",
+                            trace_id=_intercept_trace_id
+                        )
+                    )
+                    self._create_task_with_log(self._delayed_call_end(delay=4.0))
+                else:
+                    logger.info("[STAB-05] Caller declined callback — returning to LISTENING.")
+                    if self.call_logger:
+                        self.call_logger.log_event("stab05", "callback_declined", meta={"caller_query": _caller_query})
+                    self.response_task = asyncio.create_task(
+                        self.speak_immediate_response(PRDScripts.ANYTHING_ELSE, trace_id=_intercept_trace_id)
+                    )
+                return  # Short-circuit: do not pass to intent classification or LLM
+
         # 1. AGGRESSIVE LOGGING: We must see what the STT actually heard
         # [STT RAW] is used by the Expert Debugger to diagnose "deafness" or "hallucinations"
         # Progress counter added for better forensic visibility
@@ -201,6 +300,22 @@ class VoiceOrchestrator:
                         self.state.transition_to(CallState.INTERRUPTED)
                         halt_ms = int((asyncio.get_event_loop().time() - halt_start) * 1000)
                         logger.info(f">>> BARGE-IN (Partial, ~{halt_ms}ms halt): '{raw_text}'")
+                        # [STAB-03] Latency instrumentation — AC requires stop_current_speech delta < 300ms
+                        _pass = halt_ms < 300
+                        if self.call_logger:
+                            self.call_logger.log_event(
+                                "stab03", "latency_check",
+                                latency_ms=halt_ms,
+                                meta={
+                                    "check": "stop_current_speech_delta",
+                                    "pass": _pass,
+                                    "threshold_ms": 300,
+                                    "partial_text_preview": raw_text[:40],
+                                },
+                                trace_id=getattr(self, '_current_trace_id', None)
+                            )
+                        if not _pass:
+                            logger.warning(f"[STAB-03][latency_check] FAIL halt={halt_ms}ms > 300ms threshold")
 
             # Reset silence timer on partials — but ONLY when the agent is not speaking.
             # During SPEAKING, Twilio echoes TTS audio back as partial transcripts (non-final),
@@ -210,6 +325,9 @@ class VoiceOrchestrator:
 
             # STREAM BUFFERING: Pre-fetch RAG context for partial transcripts
             if len(raw_text) > 15 and self.session:
+                if getattr(self, "flags", {}).get("block_retrieval"):
+                    return
+                    
                 # 🛡️ SECURITY GATE: Prevent policy-violating partial transcripts from hitting external Vector DB
                 intent = self.policy.classify_intent(raw_text, detected_lang=detected_lang)
                 if intent == "PROCEED":
@@ -681,7 +799,7 @@ class VoiceOrchestrator:
                 
                 # [P5-01]: Skip CRM noise for purely ambiguous/noisy inputs
                 if intent != "AMBIGUOUS":
-                    # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Competitors, Fees, etc.)
+                    # 🟢 S4 Compliance: Record CRM ticket for ALL Hard Refusals (Fees, etc.)
                     self._create_task_with_log(self.crm.create_ticket(
                         transcript=text,
                         summary=f"Policy Violation: {intent}",
@@ -704,7 +822,7 @@ class VoiceOrchestrator:
             if self.response_task and not self.response_task.done():
                 self.response_task.cancel()
                 logger.debug(f"[GOVERNANCE] Cancelled pending LLM task for Hard Bypass ({intent}).")
-            
+
             self.state.transition_to(CallState.ESCALATION, trace_id=trace_id)
 
             # C. Strike 3: Use dedicated termination flow (awaits TTS + closes connection)
@@ -780,12 +898,16 @@ class VoiceOrchestrator:
                     self.handle_barge_in(self.sid, text, trace_id=trace_id, partial_text=partial_text)
                 )
                 return
-            elif current_state == CallState.TRANSCRIBING:
+            elif current_state == CallState.TRANSCRIBING and pre_transition_state in [CallState.SPEAKING, CallState.INTERRUPTED]:
                 # [BARGE-IN FIX]: Dev-Phone / environments that don't send Twilio VAD 'speech' events
                 # never flip state SPEAKING -> INTERRUPTED before the STT final arrives.
                 # By the time we reach here, state has already raced to TRANSCRIBING, but the
                 # response_task is still running (TTS may still be streaming buffered audio).
                 # We must stop TTS output now and answer the user's actual question.
+                # [STAB-02 FIX]: Guard added — pre_transition_state must be SPEAKING or INTERRUPTED.
+                # Without this, a Deepgram continuation final arriving during INTENT_EVAL (agent
+                # thinking, not speaking) would route here, trigger handle_barge_in → INTERRUPTED,
+                # and cause 5-6s of active silence. The else branch below handles that case cleanly.
                 logger.info(f">>> LATE BARGE-IN (state=TRANSCRIBING): Stopping residual TTS for: '{raw_text}'")
                 partial_text = self.synthesizer.stop_current_speech(self.sid)
                 self._create_task_with_log(self._send_clear_message())
@@ -839,14 +961,29 @@ class VoiceOrchestrator:
                 self._create_task_with_log(self._send_clear_message())
             
             self.state.transition_to(CallState.INTERRUPTED, trace_id=trace_id)
-            
+
             # Identify the turn being interrupted
             prev_turn = None
             if self.session.structured_turns:
                 prev_turn = self.session.structured_turns[-1]
                 prev_turn.agent_response_status = "interrupted"
                 prev_turn.agent_partial_response = partial_text
-            
+
+            # [STAB-05] Barge-in Proof: if a KB miss callback offer is still pending,
+            # bypass the entire RAG + LLM path and re-ask the callback question immediately.
+            # The caller interrupted the fallback phrase — the offer must still be made.
+            if getattr(self, "_pending_callback_offer", False):
+                logger.info("[STAB-05] Barge-in during pending callback offer — re-presenting CALLBACK_OFFER.")
+                if self.call_logger:
+                    self.call_logger.log_event(
+                        "stab05", "callback_offer_barge_in_reissued",
+                        meta={"caller_input": caller_input[:60]},
+                        trace_id=trace_id
+                    )
+                self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+                await self.speak_immediate_response(PRDScripts.CALLBACK_OFFER, trace_id=trace_id)
+                return
+
             # STEP B — Inject RAG Context for PRD Compliance
             # FAST-PATH: If the input is extremely short (filler/command), skip RAG to reduce latency.
             is_short_input = len(caller_input.split()) <= 2
@@ -908,16 +1045,26 @@ class VoiceOrchestrator:
             # STEP D — Update Interrupted Turn
             if classification == "NEW_TOPIC" and prev_turn:
                 prev_turn.agent_response_status = "abandoned"
+                # [STAB-03] Clear stale RAG context so the LLM cannot hallucinate the old topic
+                # into the new answer. prefetched_context_task and retrieved_chunks_cache are
+                # turn-scoped — they must not bleed across a topic boundary.
+                if self.session:
+                    self.session.prefetched_context_task = None
+                    self.session.retrieved_chunks_cache = []
+                    self.session.last_intent = None
 
             if prev_turn:
                 prev_turn.barge_in_classification = classification
 
-            # Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+            # [STAB-03] Phase 6: Session-Persistent Offer Logic (MEDIUM-M2)
+            # Fires ONCE per session when a multi-step answer is abandoned (NEW_TOPIC barge-in).
+            # Uses PRDScripts.CONTINUATION_OFFERED so the script is centrally managed.
+            _continuation_was_offered = False
             if prev_turn and prev_turn.is_multi_step and classification == "NEW_TOPIC" and not self.session.continuation_offered:
-                # Append soft offer to the end of the new response
                 if response and not response.endswith(("?", ".")): response += "."
-                response += " I can also finish walking you through the remaining steps if that's helpful."
+                response += f" {PRDScripts.CONTINUATION_OFFERED}"
                 self.session.continuation_offered = True
+                _continuation_was_offered = True
 
             # STEP E — Create New Turn Entry
             new_id = len(self.session.structured_turns) + 1
@@ -929,7 +1076,7 @@ class VoiceOrchestrator:
                 agent_partial_response=None,
                 barge_in_classification=None,
                 is_multi_step=is_multi_step,
-                continuation_offered=False
+                continuation_offered=_continuation_was_offered  # [STAB-03] accurately reflects whether offer was appended
             )
             self.session.structured_turns.append(new_turn)
             self.session.current_speaking_turn_id = new_id
@@ -944,6 +1091,30 @@ class VoiceOrchestrator:
             if self.state.get_state() == CallState.INTERRUPTED:
                 logger.debug("Barge-in task cleanup: Reverting INTERRUPTED -> LISTENING")
                 self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
+
+    async def handle_competitor_refusal(self, trace_id=None):
+        """
+        STAB-07: Isolated handler for competitor queries.
+        Ensures polite refusal without CRM ticket or call termination.
+        """
+        # [STAB-07] STRICT: Use pre-approved static response only.
+        # No dynamic templating, no variables, no LLM drift possible.
+        refusal_text = PRDScripts.REFUSAL_COMPETITORS
+        
+        # Safety Guard: Ensure no dynamic content/comparisons/positioning (redundant but safe)
+        if not self.policy.validate_no_comparison(refusal_text):
+            logger.error(f"[STAB-07] Safety Guard Failure: Competitor refusal script contained prohibited comparisons!")
+            refusal_text = "I can only provide information about GD College and cannot compare us with other institutions."
+
+        # Speak it
+        # [GUARD] competitor_refusal_triggered=true
+        logger.info(f"[STAB-07] Competitor refusal triggered (trace_id={trace_id})")
+        
+        # [GOVERNANCE] Ensure any pending tasks are cancelled before speaking static refusal
+        if self.response_task and not self.response_task.done():
+            self.response_task.cancel()
+            
+        self.response_task = asyncio.create_task(self.speak_immediate_response(refusal_text, trace_id=trace_id))
 
     async def speak_immediate_response(self, text, trace_id=None):
         """
@@ -1215,6 +1386,14 @@ class VoiceOrchestrator:
                 # Start Silence Monitor (Story S4-2)
                 self.silence_task = asyncio.create_task(self._monitor_silence())
 
+                # [STAB-12] Start dedicated session timer (independent of silence monitor)
+                self._session_timer = SessionTimerManager(
+                    session_start_wall_time=self.session_start_wall_time
+                )
+                self._session_timer.on_soft_warning = self._on_session_soft_warning
+                self._session_timer.on_hard_end      = self._on_session_hard_end
+                await self._session_timer.start()
+
                 # In PRD, caller_type should dynamically track based on conversation intent.
                 # However, at Call Start, we have no intent yet. 
                 # We start as "unknown_lead", and will update dynamically later based on text.
@@ -1287,6 +1466,17 @@ class VoiceOrchestrator:
                         try:
                             await self.transcriber.send_audio(payload)
                             self._last_stt_packet_time = time.time()  # [WATCHDOG] Audio delivered → connection is live
+                            # [STAB-02] Log Point 4: first audio frame forwarded to Deepgram post-TTS
+                            if self.state.get_state() == CallState.LISTENING and not self._post_tts_ingress_logged:
+                                self._post_tts_ingress_logged = True
+                                _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                                if self.call_logger:
+                                    self.call_logger.log_event(
+                                        "stab02", "stt_ingress_first_frame_post_tts",
+                                        meta={"turn_number": _turn_num, "state": CallState.LISTENING.value},
+                                        trace_id=getattr(self, '_current_trace_id', None)
+                                    )
+                                logger.info(f"[STAB-02][stt_ingress_first_frame_post_tts] turn={_turn_num} — Deepgram receiving audio post-TTS")
                         except Exception as stt_err:
                             logger.error(f"[FAILOVER] STT send failed: {stt_err}. Attempting recovery...")
                             # RECOVERY: Try to acquire a new transcriber FROM THE POOL immediately
@@ -1410,7 +1600,15 @@ class VoiceOrchestrator:
             except Exception:
                 self.session_start_wall_time = time.time()
             self.state.transition_to(CallState.CALL_INIT)
-            
+
+            # [STAB-12] Start dedicated session timer for text mode too
+            self._session_timer = SessionTimerManager(
+                session_start_wall_time=self.session_start_wall_time
+            )
+            self._session_timer.on_soft_warning = self._on_session_soft_warning
+            self._session_timer.on_hard_end      = self._on_session_hard_end
+            await self._session_timer.start()
+
             # LOG CALL TO CRM (Text Mode)
             try:
                 crm_id = await self.crm.log_call(
@@ -1504,6 +1702,21 @@ class VoiceOrchestrator:
                             f"chars={len(sentence)} total_so_far={total_chars} trace={trace_id}"
                         )
 
+                        # [STAB-02] Log Point 1: TTS Entry
+                        _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                        if self.call_logger:
+                            self.call_logger.log_event(
+                                "stab02", "tts_entry",
+                                meta={
+                                    "turn_number": _turn_num,
+                                    "state_before_speaking": self.state.get_state().value,
+                                    "sentence_idx": sentence_idx,
+                                    "text_preview": sentence[:60],
+                                },
+                                trace_id=trace_id
+                            )
+                        logger.info(f"[STAB-02][tts_entry] turn={_turn_num} state={self.state.get_state().value} sentence={sentence_idx} trace={trace_id}")
+
                         # STATE: Speaking
                         self.state.transition_to(CallState.SPEAKING, trace_id=trace_id)
                         
@@ -1565,16 +1778,46 @@ class VoiceOrchestrator:
                         logger.debug(f"[TTS-WORKER] Sleeping {remaining_time:.1f}s to align with client playback.")
                         await asyncio.sleep(remaining_time)
                 except asyncio.CancelledError:
-                    logger.info(f"[TTS-WORKER] Cancelled mid-stream (sentence #{sentence_idx}) trace={trace_id}")
+                    # [STAB-02] Log Point 2: TTS completion source — task cancelled
+                    _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab02", "tts_completion_source",
+                            meta={"source": "task_cancelled", "turn_number": _turn_num, "sentence_idx": sentence_idx},
+                            trace_id=trace_id
+                        )
+                    logger.info(f"[STAB-02][tts_completion_source] source=task_cancelled turn={_turn_num} sentence={sentence_idx} trace={trace_id}")
 
                 finally:
                     self._current_speaking_text = ""  # [ECHO-SUPPRESSION] clear when TTS ends
                     # Back to Listening when done speaking (if not escalated)
                     # [FIX]: Don't overwrite state if user already started INTERRUPTED, TRANSCRIBING, or if AI is generating
-                    if self.state.get_state() not in [CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED, CallState.TRANSCRIBING, CallState.INTENT_EVAL, CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION]:
+                    _state_at_finally = self.state.get_state()
+                    _guard_states = [
+                        CallState.ESCALATION, CallState.CALL_END, CallState.INTERRUPTED,
+                        CallState.TRANSCRIBING, CallState.INTENT_EVAL,
+                        CallState.RETRIEVAL, CallState.RESPONSE_VALIDATION
+                    ]
+                    _guard_blocked = _state_at_finally in _guard_states
+                    _turn_num = self.session.current_speaking_turn_id if self.session else -1
+                    # [STAB-02] Log Point 3: SPEAKING → LISTENING transition decision
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab02", "speaking_to_listening_decision",
+                            meta={
+                                "turn_number": _turn_num,
+                                "state_at_finally": _state_at_finally.value,
+                                "guard_blocked": _guard_blocked,
+                                "will_transition": not _guard_blocked,
+                            },
+                            trace_id=trace_id
+                        )
+                    logger.info(f"[STAB-02][speaking_to_listening_decision] turn={_turn_num} state_at_finally={_state_at_finally.value} guard_blocked={_guard_blocked} trace={trace_id}")
+                    if not _guard_blocked and not self._cleanup_done:
                         self.state.transition_to(CallState.LISTENING, trace_id=trace_id)
                         # Reset interaction time so silence monitor starts counting from NOW
                         self.last_interaction_time = time.time()
+                        self._post_tts_ingress_logged = False  # Arm Log Point 4 for next turn
                     logger.info(
                         f"[TTS-WORKER] Done. final_state={self.state.get_state().value} "
                         f"sentences={sentence_idx} total_chars={total_chars} trace={trace_id}"
@@ -1642,6 +1885,9 @@ class VoiceOrchestrator:
                     # Use persistent context
                     active_context = self.session.call_context if self.session else None
                     
+                    if getattr(self, "flags", {}).get("block_retrieval"):
+                        return
+                        
                     # Use pre-fetched context if available
                     prefetched_task = getattr(self.session, 'prefetched_context_task', None)
                     if prefetched_task:
@@ -1657,8 +1903,32 @@ class VoiceOrchestrator:
                         prefetched_context_task=prefetched_task,
                         degraded_mode=self._latency_alert_emitted
                     ):
+                        # [STAB-05] KB miss detection — metadata is already unpacked by the async-for.
+                        # generate_stream yields 2-tuples (sentence, metadata), so sentence is always
+                        # a string here. Check metadata directly for the kb_miss signal.
+                        if metadata and metadata.get("error") == "kb_miss":
+                            self._pending_callback_offer = True
+                            self._pending_callback_query = metadata.get("caller_query", text)
+                            logger.warning(
+                                f"[STAB-05] KB miss — bypassing audio_queue, speaking verbatim fallback directly. "
+                                f"query='{self._pending_callback_query[:60]}'"
+                            )
+                            if self.call_logger:
+                                self.call_logger.log_event(
+                                    "stab05", "kb_miss_fallback",
+                                    meta={
+                                        "caller_query": self._pending_callback_query,
+                                        "rag_score": metadata.get("rag_score", 0.0),
+                                        "category_threshold": metadata.get("category_threshold", 0.58),
+                                    }
+                                )
+                            # Speak verbatim fallback via speak_immediate_response so it is
+                            # observable in tests and does NOT enter the audio_queue/tts_worker path.
+                            await self.speak_immediate_response(sentence, trace_id=trace_id)
+                            break  # No more streaming — the CALLBACK_OFFER is injected below.
+
                         if sentence and isinstance(sentence, tuple):
-                             # Handle refusal error payload (text, meta)
+                             # Legacy guard: handles any generator that wraps payload as (text, meta)
                              sentence, error_meta = sentence
                              if "error" in error_meta:
                                  logger.debug(f"[LOG] Refusal reason: {error_meta.get('error')}")
@@ -1778,7 +2048,13 @@ class VoiceOrchestrator:
 
                 await audio_queue.put(None)
                 await worker_task
-                
+
+                # [STAB-05] KB Miss Callback Offer — appended after verbatim fallback is spoken.
+                # Must NOT be part of the LLM response stream; injected deterministically here.
+                if self._pending_callback_offer:
+                    logger.info("[STAB-05] Appending mandatory callback offer after LOW_CONFIDENCE_FALLBACK.")
+                    await self.speak_immediate_response(PRDScripts.CALLBACK_OFFER, trace_id=trace_id)
+
                 # [GOVERNANCE] Auto-terminate if the response concludes the call
                 if full_ai_text:
                     normalized_text = full_ai_text.strip().lower().rstrip(string.punctuation).strip()
@@ -1802,6 +2078,8 @@ class VoiceOrchestrator:
                     worker_task.cancel()
             logger.info(f"AI: {full_ai_text.strip()}")
             self.last_response_was_question = full_ai_text.strip().endswith("?")
+            if self.last_response_was_question:
+                self._last_ai_question_text = full_ai_text.strip()  # [STAB-04] For post-clarification repeat
             # log_conversation_turn is deprecated (PRD P3-07)
             self.session.conversation_history.append({"role": "model", "parts": [full_ai_text.strip()]})
             
@@ -1950,7 +2228,137 @@ class VoiceOrchestrator:
             logger.debug(f"[ECHO-SUPPRESSION] overlap={overlap:.2f} >= threshold={threshold} — transcript classified as echo")
         return is_echo
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # [STAB-12] Session timer event handlers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _on_session_soft_warning(self) -> None:
+        """
+        [STAB-12] TC-17: 5-minute soft warning handler.
+        - Speaks EXACTLY PRDScripts.WRAP_UP (single source of truth).
+        - Call remains FULLY functional after this fires.
+        - Does NOT terminate the call.
+        - CRM ticket created for audit trail.
+        - Idempotency guaranteed by SessionTimerManager._soft_warning_fired flag.
+
+        Edge-case (Point 3): if AI is mid-speech when timer fires, we cancel the
+        active response_task first so audio streams do not overlap.  The soft
+        warning is queued safely and the session continues normally.
+        """
+        if self._cleanup_done:
+            logger.debug("[STAB-12][soft_warning] Cleanup already done — skipping.")
+            return
+
+        logger.info("[STAB-12][soft_warning] 5-min soft warning fired.")
+        self.wrapup_triggered = True  # [STAB-10 compat] keep legacy flag in sync
+
+        # ── Stop any active AI speech before speaking the warning (Point 3) ──
+        # Mirrors the same pattern used by all other immediate-response callers.
+        if self.response_task and not self.response_task.done():
+            logger.debug("[STAB-12][soft_warning] Cancelling active response_task before speaking.")
+            self.response_task.cancel()
+            try:
+                await self.response_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Audit CRM ticket (fire-and-forget — soft warning must not block call)
+        if self.session and self.crm:
+            try:
+                self._create_task_with_log(self.crm.create_ticket(
+                    transcript="[STAB-12] Session approaching 6-minute limit. Soft wrap-up prompt played.",
+                    summary="Session Wrap-up Triggered (5-min soft warning)",
+                    sentiment="Neutral",
+                    call_logger=self.call_logger,
+                    call_id=self.session.crm_call_id or self.session.session_id,
+                    title="Session Wrap-up Triggered",
+                ))
+            except Exception as crm_e:
+                logger.error(f"[STAB-12][soft_warning] CRM ticket error: {crm_e}")
+
+        # Speak the SINGLE canonical soft-warning phrase (PRDScripts.WRAP_UP)
+        try:
+            await self.speak_immediate_response(PRDScripts.WRAP_UP)
+        except Exception as tts_e:
+            logger.error(f"[STAB-12][soft_warning] TTS error: {tts_e}")
+
+        if self.call_logger:
+            self.call_logger.log_event(
+                "stab12", "soft_warning_spoken",
+                meta={"phrase": PRDScripts.WRAP_UP}
+            )
+
+    async def _on_session_hard_end(self) -> None:
+        """
+        [STAB-12] TC-18: 6-minute hard end handler.
+        - Delivers polite closing message (PRDScripts.WRAP_UP_TERMINATION).
+        - Gracefully terminates call — no abrupt disconnect.
+        - Triggers CRM update (wrapup_timeout reason).
+        - Flushes logs via cleanup().
+
+        Idempotency (Point 5 — layered guards):
+          Layer 1: SessionTimerManager._hard_end_fired (prevents second invocation).
+          Layer 2: self._hard_end_active flag (prevents concurrent re-entry before
+                   _cleanup_done is set — rare but possible under async race).
+          Layer 3: self._cleanup_done guard in cleanup() itself.
+
+        Edge-case (Point 4): if AI is mid-response when timer fires, we stop the
+        active response_task gracefully so there is no abrupt audio cut-off before
+        the polite closing message plays.
+        """
+        # ── Layer 2 idempotency (Point 5) ─────────────────────────────────────
+        if getattr(self, "_hard_end_active", False):
+            logger.debug("[STAB-12][hard_end] Re-entry blocked by _hard_end_active flag.")
+            return
+        self._hard_end_active = True
+
+        if self._cleanup_done:
+            logger.debug("[STAB-12][hard_end] Cleanup already done — skipping.")
+            self._hard_end_active = False
+            return
+
+        logger.warning("[STAB-12][hard_end] 6-min hard end fired. Initiating graceful termination.")
+
+        if self.call_logger:
+            self.call_logger.log_event(
+                "stab12", "hard_end_triggered",
+                meta={"phrase": PRDScripts.WRAP_UP_TERMINATION}
+            )
+
+        # 1. Mark termination reason BEFORE cleanup so CRM ticket picks it up
+        if self.session:
+            self.session.termination_reason = "wrapup_timeout"
+
+        # 2. Stop any active AI speech gracefully before the closing message (Point 4)
+        #    This prevents audio overlap between an in-progress LLM response and the
+        #    polite goodbye. We DO NOT abruptly close the socket — TTS finishes cleanly.
+        if self.response_task and not self.response_task.done():
+            logger.info("[STAB-12][hard_end] Stopping active response_task for graceful close.")
+            self.response_task.cancel()
+            try:
+                await self.response_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self.synthesizer:
+            self.synthesizer.stop_current_speech(self.sid)
+        await self._send_clear_message()  # flush Twilio client-side audio buffer
+
+        # 3. Polite closing TTS — awaited, so audio fully transmits before socket closes
+        try:
+            await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
+        except Exception as tts_e:
+            logger.error(f"[STAB-12][hard_end] TTS error: {tts_e}")
+
+        # 4. Graceful termination: transition state, then full cleanup.
+        #    cleanup() guarantees: CRM ticket (awaited) + log flush + storage ops.
+        try:
+            self.state.transition_to(CallState.CALL_END)
+        except Exception:
+            pass
+        await self.cleanup()
+
     async def cleanup(self):
+
         """Final session archival and resource release (Pillar 3)."""
         # GUARD: Prevent double-cleanup (e.g. silence termination + WebSocket disconnect both call this)
         if self._cleanup_done:
@@ -1960,6 +2368,19 @@ class VoiceOrchestrator:
 
         sid = self.session.session_id if self.session else getattr(self, "_early_sid", "unknown")
         logger.info(f"Cleanup started for session {sid}.")
+
+        # [STAB-10] Capture duration BEFORE resetting session_start_wall_time
+        _call_duration_s = None
+        if self.session_start_wall_time is not None:
+            _call_duration_s = round(time.time() - self.session_start_wall_time, 1)
+
+        # [STAB-12] Cancel dedicated session timer so it does not fire after call ends
+        if self._session_timer is not None:
+            try:
+                await self._session_timer.cancel()
+            except Exception as _st_err:
+                logger.debug(f"[STAB-12] Session timer cancel error (benign): {_st_err}")
+            self._session_timer = None
 
         # Reset wrap-up tracking so the orchestrator is clean for the next session
         self.wrapup_triggered = False
@@ -2011,56 +2432,95 @@ class VoiceOrchestrator:
             except Exception as e:
                 logger.error(f"Cleanup: Synthesizer close failed: {e}")
                 
-            # LAYERED FALLBACK: Null-Safe Ticket Data (DLQ-wrapped for exception safety)
+            # [STAB-10] UNIVERSAL CRM TICKET — PRD §10: every call produces a ticket, no exceptions.
+            # Previously restricted calls were skipped here; that guard is removed.
+            # Restricted calls already create a SECURITY_ALERT ticket; this creates the session summary.
             try:
-                if self.session and self.session.conversation_history:
-                    logger.debug("Cleanup: Logging full session to CRM")
-                    history_text = "\n".join([f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history])
-                    
-                    # Pillar 3: Safety Net - Check for system failure
-                    reason = self.session.termination_reason
-                    if reason == "system_failure":
-                        logger.warning(f">>> URGENT: Creating high-priority callback ticket for {sid} due to system failure.")
+                reason = (
+                    getattr(self.session, "termination_reason", None) or "user_hangup"
+                ) if self.session else "no_session"
 
+                # Recording URL: local file path fallback (S3 upload happens separately)
+                _recording_url = None
+                if self.recorder and getattr(self.recorder, "filename", None):
+                    _recording_url = self.recorder.filename  # local path; S3 URL if available
+
+                # Derive callback_required and ticket title from termination reason
+                _callback_required = reason in (
+                    "silence_termination", "system_failure", "latency_breach", "wrapup_timeout"
+                )
+                _title_map = {
+                    "user_hangup": "AI Call Summary - Normal",
+                    "silence_termination": "AI Call Summary - Silence Termination",
+                    "system_failure": "AI Call Summary - System Failure",
+                    "latency_breach": "AI Call Summary - Latency Breach",
+                    "wrapup_timeout": "AI Call Summary - Session Limit Reached",
+                    "abandoned_setup": "AI Call Summary - No Audio",
+                    "no_session": "AI Call Summary - Connection Failed",
+                }
+                _ticket_title = _title_map.get(reason, f"AI Call Summary - {reason}")
+                _sentiment = "Negative" if _callback_required else "Positive"
+
+                if self.session and self.session.conversation_history:
+                    logger.info(f"[STAB-10] Cleanup: Writing universal CRM ticket reason={reason} callback={_callback_required}")
+                    history_text = "\n".join(
+                        [f"{m['role']}: {m['parts'][0]}" for m in self.session.conversation_history]
+                    )
+                    if reason == "system_failure":
+                        logger.warning(f">>> URGENT: High-priority callback ticket for {sid} — system failure.")
                     ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript=history_text,
-                        summary=f"Call Log: {reason} (Session: {sid}) | Type: {ct}",
-                        sentiment="Positive", # Default to positive for successful logs
+                        summary=f"Call Log: {reason} | Type: {ct} | Duration: {_call_duration_s}s",
+                        sentiment=_sentiment,
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
-                        title=f"Completed Session Log ({reason})",
+                        title=_ticket_title,
                         structured_turns=self.session.structured_turns,
-                        session_obj=self.session
+                        session_obj=self.session,
+                        callback_required=_callback_required,
+                        status="Completed",
+                        duration=_call_duration_s,
+                        recording_url=_recording_url,
+                        metadata={"termination_reason": reason, "caller_type": ct},
                     )
                 elif self.session:
-                    logger.debug("Cleanup: Logging early exit (no audio) to CRM")
-                    reason = getattr(self.session, "termination_reason", "abandoned_setup")
+                    logger.info(f"[STAB-10] Cleanup: Early-exit CRM ticket reason={reason}")
                     ct = getattr(self.session, 'caller_type', 'unknown')
                     await self.crm.create_ticket(
                         transcript="[System]: Call ended before user provided audio or during setup.",
-                        summary=f"Completed — No Callback Needed. Type: {ct}",
+                        summary=f"No Conversation — {reason} | Type: {ct}",
                         sentiment="Neutral",
                         call_logger=self.call_logger,
                         call_id=self.session.crm_call_id or sid,
-                        title="Abandoned Setup/No Audio",
+                        title=_ticket_title,
                         structured_turns=self.session.structured_turns,
-                        session_obj=self.session
+                        session_obj=self.session,
+                        callback_required=False,
+                        status="Completed",
+                        duration=_call_duration_s,
+                        recording_url=_recording_url,
+                        metadata={"termination_reason": reason, "caller_type": ct},
                     )
                 else:
-                    logger.debug("Cleanup: Logging system error (no session) to CRM")
+                    logger.warning(f"[STAB-10] Cleanup: No session object — writing error ticket for {sid}")
                     await self.crm.create_ticket(
                         transcript="[System]: Connection failed before session could be initialized.",
                         summary="System Error - Early Connection Failure",
                         sentiment="Negative",
                         call_logger=self.call_logger,
                         call_id=sid,
-                        title="System_Error",
+                        title="AI Call Summary - Connection Failed",
                         structured_turns=None,
-                        session_obj=self.session
+                        session_obj=None,
+                        callback_required=True,
+                        status="Failed",
+                        duration=None,
+                        recording_url=None,
+                        metadata={"termination_reason": "no_session"},
                     )
             except Exception as crm_ex:
-                # [DLQ] CRM is unavailable. Log to stderr so the ticket is not silently lost.
+                # [DLQ] CRM unavailable — log to stderr so ticket is not silently lost.
                 import sys
                 print(f"[DLQ] CRITICAL: CRM create_ticket failed during cleanup for {sid}: {crm_ex}", file=sys.stderr)
                 logger.error(f"[DLQ] CRM ticket failed for session {sid}: {crm_ex}", exc_info=True)
@@ -2138,130 +2598,132 @@ class VoiceOrchestrator:
 
     async def _monitor_silence(self):
         """
-        Background task to monitor user silence and trigger re-engagement prompts.
-        Implements Story S4-2 logic:
-        10-20s silence -> prompt #1
-        next 10-20s silence -> prompt #2
-        continued silence -> termination
+        [STAB-04] PRD §6.4-compliant silence monitor — 2-stage, 0.5 s tick.
+
+        Three contexts:
+          Post-Response:      10 s → soft prompt (SILENCE_1); 20 s total → graceful termination.
+          Post-Clarification: Same 10/20 cadence; stage-1 prompt repeats the clarifying question
+                              instead of the generic SILENCE_1 script.
+          Mid-Query Grace:    3 s grace period applied when caller exits TRANSCRIBING without
+                              a final transcript (e.g. clears throat, stops mid-sentence).
+
+        Tick interval is 0.5 s to stay within PRD's ±1 s tolerance.
+        Thresholds are read from config (env-overridable: SILENCE_SOFT_PROMPT_S / SILENCE_TERMINATION_S).
         """
-        logger.info("[SILENCE-TIMER] Monitor started")
+        _sid = self.session.session_id if self.session else "unknown"
+        if self.call_logger:
+            self.call_logger.log_event("stab04", "silence_timer_started", meta={"session_id": _sid})
+        logger.info(f"[STAB-04][silence_timer_started] session={_sid}")
+
         _last_tick_log = 0.0
+        _midquery_grace_until = 0.0  # future timestamp: silence counting resumes after this
+
         try:
             while not self.stop_event.is_set():
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
-                # 1. State Guard: DO NOT count silence while AI is busy.
-                # If we are speaking, thinking, or transcribing, the user is 'interacting' or waiting.
-                # Includes INTERRUPTED, RETRIEVAL, and VALIDATION states.
+                # ── 1. State Guard ────────────────────────────────────────────────────
+                # Don't count silence while AI is actively processing or speaking.
                 current_call_state = self.state.get_state()
                 if current_call_state in [
                     CallState.SPEAKING,
                     CallState.INTENT_EVAL,
-                    CallState.TRANSCRIBING,
                     CallState.ESCALATION,
                     CallState.RETRIEVAL,
-                    CallState.RESPONSE_VALIDATION
+                    CallState.RESPONSE_VALIDATION,
                 ]:
-                    # Keep the 'interaction' timestamp fresh so we don't 'timeout' mid-thought.
                     self.last_interaction_time = time.time()
                     logger.debug(f"[SILENCE-TIMER] Suppressed (state={current_call_state.value}), resetting timer")
                     continue
 
-                # 2. Maximum Session Limit check (6 minutes)
+                # Mid-Query Grace: while transcribing, keep interaction time fresh AND
+                # arm a 3 s forward grace window so silence counting doesn't resume the
+                # instant the partial stops (e.g. caller pauses mid-sentence).
+                if current_call_state == CallState.TRANSCRIBING:
+                    self.last_interaction_time = time.time()
+                    _midquery_grace_until = time.time() + 3.0
+                    continue
 
-                # 2. Session Duration / Wrap-up Guard
-                elapsed = None
-                if self.session_start_wall_time is not None:
-                    elapsed = time.time() - self.session_start_wall_time
-                elif self.session and getattr(self.session, "start_time", None):
-                    try:
-                        elapsed = time.time() - self.session.start_time.timestamp()
-                    except Exception:
-                        elapsed = None
+                # ── 2. Session Duration / Wrap-up Guard ──────────────────────────────
+                # [STAB-12] Removed: session-duration logic has been moved out of
+                # _monitor_silence() into SessionTimerManager (started in
+                # handle_audio_stream / handle_text_stream).  The SessionTimerManager
+                # fires on_soft_warning (5 min) and on_hard_end (6 min) exactly once
+                # each, completely independently of the silence monitor tick.
 
-                # Trigger wrap-up notification at 5.0 minutes (300s)
-                if elapsed is not None and elapsed >= 300.0 and not self.wrapup_triggered:
-                    logger.info(f"Wrap-up prompt triggered at {elapsed:.1f}s.")
-                    self.wrapup_triggered = True
-                    if self.session:
-                        try:
-                            # Create a lightweight CRM ticket for wrap-up
-                            await self.crm.create_ticket(
-                                transcript="[System]: Session approaching 6-minute limit. Wrap-up prompt played.",
-                                summary="Session Wrap-up Triggered",
-                                sentiment="Neutral",
-                                call_logger=self.call_logger,
-                                call_id=self.session.crm_call_id or self.session.session_id,
-                                title="Session Wrap-up Triggered"
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to create Session Wrap-up CRM ticket: {e}")
-
-                    # Speak wrap-up script to caller
-                    try:
-                        await self.speak_immediate_response(PRDScripts.WRAP_UP)
-                    except Exception as e:
-                        logger.error(f"Error speaking WRAP_UP prompt: {e}")
-
-                # Hard stop at 6 minutes
-                if elapsed is not None and elapsed >= 360.0:
-                    logger.warning(f"Session duration limit reached ({elapsed:.1f}s). Initiating wrap-up termination.")
-                    if self.session:
-                        self.session.termination_reason = "wrapup_timeout"
-                    
-                    # Speak termination script first
-                    try:
-                        await self.speak_immediate_response(PRDScripts.WRAP_UP_TERMINATION)
-                    except Exception as e:
-                        logger.error(f"Error speaking WRAP_UP_TERMINATION prompt: {e}")
-                        
-                    # Transition to CALL_END and cleanup
-                    try:
-                        self.state.transition_to(CallState.CALL_END)
-                    except Exception:
-                        pass
-                    await self.cleanup()
-                    break
-
-                # 1.5 Auto-Recovery for False Interruptions
+                # ── 1.5 Auto-Recovery for False Interruptions ─────────────────────────
                 if current_call_state == CallState.INTERRUPTED:
                     if time.time() - self.last_interaction_time > 5.0:
                         logger.info("[RECOVERY] False interruption or noise detected. Reverting INTERRUPTED -> LISTENING.")
                         self.state.transition_to(CallState.LISTENING)
 
-                # 2. Silence Stage Logic
-                silence_gap = time.time() - self.last_interaction_time
+                # ── 3. Silence Gap (mid-query grace applied) ─────────────────────────
+                # effective_last: whichever is later — true last interaction OR grace window end.
+                # silence_gap is clamped to ≥ 0 so negative values (grace still active) are safe.
+                effective_last = max(self.last_interaction_time, _midquery_grace_until)
+                silence_gap = max(0.0, time.time() - effective_last)
 
-                # Periodic tick log every 5s so gaps are always visible in logs
+                soft_s = self.config.silence_soft_prompt_s          # PRD default: 10 s
+                stage2_s = self.config.silence_termination_s - soft_s  # PRD default: 10 s after prompt
+
+                # Periodic tick log every 5 s
                 _now = time.time()
                 if _now - _last_tick_log >= 5.0:
-                    logger.debug(
-                        f"[SILENCE-TIMER] Tick: gap={silence_gap:.1f}s stage={self.silence_stage} state={current_call_state.value}"
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab04", "silence_timer_tick",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "stage": self.silence_stage,
+                                "state": current_call_state.value,
+                                "grace_active": _midquery_grace_until > _now,
+                            }
+                        )
+                    logger.info(
+                        f"[STAB-04][silence_timer_tick] gap={silence_gap:.1f}s "
+                        f"stage={self.silence_stage} state={current_call_state.value} "
+                        f"grace={'yes' if _midquery_grace_until > _now else 'no'}"
                     )
                     _last_tick_log = _now
 
-                # [SILENCE-ISS-158] Contextual Silence Machine
-                # Stage 0 → 1: First warning at 10s (fires before phoneme path's 16s)
-                # Stage 1 → 2: Second warning after another 10s
-                # Stage 2 → 3: Termination after another 10s
-                if silence_gap > 10.0 and self.silence_stage == 0:
-                    logger.info(f"[SILENCE-TIMER] FIRE stage=1 (first warning) gap={silence_gap:.1f}s")
+                # ── Stage 0 → 1: Soft prompt at soft_s (PRD: 10 s) ──────────────────
+                if silence_gap > soft_s and self.silence_stage == 0:
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab04", "soft_prompt_fired",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "was_question": self.last_response_was_question,
+                                "state": current_call_state.value,
+                            }
+                        )
+                    logger.info(
+                        f"[STAB-04][soft_prompt_fired] gap={silence_gap:.1f}s "
+                        f"was_question={self.last_response_was_question} state={current_call_state.value}"
+                    )
                     self.silence_stage = 1
-                    self.last_interaction_time = time.time() # Reset timer for next stage
-                    msg = PRDScripts.SILENCE_1
-                    await self.speak_immediate_response(msg)
+                    self.last_interaction_time = time.time()  # Reset timer for stage 2
+                    # Post-clarification path: repeat the question so caller has full context.
+                    # Generic path: standard "Are you still there?" prompt.
+                    if self.last_response_was_question and self._last_ai_question_text:
+                        prompt = self._last_ai_question_text
+                    else:
+                        prompt = PRDScripts.SILENCE_1
+                    await self.speak_immediate_response(prompt)
 
-                # Stage 2: Secondary Warning
-                elif silence_gap > 10.0 and self.silence_stage == 1:
-                    logger.info(f"[SILENCE-TIMER] FIRE stage=2 (second warning) gap={silence_gap:.1f}s")
-                    self.silence_stage = 2
-                    self.last_interaction_time = time.time()
-                    msg = PRDScripts.SILENCE_2
-                    await self.speak_immediate_response(msg)
-
-                # Stage 3: Termination
-                elif silence_gap > 10.0 and self.silence_stage == 2:
-                    logger.warning(f"[SILENCE-TIMER] FIRE stage=3 (termination) gap={silence_gap:.1f}s total≈30s")
+                # ── Stage 1 → Termination at stage2_s after the prompt (PRD: 20 s total) ─
+                elif silence_gap > stage2_s and self.silence_stage == 1:
+                    if self.call_logger:
+                        self.call_logger.log_event(
+                            "stab04", "graceful_termination",
+                            meta={
+                                "gap_s": round(silence_gap, 2),
+                                "state": current_call_state.value,
+                            }
+                        )
+                    logger.warning(
+                        f"[STAB-04][graceful_termination] gap={silence_gap:.1f}s state={current_call_state.value}"
+                    )
                     await self._trigger_silence_termination()
                     break
 
@@ -2270,15 +2732,45 @@ class VoiceOrchestrator:
         except Exception as e:
             logger.error(f"[SILENCE-TIMER] Error in monitor: {e}", exc_info=True)
         finally:
-            logger.info("[SILENCE-TIMER] Monitor stopped")
+            if self.call_logger:
+                self.call_logger.log_event("stab04", "silence_timer_stopped", meta={"session_id": _sid})
+            logger.info(f"[STAB-04][silence_timer_stopped] session={_sid}")
 
     async def _trigger_silence_termination(self):
         """
-        [MEDIUM-P5-04] Preemption: Kill hanging tasks before speaking final refusal.
+        [STAB-04] PRD §6.4 graceful termination.
+        1. CRM callback ticket if any turns were left interrupted/abandoned.
+        2. Preemptive cleanup (kills hanging Brain/RAG tasks).
+        3. Speak SILENCE_TERMINATION farewell.
         """
-        self.silence_stage = 3 # Prevent loops
+        self.silence_stage = 3  # Prevent re-entry
         if self.session:
             self.session.termination_reason = "silence_termination"
+
+        # [STAB-04] CRM callback — only when the caller was mid-conversation (incomplete turns).
+        # Fire-and-forget via _create_task_with_log so cleanup is not blocked.
+        if self.session and self.crm:
+            incomplete_turns = [
+                t for t in getattr(self.session, "structured_turns", [])
+                if getattr(t, "agent_response_status", None) in ("interrupted", "abandoned")
+            ]
+            if incomplete_turns:
+                try:
+                    self._create_task_with_log(self.crm.create_ticket(
+                        transcript="[System]: Call ended due to silence. One or more turns were left incomplete.",
+                        summary="Silence Termination — Incomplete Turns",
+                        sentiment="Negative",
+                        call_logger=self.call_logger,
+                        call_id=self.session.crm_call_id or self.session.session_id,
+                        title="Silence_Termination_Incomplete",
+                        structured_turns=self.session.structured_turns,
+                        session_obj=self.session,
+                    ))
+                    logger.info(
+                        f"[STAB-04] CRM silence callback fired — {len(incomplete_turns)} incomplete turn(s)"
+                    )
+                except Exception as e:
+                    logger.error(f"[STAB-04] CRM silence callback failed: {e}")
 
         # Preemptive Cleanup: Kills hanging Brain/RAG tasks immediately
         await self.cleanup()
@@ -2286,8 +2778,9 @@ class VoiceOrchestrator:
         # Speak final termination while socket is in CALL_END state but still open
         try:
             self.state.transition_to(CallState.CALL_END)
-        except: pass
-        
+        except Exception:
+            pass
+
         goodbye = PRDScripts.SILENCE_TERMINATION
         await self.speak_immediate_response(goodbye)
 

@@ -107,14 +107,20 @@ class ElevenLabsSynthesizer(TTSEngine):
             # Retrieve audio from queue
             while True:
                 if call_id in self._stop_signals:
+                    # [STAB-02] Log Point 2: completion source = stop_signal
+                    logger.info(f"[STAB-02][tts_completion_source] source=stop_signal call_id={call_id}")
                     break
-                    
+
                 try:
                     chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=3.0)
                     if chunk == b"__FINAL__":
+                        # [STAB-02] Log Point 2: completion source = sentinel_isFinal
+                        logger.info(f"[STAB-02][tts_completion_source] source=sentinel_isFinal call_id={call_id}")
                         break
                     yield chunk
                 except asyncio.TimeoutError:
+                    # [STAB-02] Log Point 2: completion source = timeout_3s
+                    logger.error(f"[STAB-02][tts_completion_source] source=timeout_3s call_id={call_id}")
                     raise ElevenLabsTTSException("Timeout waiting for audio chunk")
                     
         except Exception as e:
