@@ -64,6 +64,12 @@ jobs:
         run: |
           python -m compileall .
 
+      - name: Install pgvector extension
+        env:
+          PGPASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          psql -h localhost -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
       - name: Build Docker image
         run: |
           docker build -t cila-ai-agent:test .
