@@ -10,7 +10,32 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: pgvector/pgvector:pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - name: Checkout repository
@@ -44,9 +69,45 @@ jobs:
           docker build -t cila-ai-agent:test .
 
       - name: Test container startup
+        env:
+          DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_PHONE_NUMBER: ${{ secrets.TWILIO_PHONE_NUMBER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_AUDIT_BUCKET: ${{ secrets.S3_AUDIT_BUCKET }}
+          CRM_API_KEY: ${{ secrets.CRM_API_KEY }}
+          CRM_BASE_URL: ${{ secrets.CRM_BASE_URL }}
+          AUTH_TOKEN_IT: ${{ secrets.AUTH_TOKEN_IT }}
+          AUTH_TOKEN_ADMIN: ${{ secrets.AUTH_TOKEN_ADMIN }}
         run: |
-          docker run -d -p 8000:8000 --name test-agent cila-ai-agent:test
-          sleep 10
+          docker run -d -p 8000:8000 --name test-agent \
+            --network host \
+            -e LOCAL_TEST=true \
+            -e APP_ENV=production \
+            -e PORT=8000 \
+            -e REDIS_URL=redis://localhost:6379 \
+            -e PG_DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@localhost:5432/postgres \
+            -e DEEPGRAM_API_KEY="${DEEPGRAM_API_KEY}" \
+            -e GEMINI_API_KEY="${GEMINI_API_KEY}" \
+            -e TWILIO_ACCOUNT_SID="${TWILIO_ACCOUNT_SID}" \
+            -e TWILIO_AUTH_TOKEN="${TWILIO_AUTH_TOKEN}" \
+            -e TWILIO_PHONE_NUMBER="${TWILIO_PHONE_NUMBER}" \
+            -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+            -e AWS_REGION="${AWS_REGION}" \
+            -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+            -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+            -e S3_AUDIT_BUCKET="${S3_AUDIT_BUCKET}" \
+            -e CRM_API_KEY="${CRM_API_KEY}" \
+            -e CRM_BASE_URL="${CRM_BASE_URL}" \
+            -e AUTH_TOKEN_IT="${AUTH_TOKEN_IT}" \
+            -e AUTH_TOKEN_ADMIN="${AUTH_TOKEN_ADMIN}" \
+            cila-ai-agent:test
+          sleep 15
           docker logs test-agent
           curl -f http://localhost:8000/readyz
           docker stop test-agent
