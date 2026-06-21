@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets — never commit
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+phone1.txt
+twilio_nums.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Virtual environments
+# ─────────────────────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime output — generated per call, never committed
+# ─────────────────────────────────────────────────────────────────────────────
+logs/
+recordings/
+*.log
+kb_version.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sandbox / browser-test scaffolding (local dev only)
+# ─────────────────────────────────────────────────────────────────────────────
+static/sandbox.html
+tools/sandbox_caller.py
+tools/make_test_audio.py
+tools/sample_audio/
+test_chat.html
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Throwaway debug / verification scripts kept in the repo root during dev
+# ─────────────────────────────────────────────────────────────────────────────
+debug_*.py
+verify_*.py
+check_db_tables.py
+list_rag_data.py
+twilio_load_injector.py
+test_dg.py
+test_e2e_governance.py
+test_local_rag.py
+test_mixed_language.py
+test_rag.py
+test_websocket.py
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDE / OS noise
+# ─────────────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

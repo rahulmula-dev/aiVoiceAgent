@@ -1,0 +1,63 @@
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: cila-ai-agent
+#   namespace: gd-college
+#   labels:
+#     app: cila-ai-agent
+# spec:
+#   replicas: 2  # PRD: 24x7 warm operation - No cold starts, minimum 2 replicas always active
+#   selector:
+#     matchLabels:
+#       app: cila-ai-agent
+#   strategy:
+#     type: RollingUpdate
+#     rollingUpdate:
+#       maxSurge: 25%
+#       maxUnavailable: 0  # Zero downtime deployments
+#   template:
+#     metadata:
+#       labels:
+#         app: cila-ai-agent
+#       annotations:
+#         prometheus.io/scrape: "true"
+#         prometheus.io/port: "8000"
+#     spec:
+#       containers:
+#       - name: cila-ai-agent
+#         image: your-registry.com/gd-college/cila-ai-agent:latest  # Update with actual image registry
+#         imagePullPolicy: Always
+#         ports:
+#         - containerPort: 8000
+#           name: http
+#         envFrom:
+#         - secretRef:
+#             name: cila-secrets
+#         env:
+#         - name: APP_ENV
+#           value: "production"
+#         resources:
+#           # PRD: Designed for exactly 1 pod per 5-10 concurrent telephony sessions
+#           requests:
+#             cpu: "250m"
+#             memory: "256Mi"
+#           limits:
+#             cpu: "1000m"
+#             memory: "1Gi"
+#         # PRD: Ensure warm availability, prevent routing traffic to dead/starting pods
+#         readinessProbe:
+#           httpGet:
+#             path: /readyz
+#             port: 8000
+#           initialDelaySeconds: 5
+#           periodSeconds: 10
+#           timeoutSeconds: 2 # Matches /readyz internal timeout
+#           successThreshold: 1
+#           failureThreshold: 2 # Faster recovery on degradation
+#         livenessProbe:
+#           httpGet:
+#             path: /healthz
+#             port: 8000
+#           initialDelaySeconds: 15
+#           periodSeconds: 20
+#           failureThreshold: 3

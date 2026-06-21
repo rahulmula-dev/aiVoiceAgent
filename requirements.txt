@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-dotenv
+websockets>=12.0
+httpx
+google-generativeai
+asyncpg>=0.29.0
+pgvector>=0.3.0
+pydantic
+langdetect
+lingua-language-detector
+redis
+boto3>=1.34.0
+tenacity>=8.2.0
