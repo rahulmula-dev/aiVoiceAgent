@@ -1,135 +1,119 @@
 """
-contracts/language_interceptor.py
-==================================
-Language Governance Interceptor — the explicit gate between Deepgram STT
-and the Gemini LLM call.
+contracts/language_interceptor.py — language gate with 3-strike enforcement.
 
-Architecture position
----------------------
+Sits between Deepgram STT and the LLM. For each finalized user transcript:
 
-  Twilio audio
-      │
-  Deepgram STT  (transcript + detected_lang)
-      │
-  ┌───▼──────────────────────────────────────┐
-  │  LanguageGovernanceInterceptor.check()   │  ← YOU ARE HERE
-  │  • Deepgram acoustic signal (PRIMARY)    │
-  │  • FastText lid.176.ftz (0.80 threshold) │
-  │  • Lingua pure-Python (0.75 threshold)   │
-  │  • 3-Strike state machine                │
-  └──────────┬────────────────┬──────────────┘
-             │ proceed=True   │ proceed=False
-             ▼                ▼
-         Gemini LLM       Refusal TTS
-         (secondary          │
-          Hinglish           │ terminate=True?
-          filter)            └──► websocket.close()
+  1. Fast-path: if the text is in the English-affirmation set (single short
+     words like "ok", "yes", "no", "hello"), allow immediately. These are
+     too short for any detector to classify reliably.
+  2. Name-introduction bypass: "Hi, my name is ..." and similar patterns
+     are allowed without language detection (names from any culture should
+     not count as non-English).
+  3. Lingua detection: pure-Python detector. If confidence >= 0.75 and
+     detected language != English, count a strike.
+  4. Fail-open: if Lingua is unavailable or throws, allow the request
+     through (we never block the caller because the detector misbehaved).
 
-Session state
--------------
-Strike count lives on this object (one instance per call).
-The orchestrator (manager.py) is responsible for creating the interceptor
-when a call starts and persisting ``interceptor.strike_count`` to the
-``Session.language_warning_count`` field after each ``check()`` call.
+Strike policy:
+  - Strikes 1 and 2: speak ``REFUSAL_LANGUAGE_1`` / ``REFUSAL_LANGUAGE_2``,
+    continue the call.
+  - Strike 3 (final): speak ``REFUSAL_LANGUAGE_3``, terminate the call.
 
-Usage in manager.py
--------------------
-::
+State (strike count, last detected language) lives on the interceptor
+instance. One instance per call; the orchestrator creates it in __init__.
 
-    # In VoiceOrchestrator.__init__ / start_call():
-    self._lang_interceptor = LanguageGovernanceInterceptor(session_id=self.sid)
-
-    # In _on_transcript():
-    result = self._lang_interceptor.check(raw_text, deepgram_lang=detected_lang)
-    self.session.language_warning_count = result.strike  # persist to session
-
-    if not result.proceed_to_llm:
-        await self.speak_immediate_response(result.refusal_text)
-        if result.terminate_call:
-            await self._language_termination_flow(result.refusal_text, trace_id)
-        return
-
-    # … continue to Gemini …
-
-FastText on EC2
----------------
-Set the environment variable ``FASTTEXT_MODEL_PATH`` to the absolute path of
-``lid.176.ftz``.  If the file is absent or the package is not installed, the
-interceptor transparently falls back to Lingua, then fails-open (never blocks)
-so the call is never dropped due to a missing library.
-
-    FASTTEXT_MODEL_PATH=/home/ubuntu/ai-voice-agent/models/lid.176.ftz
+Adapted from the company's contracts/language_interceptor.py (478 lines).
+The clean-build version uses Lingua as the primary text classifier. Deepgram's
+acoustic per-word language tag is intentionally NOT used to fire strikes —
+it routinely mis-tags accented English on PSTN audio. Lingua alone is good
+enough for the demo categories (English vs Hindi / Spanish / French /
+Mandarin / Portuguese / German / Punjabi).
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+from contracts.policy import PRDScripts
+
 
 logger = logging.getLogger("LanguageInterceptor")
 
-# ── Lazy import — avoid circular deps ─────────────────────────────────────────
-# These are resolved at call time, not import time.
-_policy_scripts = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lingua detector — lazy import so the package only loads on first check()
+# call. This keeps `from contracts.language_interceptor import ...` cheap.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _get_scripts():
-    global _policy_scripts
-    if _policy_scripts is None:
-        from contracts.policy import PRDScripts  # noqa: PLC0415
-        _policy_scripts = PRDScripts
-    return _policy_scripts
+_lingua_detector = None  # type: ignore[assignment]
 
 
-# ── Result dataclass ───────────────────────────────────────────────────────────
+def _get_lingua_detector():
+    """Return a cached Lingua LanguageDetector, building on first call."""
+    global _lingua_detector
+    if _lingua_detector is None:
+        try:
+            from lingua import Language, LanguageDetectorBuilder
+
+            # Limit to the languages we actually want to distinguish. Building
+            # with a small set is dramatically faster than the full 75-language
+            # detector (~10x speedup, ~50 MB less RAM).
+            _lingua_detector = (
+                LanguageDetectorBuilder.from_languages(
+                    Language.ENGLISH,
+                    Language.HINDI,
+                    Language.SPANISH,
+                    Language.FRENCH,
+                    Language.CHINESE,
+                    Language.PUNJABI,
+                    Language.GERMAN,
+                    Language.PORTUGUESE,
+                )
+                .with_preloaded_language_models()
+                .build()
+            )
+        except Exception as e:  # pragma: no cover  — fail-open path
+            logger.warning(f"[LANG] Lingua unavailable: {e}. Failing open.")
+            _lingua_detector = False  # sentinel: "tried and failed"
+    return _lingua_detector if _lingua_detector else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# InterceptResult — immutable decision the orchestrator uses to route the turn
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class InterceptResult:
-    """
-    Structured decision returned by ``LanguageGovernanceInterceptor.check()``.
+    """Decision returned by ``LanguageGovernanceInterceptor.check()``."""
 
-    Attributes
-    ----------
-    proceed_to_llm  : True  → transcript is English; forward to Gemini.
-                      False → refusal must be spoken; do NOT call Gemini.
-    refusal_text    : The exact script to speak when ``proceed_to_llm`` is False.
-    terminate_call  : True on Strike 3 → close websocket after speaking refusal.
-    strike          : Current cumulative strike count for this session.
-    lang_code       : ISO-639-1 code of the detected language (``"en"``, ``"fr"``…).
-    confidence      : Detector confidence in [0, 1].
-    detection_method: Which detector fired (``"deepgram_acoustic"``, ``"fasttext"``,
-                      ``"lingua"``, ``"fast_path"``, or ``"fail_open"``).
-    """
-    proceed_to_llm: bool
-    refusal_text: Optional[str]
-    terminate_call: bool
-    strike: int
-    lang_code: str
-    confidence: float
-    detection_method: str
+    proceed_to_llm: bool         # True = English (or allow), continue normally
+    refusal_text: Optional[str]  # If proceed_to_llm=False, speak this instead of calling LLM
+    terminate_call: bool         # True only on final strike — close WS after speaking
+    strike: int                  # Cumulative strike count for this call
+    lang_code: str               # Detected language code or "unknown"
+    confidence: float            # Detector confidence in [0, 1]
+    detection_method: str        # "fast_path" | "name_intro" | "lingua" | "fail_open"
 
 
-# ── Interceptor ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# LanguageGovernanceInterceptor
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class LanguageGovernanceInterceptor:
     """
-    Stateful 3-Strike language gate for one call session.
+    Per-call 3-strike language enforcement gate.
 
-    One instance is created per inbound call.  Thread-safety is not required
-    because each call is processed on a single asyncio event loop.
-
-    Parameters
-    ----------
-    session_id  : Identifier used in log messages (call_id / session_id).
-    max_strikes : Number of non-English detections before termination (default 3).
+    Construct one per inbound call; pass to the LLM loop via VoiceOrchestrator.
+    Not thread-safe (asyncio single-loop assumption is fine for our use).
     """
 
-    # BCP-47 codes considered "English" (covers Deepgram region variants)
-    _SUPPORTED_CODES: frozenset[str] = frozenset({"en", "en-us", "en-gb", "en-ca", "en-au", "en-in"})
-
-    # Common single-word English utterances that language models mis-classify
+    # Single-word English utterances that detectors often misclassify.
     _ENGLISH_FAST_PATH: frozenset[str] = frozenset({
         "ok", "okay", "yes", "yeah", "yep", "yup", "no", "nope",
         "hi", "hey", "hello", "thanks", "thank", "sure", "right",
@@ -141,171 +125,162 @@ class LanguageGovernanceInterceptor:
         "hmm", "uh", "um", "ah", "oh", "mhm", "mhmm",
     })
 
-    # Regex: name-introduction utterances must never trigger a strike
-    _INTRO_RE = re.compile(
-        r"^(hi|hello)?[\s.,!]*?(my name is|i am|this is|it'?s)\b",
+    # Name-introduction phrases that should never trigger a strike — names
+    # from any culture are valid English-mode inputs.
+    _NAME_INTRO_REGEX = re.compile(
+        r"^(hi|hello|hey)?[\s.,!]*?(my name is|i am|this is|it's|i'm)\b",
         re.IGNORECASE,
     )
+
+    # Languages that count as English (Deepgram returns region codes like en-IN).
+    _ENGLISH_CODES: frozenset[str] = frozenset({
+        "en", "en-us", "en-gb", "en-ca", "en-au", "en-in",
+    })
+
+    # Detection confidence threshold below which we don't block.
+    _MIN_BLOCK_CONFIDENCE: float = 0.75
 
     def __init__(self, session_id: str, max_strikes: int = 3) -> None:
         self.session_id = session_id
         self.max_strikes = max_strikes
-        self._strike_count: int = 0
+        self.strike_count = 0
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Public entry point ───────────────────────────────────────────────
 
-    @property
-    def strike_count(self) -> int:
-        """Read-only view of cumulative non-English strike count."""
-        return self._strike_count
-
-    def reset(self) -> None:
-        """Reset strike count. Call this when reusing the orchestrator for a new call."""
-        self._strike_count = 0
-        logger.info(f"[Interceptor:{self.session_id}] Strike counter reset.")
-
-    def check(
-        self,
-        transcript: str,
-        deepgram_lang: Optional[str] = None,
-    ) -> InterceptResult:
+    def check(self, user_text: str, detected_lang: Optional[str] = None) -> InterceptResult:
         """
-        Validate one Deepgram transcript and apply the 3-Strike policy.
+        Classify a finalized user transcript and return the routing decision.
 
         Parameters
         ----------
-        transcript    : Final transcript string from Deepgram's ``on_message``.
-        deepgram_lang : ``detected_language`` field from Deepgram metadata, e.g.
-                        ``"en"``, ``"fr"``, ``"hi"``.  Pass ``None`` if unavailable.
+        user_text : str
+            The finalized transcript from STT.
+        detected_lang : str, optional
+            Deepgram's acoustic / word-level language code for this utterance
+            (from ``language=multi`` mode), e.g. "en", "hi", "ja". Accepted
+            for backward compatibility and informational logging only — it is
+            NOT consulted for strike decisions, since it routinely mis-tags
+            accented English on PSTN audio.
 
-        Returns
-        -------
-        InterceptResult
-            Callers must check ``proceed_to_llm`` before forwarding to Gemini,
-            and ``terminate_call`` before closing the WebSocket.
+        Caller is expected to:
+          - If ``proceed_to_llm`` is True   → call the LLM normally.
+          - If False and ``terminate_call`` False → speak ``refusal_text``,
+            do NOT call the LLM, continue listening for the next turn.
+          - If False and ``terminate_call`` True → speak ``refusal_text``,
+            push None into the LLM/TTS queues so the call closes cleanly.
+
+        Detection order (first decisive signal wins):
+          1. empty input            → allow
+          2. fast-path affirmations → allow
+          3. name introduction      → allow
+          4. non-Latin script ratio → strike  (Devanagari / Bengali / CJK / etc.)
+          5. Lingua text model      → strike if text is confidently non-English
+          6. fail open              → allow
+
+        Note: Deepgram's per-word `detected_lang` tag is intentionally NOT
+        used to fire strikes. On PSTN audio with accents it routinely mis-tags
+        clear English as Hindi/Spanish; trusting it caused false terminations
+        mid-conversation. The text itself (via Lingua) is the source of truth.
         """
-        # ── 1. Empty / silence ─────────────────────────────────────────────────
-        text = (transcript or "").strip()
-        if not text:
-            return self._pass("", 0.0, "empty")
+        # Empty input — never block, never strike
+        if not user_text or not user_text.strip():
+            return self._allow("empty_input", lang_code="en", confidence=1.0)
 
-        # ── 2. Single-word English fast path ───────────────────────────────────
-        # Language models are unreliable on standalone fillers ("okay" → Tagalog).
-        # Hard-code the unambiguous English affirmations.
-        normalised = text.lower().rstrip(".,!?")
-        if normalised in self._ENGLISH_FAST_PATH:
-            return self._pass("en", 1.0, "fast_path")
+        normalized = user_text.strip()
+        lower = normalized.lower()
 
-        # ── 3. Name-introduction fast path ─────────────────────────────────────
-        # "Hi, my name is Jaspreet" must never trigger a strike regardless of the
-        # name's language of origin.
-        if self._INTRO_RE.search(text):
-            return self._pass("en", 1.0, "fast_path")
+        # ── (1) Fast-path: short English affirmations ────────────────────
+        words = re.findall(r"\b\w+\b", lower)
+        if len(words) <= 2 and all(w in self._ENGLISH_FAST_PATH for w in words):
+            return self._allow("fast_path", lang_code="en", confidence=1.0)
 
-        # ── 4. Deepgram acoustic detection (PRIMARY when available) ────────────
-        # Operating on raw audio phonemes, Deepgram's acoustic detection is the
-        # most reliable signal and is checked before any text-based model.
-        if deepgram_lang:
-            norm = deepgram_lang.lower().split("-")[0]
-            if self._is_supported_code(deepgram_lang):
-                # Deepgram confirms a supported language — fast-path approve.
-                # Text detection still runs as a secondary confirmation, but we
-                # trust the acoustic signal when it says English.
-                return self._pass(norm, 1.0, "deepgram_acoustic")
-            else:
-                # Deepgram detected a non-supported language at the phoneme level.
-                # This is the strongest possible non-English signal.
-                logger.warning(
-                    f"[Interceptor:{self.session_id}] Deepgram acoustic blocked "
-                    f"lang='{deepgram_lang}': '{text[:60]}'"
-                )
-                return self._strike(norm, 1.0, "deepgram_acoustic")
+        # ── (2) Name introduction — never a strike ───────────────────────
+        if self._NAME_INTRO_REGEX.search(lower):
+            return self._allow("name_intro", lang_code="en", confidence=1.0)
 
-        # ── 5. Text-based detection: FastText → Lingua → fail-open ────────────
-        is_english, lang_code, confidence, method = self._text_detect(text)
+        # ── (3) Non-Latin script check ───────────────────────────────────
+        # If most of the alphabetic characters are NOT Latin (a-z), the caller
+        # is speaking a language written in another script — Hindi (Devanagari),
+        # Bengali, Japanese, Chinese, Arabic, etc. This is decisive and cheap,
+        # and works whenever Deepgram returns native-script text, regardless of
+        # the per-word language tags.
+        alpha = [c for c in normalized if c.isalpha()]
+        if len(alpha) >= 3:
+            latin = sum(1 for c in alpha if "a" <= c.lower() <= "z")
+            latin_ratio = latin / len(alpha)
+            if latin_ratio < 0.40:
+                code = (detected_lang.split("-")[0].lower() if detected_lang else "non-en")
+                return self._strike(lang_code=code, confidence=1.0)
 
-        if is_english:
-            return self._pass(lang_code, confidence, method)
-        else:
-            return self._strike(lang_code, confidence, method)
+        # ── (5) Lingua text detection — PRIMARY signal for Latin-script ──
+        # We classify the actual transcribed text, not the acoustic guess.
+        # Lingua looks at character n-grams and word distributions, which is
+        # far more reliable than Deepgram's per-word language tag on PSTN
+        # audio with accents.
+        detector = _get_lingua_detector()
+        if detector is None:
+            # Detector unavailable — fail open (do not strike on tag alone)
+            return self._allow("fail_open", lang_code="unknown", confidence=0.0)
 
-    # ── Private helpers ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _is_supported_code(code: str) -> bool:
-        """True if the BCP-47 code (or its base form) is a supported language."""
-        base = code.lower().split("-")[0]
-        return base in LanguageGovernanceInterceptor._SUPPORTED_CODES
-
-    def _text_detect(self, text: str) -> tuple[bool, str, float, str]:
-        """
-        Run FastText → Lingua → fail-open chain.
-
-        Returns
-        -------
-        (is_english, lang_code, confidence, method)
-        """
         try:
-            from contracts.language_guard import validate_language, _try_load_fasttext  # noqa: PLC0415
-            result = validate_language(text)
-            if not result.model_available:
-                # No detector was initialised — fail open (never punish the caller)
-                logger.warning(
-                    f"[Interceptor:{self.session_id}] No detector available — failing open."
-                )
-                return True, "unknown", 0.0, "fail_open"
+            confidences = detector.compute_language_confidence_values(normalized)
+            if not confidences:
+                return self._allow("fail_open", lang_code="unknown", confidence=0.0)
 
-            # Determine which detector was actually used (FastText takes priority in language_guard)
-            method = "fasttext" if _try_load_fasttext() is not None else "lingua"
-            return result.is_english, result.predicted_lang_code, result.confidence, method
+            top = confidences[0]
+            lang_name = top.language.iso_code_639_1.name.lower()  # e.g. "EN" -> "en"
+            confidence = float(top.value)
+        except Exception as e:
+            logger.warning(f"[LANG][{self.session_id}] Lingua error: {e}. Failing open.")
+            return self._allow("fail_open", lang_code="unknown", confidence=0.0)
 
-        except Exception as exc:
-            logger.error(
-                f"[Interceptor:{self.session_id}] Text detection raised {exc!r}. Failing open."
-            )
-            return True, "unknown", 0.0, "fail_open"
+        # English at any confidence → allow. The text reads as English; that
+        # wins over whatever Deepgram's acoustic guess was.
+        if lang_name in self._ENGLISH_CODES:
+            return self._allow("lingua", lang_code="en", confidence=confidence)
 
-    def _pass(self, lang_code: str, confidence: float, method: str) -> InterceptResult:
-        """Return an allow-through result without touching the strike counter."""
-        logger.debug(
-            f"[Interceptor:{self.session_id}] PASS "
-            f"lang={lang_code} conf={confidence:.3f} via={method} "
-            f"strikes={self._strike_count}"
-        )
+        # Non-English but low confidence → allow (likely accented English or
+        # a short utterance Lingua can't pin down). Default to trusting the
+        # caller rather than striking on a weak signal.
+        if confidence < self._MIN_BLOCK_CONFIDENCE:
+            return self._allow("lingua_low_conf", lang_code=lang_name, confidence=confidence)
+
+        # ── Strike: confident non-English text ───────────────────────────
+        return self._strike(lang_code=lang_name, confidence=confidence)
+
+    # ── Internal helpers ─────────────────────────────────────────────────
+
+    def _allow(self, method: str, lang_code: str, confidence: float) -> InterceptResult:
         return InterceptResult(
             proceed_to_llm=True,
             refusal_text=None,
             terminate_call=False,
-            strike=self._strike_count,
+            strike=self.strike_count,
             lang_code=lang_code,
             confidence=confidence,
             detection_method=method,
         )
 
-    def _strike(self, lang_code: str, confidence: float, method: str) -> InterceptResult:
-        """Increment the strike counter and return the appropriate refusal."""
-        self._strike_count += 1
-        scripts = _get_scripts()
-
-        if self._strike_count >= self.max_strikes:
-            refusal = scripts.REFUSAL_LANGUAGE_3
-            terminate = True
+    def _strike(self, lang_code: str, confidence: float) -> InterceptResult:
+        self.strike_count += 1
+        is_final = self.strike_count >= self.max_strikes
+        if self.strike_count == 1:
+            refusal = PRDScripts.REFUSAL_LANGUAGE_1
+        elif self.strike_count == 2:
+            refusal = PRDScripts.REFUSAL_LANGUAGE_2
         else:
-            # Strikes 1 and 2 use the same polite prompt (PRD §Language Governance)
-            refusal = scripts.REFUSAL_LANGUAGE_1
-            terminate = False
+            refusal = PRDScripts.REFUSAL_LANGUAGE_3
 
-        logger.warning(
-            f"[Interceptor:{self.session_id}] NON-ENGLISH STRIKE {self._strike_count}/{self.max_strikes} "
-            f"lang={lang_code} conf={confidence:.3f} via={method} | terminate={terminate}"
+        logger.info(
+            f"[LANG][{self.session_id}] strike {self.strike_count}/{self.max_strikes} "
+            f"lang={lang_code} conf={confidence:.2f} terminate={is_final}"
         )
-
         return InterceptResult(
             proceed_to_llm=False,
             refusal_text=refusal,
-            terminate_call=terminate,
-            strike=self._strike_count,
+            terminate_call=is_final,
+            strike=self.strike_count,
             lang_code=lang_code,
             confidence=confidence,
-            detection_method=method,
+            detection_method="lingua",
         )

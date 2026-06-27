@@ -1,286 +1,266 @@
-import os
+"""
+utils/connection_pool.py — Pre-warmed STT + TTS connection pools.
+
+Goal: eliminate per-call TCP/TLS handshake latency so the greeting starts
+sooner after dial-in.
+
+STT (Deepgram WebSocket)
+------------------------
+Deepgram STT sessions are stateful per-call (the stream carries one call's
+audio from start to finish, then is consumed). The pool keeps N idle
+connections open before any call arrives. When a call starts:
+  1. `pool.acquire()` hands out a pre-connected socket instantly.
+  2. A background task immediately opens a replacement so the pool is
+     ready for the next call.
+  3. When the call ends, the socket is closed (consumed, not returned).
+
+TTS (ElevenLabs HTTP)
+---------------------
+ElevenLabs uses HTTPS streaming. Currently, each `synthesize_and_stream()`
+call creates a fresh `httpx.AsyncClient`, which pays TCP+TLS per call.
+A single shared client maintains an internal keep-alive connection pool;
+all synthesis calls reuse connections after the first one.
+
+Usage:
+    # At server startup (in run_server.py):
+    from orchestrator.factory import warmup_pools
+    await warmup_pools()
+
+    # In orchestrator — pools are injected automatically via the factory.
+"""
+
 import asyncio
-import logging
+import json
 import time
-import random
-from typing import Optional, Callable, Any
+from contextlib import asynccontextmanager
 
-logger = logging.getLogger("WebSocketPool")
+import httpx
+import websockets
 
-class PoolExhaustedError(Exception):
-    pass
+import config
 
-class WebSocketPool:
-    """
-    Generalized WebSocket Connection Pool for Voice Services (STT/TTS).
-    Maintains a pre-warmed queue of connections to eliminate setup latency.
-    """
-    def __init__(
-        self,
-        name: str,
-        create_connection_func: Callable[[], Any],
-        close_connection_func: Callable[[Any], Any],
-        health_check_func: Callable[[Any], Any],
-        reset_connection_func: Callable[[Any], None],
-        pool_size: int,
-        min_connections: int,
-        health_check_interval_s: int
-    ):
-        self.name = name
-        self.create_connection_func = create_connection_func
-        self.close_connection_func = close_connection_func
-        self.health_check_func = health_check_func
-        self.reset_connection_func = reset_connection_func
-        
-        self.pool_size = pool_size
-        self.min_connections = min_connections
-        self.health_check_interval_s = health_check_interval_s
-        
-        self._pool: asyncio.Queue = asyncio.Queue(maxsize=pool_size)
-        self._active_connections = set()
-        self._health_task: Optional[asyncio.Task] = None
-        
-        # Metrics
-        self.replacement_count = 0
-        self._checkout_times = {} # conn -> checkout_time
 
-    async def initialize(self):
-        logger.info(f"[{self.name}] Initializing pool of size {self.pool_size}")
-        
-        # MEDIUM-WS-03: Batched initialization with jitter to prevent burst rate limiting
-        batch_size = 10
-        success_count = 0
-        
-        for i in range(0, self.pool_size, batch_size):
-            if i > 0:
-                jitter = random.uniform(0.1, 0.5)
-                logger.info(f"[{self.name}] Initialization batch jitter: sleeping for {jitter:.2f}s")
-                await asyncio.sleep(jitter)
-                
-            current_batch_size = min(batch_size, self.pool_size - i)
-            tasks = [self.create_connection_func() for _ in range(current_batch_size)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for res in results:
-                if isinstance(res, Exception) or res is None:
-                    logger.error(f"[{self.name}] Failed to create connection during initialization: {res}")
-                else:
-                    self._pool.put_nowait(res)
-                    success_count += 1
-                
-        if success_count == 0:
-            if os.getenv("LOCAL_TEST", "false").lower() == "true":
-                logger.error(f"[{self.name}] FAILED to initialize any connections. (Continuing anyway due to LOCAL_TEST=true)")
-            else:
-                raise Exception(f"[{self.name}] CRITICAL: Failed to initialize any connections")
-            
-        self._health_task = asyncio.create_task(self._health_monitor())
-        self._lease_task = asyncio.create_task(self._lease_monitor())
-        logger.info(f"[{self.name}] Pool initialized successfully with {success_count} connections")
+# ─────────────────────────────────────────────────────────────────────────────
+# Deepgram STT pool
+# ─────────────────────────────────────────────────────────────────────────────
 
-    async def acquire(self, timeout: float = 5.0) -> Any:
-        start_time = time.time()
-        attempts = 0
-        max_pool_retries = 1 # Retry once before giving up
-        
-        while attempts <= max_pool_retries:
-            try:
-                # PRD §5: Check health but minimize mid-call delay
-                # Use a local start time for this specific attempt's timeout logic
-                attempt_start = time.time()
-                while True:
-                    # Use remaining time so the overall acquire respects the timeout
-                    elapsed = time.time() - attempt_start
-                    remaining = timeout - elapsed
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError()
+_STT_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    f"?model={config.DEEPGRAM_MODEL}"
+    f"&encoding={config.AUDIO_ENCODING}"
+    f"&sample_rate={config.SAMPLE_RATE}"
+    "&channels=1"
+    "&punctuate=true"
+    "&interim_results=true"
+    "&vad_events=true"
+    "&endpointing=300"
+    "&utterance_end_ms=1000"
+    "&no_delay=true"
+    "&language=multi"
+)
 
-                    conn = await asyncio.wait_for(self._pool.get(), timeout=remaining)
-                    # Verify health before handing out
-                    if await self.health_check_func(conn):
-                        self._active_connections.add(conn)
-                        self._checkout_times[conn] = asyncio.get_event_loop().time()
+_KEEPALIVE_INTERVAL_S = 3.0
 
-                        # Emit wait time metric
-                        wait_time_ms = (time.time() - start_time) * 1000
-                        self._emit_metrics(wait_time_ms)
-                        logger.info(
-                            f"[{self.name}] [POOL-ACQUIRE] wait={wait_time_ms:.1f}ms "
-                            f"active={len(self._active_connections)} idle={self._pool.qsize()}"
-                        )
-                        return conn
-                    else:
-                        # Drop dead connection and try next one if time permits
-                        logger.warning(f"[{self.name}] Dropped dead connection from pool during acquire")
-                        asyncio.create_task(self._replace_connection(conn))
-                        # Loop will try to get another one until timeout expires
-            except (asyncio.TimeoutError, PoolExhaustedError):
-                attempts += 1
-                if attempts <= max_pool_retries:
-                    # Smart Wait: only sleep if we have enough budget left for a retry
-                    elapsed_so_far = time.time() - start_time
-                    if elapsed_so_far < timeout:
-                        wait_time = min(1.0, timeout - elapsed_so_far)
-                        logger.warning(f"[{self.name}] Pool exhausted. Retrying in {wait_time:.1f}s (Attempt {attempts}/{max_pool_retries})")
 
-                        # Emit retry metric
-                        prefix = "stt_pool" if "STT" in self.name or "Deepgram" in self.name else "tts_pool"
-                        logger.info(f"[METRIC] {prefix}_acquire_retry_count=1")
+class _IdleSTTConn:
+    """Wrapper around a Deepgram WebSocket that keeps itself alive while idle."""
 
-                        await asyncio.sleep(wait_time)
-                    else:
-                        logger.warning(f"[{self.name}] Pool exhausted. No time for retry.")
-                        # Move to final raise by breaking outer loop logic
-                        attempts = max_pool_retries + 1
+    def __init__(self, ws, keepalive_task: asyncio.Task):
+        self.ws = ws
+        self._keepalive_task = keepalive_task
+        self.created_at = time.monotonic()
 
-                if attempts > max_pool_retries:
-                    logger.warning(f"[{self.name}] Pool exhausted after {attempts-1} attempts and {timeout}s total timeout.")
-                    self._emit_metrics((time.time() - start_time) * 1000)
-                    raise PoolExhaustedError(f"Pool {self.name} exhausted after {attempts-1} attempts.")
-            except Exception as e:
-                logger.error(f"[{self.name}] Unexpected error during acquire: {e}")
-                raise
+    def stop_keepalive(self) -> None:
+        """Cancel the idle keepalive — run_stt has its own."""
+        self._keepalive_task.cancel()
 
-    async def release(self, conn: Any):
-        held_ms = 0.0
-        if conn in self._checkout_times:
-            held_ms = (asyncio.get_event_loop().time() - self._checkout_times[conn]) * 1000
-        if conn in self._active_connections:
-            self._active_connections.discard(conn)
-            self._checkout_times.pop(conn, None)
-        logger.info(
-            f"[{self.name}] [POOL-RELEASE] held={held_ms:.0f}ms "
-            f"active={len(self._active_connections)} idle={self._pool.qsize()}"
-        )
-            
-        # Reset state on return
-        self.reset_connection_func(conn)
-            
-        if await self.health_check_func(conn):
-            try:
-                self._pool.put_nowait(conn)
-            except asyncio.QueueFull:
-                await self.close_connection_func(conn)
-        else:
-            await self._replace_connection(conn)
-            
-        self._emit_metrics()
-
-    async def _replace_connection(self, dead_conn: Any = None):
-        if dead_conn:
-            await self.close_connection_func(dead_conn)
-            
+    async def close(self) -> None:
+        self._keepalive_task.cancel()
         try:
-            conn = await self.create_connection_func()
-            if conn:
-                try:
-                    self._pool.put_nowait(conn)
-                    self.replacement_count += 1
-                    logger.info(
-                        f"[{self.name}] [POOL-RECONNECT] Dead connection replaced "
-                        f"(total_replacements={self.replacement_count} idle={self._pool.qsize()})"
-                    )
-                except asyncio.QueueFull:
-                    await self.close_connection_func(conn)
+            await self._keepalive_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+
+class DeepgramPool:
+    """
+    Pool of pre-opened Deepgram STT WebSocket connections.
+
+    Context-manager interface mirrors `websockets.connect()` so `run_stt` can
+    swap from `async with websockets.connect(...) as ws:` to
+    `async with stt_pool.acquire() as ws:` with zero change to the body.
+    """
+
+    def __init__(self, size: int = 2):
+        self._size = size
+        self._pool: asyncio.Queue = asyncio.Queue()
+        self._running = False
+
+    async def warmup(self) -> None:
+        """Open `size` connections concurrently. Call once at server startup."""
+        self._running = True
+        print(f"[POOL/STT] Pre-warming {self._size} Deepgram connections...")
+        results = await asyncio.gather(
+            *[self._open_one() for _ in range(self._size)],
+            return_exceptions=True,
+        )
+        opened = sum(1 for r in results if not isinstance(r, Exception))
+        print(f"[POOL/STT] {opened}/{self._size} connections ready")
+
+    async def _open_one(self) -> None:
+        """Open one Deepgram connection, attach a keepalive, put it in the pool."""
+        try:
+            ws = await websockets.connect(
+                _STT_URL,
+                subprotocols=["token", config.DEEPGRAM_API_KEY],
+            )
+            keepalive_task = asyncio.create_task(self._idle_keepalive(ws))
+            await self._pool.put(_IdleSTTConn(ws, keepalive_task))
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to replace connection: {e}")
+            print(f"[POOL/STT] Failed to open connection: {type(e).__name__}: {e}")
 
-    async def _health_monitor(self):
+    @staticmethod
+    async def _idle_keepalive(ws) -> None:
+        """Keep an idle pooled socket alive with periodic KeepAlive frames."""
         while True:
-            await asyncio.sleep(self.health_check_interval_s)
-            
-            # 1. Drain and check ALL current idle connections in a burst
-            num_to_check = self._pool.qsize()
-            for _ in range(num_to_check):
+            await asyncio.sleep(_KEEPALIVE_INTERVAL_S)
+            try:
+                await ws.send(json.dumps({"type": "KeepAlive"}))
+            except Exception:
+                return
+
+    @asynccontextmanager
+    async def acquire(self):
+        """
+        Yield a live Deepgram WebSocket.
+
+        Fast path: pool has a pre-warmed socket → return immediately.
+        Slow path: pool empty (burst/startup) → open a fresh connection.
+
+        Either way, a replacement is opened asynchronously in the background
+        so the pool is ready for the next call.
+        """
+        conn: _IdleSTTConn | None = None
+        try:
+            conn = self._pool.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        if conn is not None:
+            # Hand off to run_stt. Cancel the idle keepalive; run_stt has its own.
+            conn.stop_keepalive()
+            try:
+                await conn._keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            age_ms = round((time.monotonic() - conn.created_at) * 1000)
+            print(f"[POOL/STT] Acquired pre-warmed connection (idle {age_ms}ms)")
+            try:
+                yield conn.ws
+            finally:
+                # Close the consumed connection and replenish the pool.
                 try:
-                    conn = self._pool.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                
-                is_alive = await self.health_check_func(conn)
-                if is_alive:
-                    try: self._pool.put_nowait(conn)
-                    except asyncio.QueueFull: await self.close_connection_func(conn)
-                else:
-                    logger.warning(f"[{self.name}] Health check failed in monitor. Replacing.")
-                    await self._replace_connection(conn)
-                
-                # Tiny yield to let acquire() slip in if it's waiting
-                await asyncio.sleep(0.01)
+                    await conn.ws.close()
+                except Exception:
+                    pass
+                if self._running:
+                    asyncio.create_task(self._open_one())
+        else:
+            # Fallback: open a fresh connection directly (burst or first call).
+            print("[POOL/STT] Pool empty — opening fresh connection (burst/startup)")
+            ws = await websockets.connect(
+                _STT_URL,
+                subprotocols=["token", config.DEEPGRAM_API_KEY],
+            )
+            try:
+                yield ws
+            finally:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                if self._running:
+                    asyncio.create_task(self._open_one())
 
-            # 2. Ensure minimum connections are maintained
-            current_idle = self._pool.qsize()
-            total = current_idle + len(self._active_connections)
-            if total < self.min_connections:
-                needed = self.min_connections - total
-                for _ in range(needed):
-                    asyncio.create_task(self._replace_connection())
-            
-            self._emit_metrics()
-
-    async def _lease_monitor(self):
-        """
-        Antigravity Mechanism: Sweeps orphaned connections (WS-03).
-        Runs every 30s to reclaim connections held for > 300s (safety threshold).
-        """
-        while True:
-            await asyncio.sleep(30)
-            now = asyncio.get_event_loop().time()
-            expired = []
-            
-            # Prune active connections that have exceeded the lease time
-            # 1200.0s (20 mins) is the hard ceiling for a single call's resource hold
-            # to prevent killing valid long-running conversations.
-            lease_limit = 1200.0
-            
-            for conn in list(self._active_connections):
-                checkout_time = self._checkout_times.get(conn)
-                if checkout_time and (now - checkout_time) > lease_limit:
-                    expired.append(conn)
-            
-            for conn in expired:
-                logger.error(f"[{self.name}] LEASE EXPIRED for connection held for >{lease_limit}s. Force-reclaiming.")
-                # Force release and close
-                await self.release(conn)
-                # Ensure it's truly gone even if release() fails to put it in pool
-                if conn in self._active_connections:
-                    self._active_connections.discard(conn)
-                    self._checkout_times.pop(conn, None)
-                    await self.close_connection_func(conn)
-
-    def _emit_metrics(self, wait_time_ms: float = 0.0):
-        active = len(self._active_connections)
-        idle = self._pool.qsize()
-        
-        # Determine prefix for emitting
-        prefix = "stt_pool" if "STT" in self.name or "Deepgram" in self.name else "tts_pool"
-        session_str = "connections" if prefix == "stt_pool" else "sessions"
-        
-        # Telemetry per PRD (debug-level to avoid log noise every health-check cycle)
-        logger.debug(f"[METRIC] {prefix}_active_{session_str}={active}")
-        logger.debug(f"[METRIC] {prefix}_idle_{session_str}={idle}")
-
-        # Utilization Logic
-        total = active + idle
-        utilization = (active / self.pool_size * 100) if self.pool_size > 0 else 0
-        logger.debug(f"[METRIC] {prefix}_utilization_pct={utilization:.1f}")
-
-        logger.debug(f"[METRIC] {prefix}_replacement_count={self.replacement_count}")
-        if wait_time_ms > 0:
-            logger.debug(f"[METRIC] {prefix}_wait_time_ms={wait_time_ms:.2f}")
-
-    async def close_pool(self):
-        if self._health_task:
-            self._health_task.cancel()
-        if hasattr(self, '_lease_task') and self._lease_task:
-            self._lease_task.cancel()
-            
+    async def shutdown(self) -> None:
+        """Drain + close all idle connections. Call on server shutdown."""
+        self._running = False
         while not self._pool.empty():
-            conn = await self._pool.get()
-            await self.close_connection_func(conn)
-            
-        for conn in list(self._active_connections):
-            await self.close_connection_func(conn)
-            self._active_connections.discard(conn)
-            
-        logger.info(f"[{self.name}] Pool closed")
+            try:
+                conn = self._pool.get_nowait()
+                await conn.close()
+            except asyncio.QueueEmpty:
+                break
+        print("[POOL/STT] Shutdown complete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ElevenLabs TTS pool
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ElevenLabsPool:
+    """
+    Shared httpx.AsyncClient for ElevenLabs synthesis.
+
+    httpx.AsyncClient maintains an internal TCP keep-alive pool. By sharing one
+    client instead of creating a new one per synthesis call, subsequent requests
+    reuse existing connections and skip TCP+TLS renegotiation.
+
+    The greeting (first synthesis per call) benefits most: with warmup the
+    connection to ElevenLabs is already open.
+    """
+
+    def __init__(self, max_connections: int = 5):
+        limits = httpx.Limits(
+            max_connections=max_connections,
+            max_keepalive_connections=max_connections,
+            keepalive_expiry=30,
+        )
+        self._client = httpx.AsyncClient(timeout=30, limits=limits)
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    async def warmup(self) -> None:
+        """
+        Fire a cheap authenticated request to pre-establish the TCP+TLS
+        connection so the first synthesis call on any call is fast.
+        """
+        try:
+            headers = {"xi-api-key": config.ELEVENLABS_API_KEY}
+            resp = await self._client.get(
+                "https://api.elevenlabs.io/v1/models",
+                headers=headers,
+                timeout=10,
+            )
+            print(f"[POOL/TTS] ElevenLabs connection warmed (HTTP {resp.status_code})")
+        except Exception as e:
+            print(f"[POOL/TTS] Warmup request failed (non-fatal): {type(e).__name__}: {e}")
+            print("[POOL/TTS] First synthesis will pay the full TCP+TLS cost")
+
+    async def shutdown(self) -> None:
+        await self._client.aclose()
+        print("[POOL/TTS] Shutdown complete")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level bundle
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConnectionPools:
+    """Owns both pools; provides a single warmup/shutdown surface."""
+
+    def __init__(self, stt_size: int = 2):
+        self.stt = DeepgramPool(size=stt_size)
+        self.tts = ElevenLabsPool()
+
+    async def warmup(self) -> None:
+        await asyncio.gather(self.stt.warmup(), self.tts.warmup())
+
+    async def shutdown(self) -> None:
+        await asyncio.gather(self.stt.shutdown(), self.tts.shutdown())

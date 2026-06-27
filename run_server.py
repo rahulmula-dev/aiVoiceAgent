@@ -1,28 +1,55 @@
-# Root Server Runner - GD College AI Voice Agent
-import os
-import sys
+"""
+run_server.py — thin entry point.
+
+All routes live in telephony/server.py (FastAPI `app`).
+All per-call orchestration lives in orchestrator/manager.py (VoiceOrchestrator).
+
+This file just:
+  1. Imports `config` (triggers .env load + validates API keys are present)
+  2. Imports the FastAPI `app` from telephony.server
+  3. Configures and runs uvicorn
+
+Pipeline topology (per call) is documented in orchestrator/manager.py.
+"""
+
+import asyncio
+
 import uvicorn
-from dotenv import load_dotenv
 
-# Ensure the root directory is in sys.path for modular imports to work
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-if ROOT_DIR not in sys.path:
-    sys.path.append(ROOT_DIR)
-
-# Load environment variables
-load_dotenv()
-
+import config
 from telephony.server import app
+from orchestrator.factory import warmup_pools, init_gate
+
+
+async def main() -> None:
+    print("[MAIN] Starting modular voice pipeline server on port 5000")
+    print(f"       STT -> Deepgram {config.DEEPGRAM_MODEL}")
+    if config.LLM_PROVIDER == "gemini":
+        print(f"       LLM -> Gemini   {config.GEMINI_MODEL}")
+    else:
+        print(f"       LLM -> Groq     {config.GROQ_MODEL}")
+    print(f"       TTS -> ElevenLabs {config.ELEVENLABS_MODEL_ID}")
+    if config.CONCURRENCY_GATE_ENABLED:
+        print(f"       Gate -> Redis    max {config.MAX_CONCURRENT_CALLS} concurrent calls")
+
+    print("[MAIN] Warming up connection pools...")
+    await warmup_pools()
+    await init_gate()
+
+    cfg = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=5000,
+        log_level="warning",
+        access_log=False,
+    )
+    server = uvicorn.Server(cfg)
+    print("[MAIN] Waiting for Twilio calls...")
+    await server.serve()
+
 
 if __name__ == "__main__":
-    # Change the default port to 8001 to avoid conflicts on 8000
-    PORT = int(os.getenv("PORT", 8001))
-    print(f"\n>>> Starting AI Voice Agent Server at http://localhost:{PORT}")
-    print(f">>> TEST CHAT UI AVAILABLE AT: http://localhost:{PORT}/chat-ui")
-    print(f">>> Root Directory: {ROOT_DIR}")
     try:
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
-    except Exception as e:
-        print(f"\nCRITICAL: Uvicorn failed to start: {e}")
-        import traceback
-        traceback.print_exc()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[MAIN] Shutting down")

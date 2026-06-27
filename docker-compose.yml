@@ -1,77 +1,181 @@
+# docker-compose.yml — AI Voice Agent (CILA)
+# ---------------------------------------------------------------------------
+# Defines the three services needed to run the full stack locally:
+#   1. postgres  — pgvector-enabled PostgreSQL for RAG embeddings + CRM data
+#   2. redis     — in-memory store for session state and conversation context
+#   3. cila-ai-agent — the FastAPI telephony server
+#
+# Usage:
+#   docker-compose up --build      # First run (builds the agent image)
+#   docker-compose up -d           # Subsequent runs (detached)
+#   docker-compose logs -f         # Stream logs
+#   docker-compose down            # Stop and remove containers (data persists in pgdata volume)
+# ---------------------------------------------------------------------------
+
+# Compose file format version — 3.8 supports deploy.resources limits used below.
 version: '3.8'
 
 services:
+
+  # ---------------------------------------------------------------------------
+  # Service: postgres
+  # ---------------------------------------------------------------------------
+  # pgvector/pgvector:pg16 is the official pgvector image built on PostgreSQL 16.
+  # It ships with the vector extension pre-installed and ready to enable via
+  # CREATE EXTENSION IF NOT EXISTS vector; (done by db-init/01_schema.sql).
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: cila-postgres
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: postgres
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./db-init:/docker-entrypoint-initdb.d
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - cila-network
+    container_name: cila-postgres   # Fixed name for easier `docker exec` debugging
 
+    environment:
+      POSTGRES_USER: postgres                 # Superuser username inside the container
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # Read from .env — never hard-code passwords
+      POSTGRES_DB: postgres                   # Default database created on first boot
+
+    volumes:
+      # Named volume: persists the PostgreSQL data directory across container restarts.
+      # Without this, all RAG embeddings and CRM records would be lost on `docker-compose down`.
+      - pgdata:/var/lib/postgresql/data
+
+      # Bind-mount the db-init directory to the PostgreSQL init hook.
+      # Any .sql or .sh files placed in /docker-entrypoint-initdb.d/ are executed
+      # automatically on the very first container start (when pgdata is empty).
+      # 01_schema.sql runs here to create the rag schema, tables, and HNSW index.
+      - ./db-init:/docker-entrypoint-initdb.d
+
+    ports:
+      # Map host:5433 → container:5432.
+      # Host port is 5433 because the user's machine already has a local
+      # Postgres 18 service bound to 5432. The container still uses 5432
+      # internally — only the host-facing port differs.
+      - "5433:5432"
+
+    healthcheck:
+      # pg_isready exits 0 only when the server is ready to accept connections.
+      # The cila-ai-agent service uses condition: service_healthy (below) to
+      # delay its own start until PostgreSQL is fully up — preventing asyncpg
+      # "Connection refused" errors on fast machines where compose races.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s   # Check every 10 seconds
+      timeout: 5s     # Fail if no response within 5 seconds
+      retries: 5      # Mark healthy only after 5 consecutive passes
+
+    networks:
+      - cila-network  # Shared bridge network — containers resolve each other by service name
+
+  # ---------------------------------------------------------------------------
+  # Service: redis
+  # ---------------------------------------------------------------------------
+  # Redis stores:
+  #   - Active call session state (call_sid → conversation context, language, etc.)
+  #   - Rate-limiting counters
+  #   - Pub/sub for streaming audio events (future)
+  # redis:7-alpine is the official Redis 7 image on Alpine Linux (~30 MB).
   redis:
     image: redis:7-alpine
     container_name: cila-redis
+
     ports:
+      # Expose Redis to the host for local debugging with redis-cli or RedisInsight.
       - "6379:6379"
+
     healthcheck:
+      # redis-cli ping returns "PONG" when Redis is ready.
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+
     networks:
       - cila-network
 
+  # ---------------------------------------------------------------------------
+  # Service: cila-ai-agent
+  # ---------------------------------------------------------------------------
+  # The main FastAPI + uvicorn telephony server.
+  # Built from the local Dockerfile (build: .) on first run or after changes.
   cila-ai-agent:
-    build: .
-    image: cila-ai-agent:latest
+    build: .                         # Build from Dockerfile in the current directory
+    image: cila-ai-agent:latest      # Tag the built image for re-use without rebuilding
     container_name: cila-ai-agent
+
     ports:
+      # Expose port 8000 to the host so Twilio webhooks can reach the server
+      # via an ngrok tunnel (development) or a public load-balancer (staging/prod).
       - "8000:8000"
+
     environment:
+      # APP_ENV controls feature flags and logging verbosity inside the app.
+      # ${APP_ENV:-production} uses the .env value if set, otherwise falls back to "production".
       - APP_ENV=${APP_ENV:-production}
+
+      # PORT must match the EXPOSE and ports mapping above.
+      # run_server.py reads this to bind uvicorn on the correct port.
       - PORT=8000
+
+      # REDIS_URL uses the Docker service name "redis" as the hostname.
+      # Inside the cila-network bridge, Docker DNS resolves "redis" to the Redis container IP.
       - REDIS_URL=redis://redis:6379
+
+      # Path to the FastText language-ID model baked into the image at build time.
       - FASTTEXT_MODEL_PATH=/app/models/lid.176.ftz
+
+    # env_file loads all remaining secrets (API keys, DB URL, etc.) from .env
+    # without hard-coding them in this file. Variables defined in environment:
+    # above take precedence over .env values for the same key.
     env_file:
       - .env
+
+    # Always restart the container if it exits — ensures 24/7 availability
+    # for inbound Twilio calls even after a crash or server reboot.
     restart: always
+
+    # Wait for both Redis and Postgres to pass their healthchecks before starting
+    # the agent. This prevents asyncpg / redis-py connection errors on startup.
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+
     healthcheck:
+      # /readyz is the deep-health endpoint: checks DB, Redis, and external APIs.
+      # Used by load balancers and orchestrators to decide whether to route traffic.
       test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 30s
       timeout: 10s
       retries: 3
+
     deploy:
       resources:
         limits:
-          cpus: '1.0'
-          memory: 1G
+          # Hard cap: the container is killed if it exceeds these limits,
+          # preventing one runaway call from starving other services on the host.
+          cpus: '1.0'    # 1 full CPU core maximum
+          memory: 1G     # 1 GB RAM maximum
         reservations:
-          cpus: '0.2'
-          memory: 256M
+          # Soft minimum: Docker Swarm / compose will try to place the container
+          # on a host that has at least this much free capacity.
+          cpus: '0.2'    # Reserve 20% of a CPU core
+          memory: 256M   # Reserve 256 MB RAM
+
     networks:
       - cila-network
 
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
 networks:
+  # A single user-defined bridge network for all three services.
+  # User-defined bridge networks provide automatic DNS resolution by service name
+  # (e.g., the agent can reach Postgres at hostname "postgres" on port 5432).
   cila-network:
     driver: bridge
 
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
 volumes:
+  # Named volume for PostgreSQL data — survives `docker-compose down` and
+  # container image updates. To fully reset the DB: `docker volume rm pgdata`.
   pgdata:

@@ -1,14 +1,15 @@
 {
-    "DEFAULT_THRESHOLD": 0.58,
-    "OPERATIONAL_CATEGORIES": {
-        "PROGRAM_STRUCTURE": 0.58,
-        "FEE_DETAILS": 0.60,
-        "ELIGIBILITY": 0.62,
-        "DEADLINES": 0.65
-    },
-    "HARD_REFUSAL_CATEGORIES": {
-        "HARD_REFUSAL_LEGAL": 0.75,
-        "HARD_REFUSAL_IMMIGRATION": 0.75,
-        "HARD_REFUSAL_HARASSMENT": 0.80
-    }
+  "_comment": "Confidence thresholds for RAG retrieval. Tuned for GD College knowledge set.",
+  "DEFAULT_THRESHOLD": 0.58,
+  "HARD_REFUSAL_CATEGORIES": {
+    "immigration": 0.95,
+    "legal": 0.90,
+    "competitor": 0.85
+  },
+  "OPERATIONAL_CATEGORIES": {
+    "PROGRAM_STRUCTURE": 0.58,
+    "FEE_DETAILS": 0.60,
+    "ELIGIBILITY": 0.62,
+    "DEADLINES": 0.65
+  }
 }

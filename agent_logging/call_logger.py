@@ -1,324 +1,236 @@
+"""
+agent_logging/call_logger.py — crash-safe per-call event stream + summary.
+
+``CallLogger`` is a drop-in subclass of ``logs.transcript_logger.TranscriptLogger``.
+It keeps every public method the STT / LLM / TTS modules already use
+(``log_user``, ``log_bot``, ``mark_user_finalized``, ``mark_llm_first_token``,
+``mark_tts_first_audio``, ``close``), so no changes are needed at the call
+sites — the orchestrator just instantiates ``CallLogger`` instead of
+``TranscriptLogger``.
+
+What ``CallLogger`` adds on top:
+
+1. **Crash-safe append** — every event is written to
+   ``logs/calls/<datetime>_<id>.events.jsonl`` the moment it happens. If the
+   process dies mid-call, the JSONL file is still well-formed up to the last
+   complete line, so post-mortem analysis still has the conversation up to
+   the failure point. The existing ``logs/transcripts/<datetime>.json`` keeps
+   working as before (parent's responsibility), preserving ``view_call.py``.
+
+2. **Sealed summary** — on ``close()``, a small ``logs/calls/<datetime>_<id>.json``
+   is written atomically (``.tmp`` then ``os.replace``). It contains:
+     - duration, masked caller, turn counts
+     - latency p50/p90/p95/p99/avg for the user-final → tts-first-audio leg
+     - governance counts (language strikes, restricted-topic refusals)
+   This is the file to scan when you want one-line-per-call analytics.
+
+3. **Governance event recording** — extra method ``log_governance_*`` so the
+   LLM loop can record when a strike or topic refusal fires. These do not
+   land in the transcript JSON (which stays speaker/bot-only) — they go to
+   the new events.jsonl and the summary stats.
+
+The two destination directories don't overlap, so there is no risk of
+clobbering the existing transcript writes:
+
+    logs/
+      transcripts/<datetime>.json          # existing TranscriptLogger, unchanged
+      calls/<datetime>_<id>.events.jsonl   # NEW: append-as-it-happens
+      calls/<datetime>_<id>.json           # NEW: sealed summary
+      access_audit.jsonl                   # NEW: audit_logger writes here
+"""
+
+from __future__ import annotations
+
 import json
 import os
+import statistics
+import threading
 import time
-import logging as std_logging
-from datetime import datetime
-from typing import List, Dict, Any
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-# Configure a basic logger for internal CallLogger errors
-logger = std_logging.getLogger("CallLogger")
+from logs.transcript_logger import TranscriptLogger
 
-from .voice_logger import mask_phone_number
 
-class CallLogger:
+_CALLS_DIR = Path(__file__).resolve().parent.parent / "logs" / "calls"
+_CALLS_DIR.mkdir(parents=True, exist_ok=True)
+
+_LOCK = threading.Lock()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _safe_filename_id(call_id: str) -> str:
+    """Sanitize a call_id into a filename-safe slug, capped at 32 chars."""
+    return "".join(c if c.isalnum() else "_" for c in (call_id or ""))[:32] or "nocallid"
+
+
+class CallLogger(TranscriptLogger):
     """
-    Captures the entire lifecycle of a call in a structured JSON format.
-    Tracks events, latency, and metadata.
+    Drop-in replacement for ``TranscriptLogger`` that also writes a crash-safe
+    events JSONL and a sealed summary JSON.
+
+    Constructor takes the same ``call_id`` as the parent, plus an optional
+    ``caller_number_masked`` for the summary (use ``voice_logger.mask_phone``
+    before passing).
     """
-    def __init__(self, call_id: str, caller_number: str = "Unknown", agent_version: str = "1.0.0"):
-        self.call_id = call_id
-        self.start_time = datetime.now()
-        self.caller_number = self._anonymize_number(caller_number)
-        self.agent_version = agent_version
-        self.status = "in-progress"
-        self.reason = "unknown"  # Termination reason: user_hangup, error, timeout, agent_ended
-        self.events: List[Dict[str, Any]] = []
-        self._summary_written = False  # Guard: ensure summary is only written once
-        self._final_log_written = False  # IMMUTABILITY GUARD
-        
-        # Log directory and files
-        self.log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.events_file = os.path.join(self.log_dir, f"call_{self.call_id}.events.jsonl")
-        
-        # Log initialization
-        self.log_event("orchestrator", "call_logger_initialized", 
-                       meta={"agent_version": self.agent_version})
-        
-        # PILLAR 3: Ghost File Rule - Removed mid-call/initialization writes for Audit Integrity
-        # save_log(status="initialized") is now removed to preserve immutability.
 
-    def _anonymize_number(self, number: str) -> str:
-        """Helper to mask the phone number using centralized logic (MEDIUM-P3-02)."""
-        return mask_phone_number(number)
+    def __init__(self, call_id: str, caller_number_masked: str = "<unknown>") -> None:
+        super().__init__(call_id=call_id)
 
-    def log_event(self, event_type: str, event_name: str, latency_ms: int = None, meta: Dict[str, Any] = None, trace_id: str = None):
-        """
-        Logs a single event with a timestamp.
-        Auto-injects call_id and trace_id for traceability.
-        """
-        event_entry = {
-            "timestamp": datetime.now().isoformat(),
-            "type": event_type,
-            "event": event_name,
-            "call_id": self.call_id  # Auto-inject ID
-        }
+        # Use the parent's filename stamp so the .events.jsonl and the
+        # transcript JSON share the same timestamp prefix (easier correlation).
+        stamp = self._filename
+        slug = _safe_filename_id(call_id)
+        self._events_path = _CALLS_DIR / f"{stamp}_{slug}.events.jsonl"
+        self._summary_path = _CALLS_DIR / f"{stamp}_{slug}.json"
 
+        self._caller_masked = caller_number_masked
+        self._call_start_mono = time.monotonic()
+        self._latencies_ms: list[float] = []
+        self._user_turns = 0
+        self._bot_turns = 0
+        self._lang_strikes = 0
+        self._topic_refusals = 0
+
+        self._append({
+            "event": "call_start",
+            "call_id": call_id,
+            "caller": caller_number_masked,
+        })
+
+    # ── Internal append helper (thread-safe per-instance) ────────────────
+
+    def _append(self, record: dict) -> None:
+        record.setdefault("ts", _now_iso())
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with _LOCK:
+            try:
+                with self._events_path.open("a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception as e:
+                # Logging must never break the call. Print once and move on.
+                print(f"[CALL_LOGGER] events append failed: {e}")
+
+    # ── Drop-in overrides — same signatures as TranscriptLogger ──────────
+
+    def log_user(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text or self._closed:
+            return
+        super().log_user(text)
+        self._user_turns += 1
+        self._append({"event": "user_turn", "text": text})
+
+    def log_bot(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text or self._closed:
+            return
+        super().log_bot(text)
+        self._bot_turns += 1
+        self._append({"event": "bot_turn", "text": text})
+
+    def mark_tts_first_audio(self) -> None:
+        if self._closed or self._t_user_final is None:
+            super().mark_tts_first_audio()
+            return
+        # We want to also capture the latency in our own list, but the parent
+        # method consumes the timers in place. Compute the same thing first.
+        now = time.monotonic()
+        latency_ms: float | None = None
+        if self._t_user_final is not None and self._t_llm_first_token is not None:
+            latency_ms = (now - self._t_user_final) * 1000.0
+        super().mark_tts_first_audio()
         if latency_ms is not None:
-            event_entry["latency_ms"] = latency_ms
+            self._latencies_ms.append(latency_ms)
+            self._append({
+                "event": "latency",
+                "user_final_to_tts_first_audio_ms": round(latency_ms),
+            })
 
-        if trace_id:
-            event_entry["trace_id"] = trace_id
+    # ── Governance hook methods (called from run_llm) ────────────────────
 
-        if meta:
-            event_entry.update(meta)
+    def log_governance_lang_strike(
+        self,
+        strike: int,
+        lang_code: str,
+        confidence: float,
+        terminated: bool,
+    ) -> None:
+        self._lang_strikes += 1
+        self._append({
+            "event": "gov_lang_strike",
+            "strike": strike,
+            "lang": lang_code,
+            "confidence": round(confidence, 2),
+            "terminated": terminated,
+        })
 
-        self.events.append(event_entry)
+    def log_governance_topic_refusal(self, category: str) -> None:
+        self._topic_refusals += 1
+        self._append({"event": "gov_topic_refusal", "category": category})
 
-        # Emit to std_logging so component events appear in Docker logs and voice_agent.log
-        lat_str = f" latency={latency_ms}ms" if latency_ms is not None else ""
-        logger.debug(f"[{event_type}] {event_name}{lat_str} call={self.call_id}")
+    # ── Sealed summary on close ──────────────────────────────────────────
 
-        # PRD [HIGH-P3-02]: Append-only event stream for crash resilience
-        try:
-            with open(self.events_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(event_entry) + "\n")
-        except Exception as e:
-            logger.error(f"Failed to append to event stream {self.events_file}: {e}")
-
-    def _calculate_percentiles(self, latencies: List[int], percentiles: List[float] = None) -> Dict[str, int]:
-        """
-        Calculates requested percentiles for a list of latencies using the nearest-rank method.
-        Default: p50, p90, p95, p99.
-        """
-        if percentiles is None:
-            percentiles = [0.50, 0.90, 0.95, 0.99]
-            
-        if not latencies:
-            return {f"p{int(p*100)}": 0 for p in percentiles}
-        
-        import math
-        sorted_lats = sorted(latencies)
-        n = len(sorted_lats)
-        
-        results = {}
-        for p in percentiles:
-            # Nearest-rank formula: i = ceil(P/100 * N)
-            idx = max(0, min(n - 1, math.ceil(p * n) - 1))
-            results[f"p{int(p*100)}"] = sorted_lats[idx]
-            
-        return results
-
-    def generate_summary_line(self, status: str = None, reason: str = None):
-        """
-        Generates a saturated one-liner summary for logs.
-        Idempotent: only writes once per CallLogger instance, regardless of how many callers invoke it.
-        
-        Args:
-            status: Call status (e.g., "completed", "error")
-            reason: Termination reason (e.g., "user_hangup", "silence_termination", "error")
-        """
-        # GUARD: Only write once. The first caller wins (cleanup() sets the real reason).
-        # Subsequent calls from server finally blocks are no-ops.
-        if self._summary_written:
-            logger.debug(f"Summary already written for {self.call_id}. Skipping duplicate.")
+    def close(self) -> None:
+        if self._closed:
             return
-        self._summary_written = True
+        # Parent writes the transcript JSON and flips self._closed.
+        end_mono = time.monotonic()
+        duration_s = round(end_mono - self._call_start_mono, 2)
+        summary = self._build_summary(duration_s)
+        self._append({"event": "call_end", "duration_s": duration_s, **summary})
+        super().close()  # writes logs/transcripts/<datetime>.json + sets _closed
 
+        # Atomic sealed summary write
+        tmp_path = self._summary_path.with_suffix(self._summary_path.suffix + ".tmp")
         try:
-            if status:
-                self.status = status
-            if reason:
-                self.reason = reason
-                
-            end_time = datetime.now()
-            duration = round((end_time - self.start_time).total_seconds(), 2)
-            
-            # Use a shallow copy to avoid "list changed size" errors from background tasks
-            events_snapshot = list(self.events)
-            
-            # Calculate turns (user spoken events)
-            user_turns = len([e for e in events_snapshot if e.get("type") == "stt" and e.get("event") == "user_transcript_final"])
-            
-            # --- LATENCY AGGREGATION (Modular Stats) ---
-            def get_lats(e_type, e_name):
-                return [e["latency_ms"] for e in events_snapshot 
-                        if e.get("type") == e_type and e.get("event") == e_name and "latency_ms" in e]
-
-            llm_latencies = get_lats("orchestrator", "llm_response_start")
-            stt_latencies = get_lats("stt", "user_transcript_final")
-            rag_latencies = get_lats("retrieval", "rag_search_latency")
-            tts_latencies = get_lats("tts", "audio_stream_start")
-            
-            # TELEMETRY MONITORING: Warn if core subsystems are missing events (indicates broken hooks)
-            if user_turns > 0: # Only check if the user actually spoke
-                for name, lats in [("LLM", llm_latencies), ("STT", stt_latencies), ("RAG", rag_latencies), ("TTS", tts_latencies)]:
-                    if not lats:
-                        logger.warning(f"[TELEMETRY_MISS] Subsystem {name} reported 0 latency events for call {self.call_id}")
-
-            avg_latency = int(sum(llm_latencies) / len(llm_latencies)) if llm_latencies else 0
-            
-            summary = {
-                "id": self.call_id,
-                "start": self.start_time.isoformat() + "Z",  # ISO 8601 with Z suffix
-                "dur": duration,
-                "turns": user_turns,
-                "lat_avg": avg_latency,
-                "stats": {
-                    "llm": self._calculate_percentiles(llm_latencies),
-                    "stt": self._calculate_percentiles(stt_latencies),
-                    "rag": self._calculate_percentiles(rag_latencies),
-                    "tts": self._calculate_percentiles(tts_latencies)
-                },
-                "status": self.status,
-                "reason": self.reason
-            }
-            
-            summary_line = f"CALL_SUMMARY: {json.dumps(summary)}"
-            
-            # Output to main log (voice_agent.log) - full JSON format
-            std_logging.getLogger("CallSummary").info(summary_line)
-            
-            # Also write ONLY this line to a separate summary file (call_summary.log)
+            with _LOCK:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    json.dump(summary, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self._summary_path)
+            print(f"[LOG] Call summary saved -> {self._summary_path}")
+        except Exception as e:
+            print(f"[CALL_LOGGER] summary write failed: {e}")
             try:
-                log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
-                os.makedirs(log_dir, exist_ok=True)
-                summary_file = os.path.join(log_dir, "call_summary.log")
-                
-                with open(summary_file, "a", encoding="utf-8") as f:
-                    timestamp = datetime.now().isoformat()
-                    f.write(f"{timestamp} | {summary_line}\n")
-            except Exception as file_err:
-                logger.error(f"Failed to write to call_summary.log: {file_err}")
-                
-        except Exception as e:
-            logger.error(f"Failed to generate summary line for {self.call_id}: {e}")
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
-    def save_log(self, status: str = "completed", session_obj: Any = None):
-        """
-        Writes the final JSON log to the logs/ directory.
-        Compiles all PRD-required top-level metadata.
-        Uses Atomic Write & Final Seal pattern (IMMUTABILITY).
-        """
-        if self._final_log_written:
-            logger.debug(f"Final log already sealed for {self.call_id}. Skipping.")
-            return
+    # ── Summary builder ──────────────────────────────────────────────────
 
-        # Only seal if status is 'completed' or 'error' (terminal states)
-        if status not in ["completed", "error"]:
-            logger.debug(f"Save suppressed: Immutability requirement prohibits mid-call writes (status: {status})")
-            return
+    def _build_summary(self, duration_s: float) -> dict[str, Any]:
+        lat = sorted(self._latencies_ms)
 
-        try:
-            self._final_log_written = True
-            self.status = status
-            
-            end_time = datetime.now()
-            duration = round((end_time - self.start_time).total_seconds(), 2)
-            
-            # Use a shallow copy to avoid "list changed size" errors
-            events_snapshot = list(self.events)
-            
-            structured_turns = []
-            if session_obj and hasattr(session_obj, 'structured_turns'):
-                structured_turns = session_obj.structured_turns
-            
-            # --- PRD METADATA SATIATION (Forensic Fix) ---
-            kb_version_id = "unknown"
-            chunk_ids = []
-            sentiment = "Neutral"
-            termination_reason = self.reason
-            confidence_scores = []
-            
-            if session_obj:
-                if hasattr(session_obj, 'call_context'):
-                    kb_version_id = session_obj.call_context.kb_version_id or "unknown"
-                    chunk_ids = getattr(session_obj.call_context, 'chunk_ids_used', [])
-                
-                sentiment = getattr(session_obj, 'sentiment_label', "Neutral")
-                termination_reason = getattr(session_obj, 'termination_reason', self.reason)
-                
-                # PRD HIGH-P3-01: Prioritize crash-proof session state for confidence history
-                confidence_scores = getattr(session_obj, 'confidence_scores', [])
-                
-                # FALLBACK LOGIC: If session data is missing or unknown, scrape the events array
-                if not kb_version_id or kb_version_id == "unknown":
-                    v_ids = [e.get("kb_version_id") for e in events_snapshot 
-                            if e.get("type") == "retrieval" and e.get("kb_version_id") and e.get("kb_version_id") != "unknown"]
-                    if v_ids: 
-                        kb_version_id = v_ids[0]
+        def pct(p: float) -> float | None:
+            if not lat:
+                return None
+            k = max(0, min(len(lat) - 1, int(round((p / 100.0) * (len(lat) - 1)))))
+            return round(lat[k], 1)
 
-                if not chunk_ids:
-                    chunk_ids = []
-                    for e in events_snapshot:
-                        if e.get("type") == "retrieval":
-                            cid = e.get("top_chunk_id")
-                            if cid and cid not in chunk_ids:
-                                chunk_ids.append(cid)
-
-                if not confidence_scores:
-                    confidence_scores = [e.get("confidence_score") for e in events_snapshot 
-                                        if e.get("type") == "brain" and "confidence_score" in e]
-
-            # Latency Metrics Summary
-            def get_lat_stats(e_type, e_name):
-                lats = [e["latency_ms"] for e in events_snapshot 
-                        if e.get("type") == e_type and e.get("event") == e_name and "latency_ms" in e]
-                return self._calculate_percentiles(lats)
-
-            log_data = {
-                "call_id": self.call_id,
-                "kb_version_id": kb_version_id,
-                "chunk_ids": chunk_ids,
-                "confidence_scores": confidence_scores,
-                "sentiment_label": sentiment,
-                "termination_reason": termination_reason,
-                "latency_metrics": {
-                    "llm": get_lat_stats("orchestrator", "llm_response_start"),
-                    "stt": get_lat_stats("stt", "user_transcript_final"),
-                    "rag": get_lat_stats("retrieval", "rag_search_latency"),
-                    "tts": get_lat_stats("tts", "audio_stream_start")
-                },
-                "caller_number": self.caller_number,
-                "start_time": self.start_time.isoformat(),
-                "end_time": end_time.isoformat(),
-                "duration_seconds": duration,
-                "status": self.status,
-                "structured_turns": [t.dict() if hasattr(t, 'dict') else t for t in structured_turns],
-                "events": events_snapshot
-            }
-            
-            # 5. SYNC TO S3 (CRITICAL-P3-01)
-            from utils.s3_storage import S3Storage
-            s3 = S3Storage()
-            
-            # Upload Events File
-            if os.path.exists(self.events_file):
-                s3.upload_file(self.events_file, f"events/{os.path.basename(self.events_file)}")
-                
-            # Upload Summary File
-            summary_file = os.path.join(self.log_dir, "call_summary.log")
-            if os.path.exists(summary_file):
-                # We don't delete the aggregate summary file yet, or we rename it per call
-                s3_summary_key = f"summaries/{self.call_id}_summary.log"
-                # For aggregate logs, we might just want to copy or upload a snapshot
-                s3.upload_file(summary_file, s3_summary_key, delete_local=False)
-
-            logger.info(f"Audit trace for {self.call_id} synced to S3.")
-            # File path for the final sealed log
-            log_file = os.path.join(self.log_dir, f"call_{self.call_id}.json")
-
-            # Atomic Write Pattern: Write to temp, then rename
-            temp_file = log_file + ".tmp"
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(log_data, f, indent=2)
-            
-            # Atomic rename (Post-hoc seal)
-            if os.path.exists(log_file):
-                os.remove(log_file) # Should not exist due to single-write rule
-            os.rename(temp_file, log_file)
-            
-            logger.info(f"Call log sealed and saved: {log_file}")
-
-            # Optional: Remove the event stream if the final log is successfully sealed
-            try:
-                if os.path.exists(self.events_file):
-                    os.remove(self.events_file)
-            except Exception as clean_err:
-                 logger.debug(f"Could not remove event stream: {clean_err}")
-
-        except Exception as e:
-            self._final_log_written = False # Reset flag if write fails so we can retry during cleanup
-            logger.error(f"Failed to save call log for {self.call_id}: {e}")
-        except Exception as e:
-            logger.error(f"Failed to save call log for {self.call_id}: {e}")
+        return {
+            "call_id": self.call_id,
+            "caller": self._caller_masked,
+            "started_at": self._started_at,
+            "ended_at": _now_iso(),
+            "duration_s": duration_s,
+            "user_turns": self._user_turns,
+            "bot_turns": self._bot_turns,
+            "governance": {
+                "language_strikes": self._lang_strikes,
+                "topic_refusals": self._topic_refusals,
+            },
+            "latency_ms": {
+                "count": len(lat),
+                "p50": pct(50),
+                "p90": pct(90),
+                "p95": pct(95),
+                "p99": pct(99),
+                "avg": round(statistics.mean(lat), 1) if lat else None,
+                "max": round(max(lat), 1) if lat else None,
+            },
+        }

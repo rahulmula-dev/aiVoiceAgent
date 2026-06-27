@@ -1,144 +1,63 @@
-# Orchestrator Factory - Provider Instantiation Layer
 """
-Factory pattern to decouple telephony from concrete STT/TTS implementations.
-This allows the telephony layer to remain agnostic to specific providers.
+orchestrator/factory.py — VoiceOrchestrator factory + connection pool + concurrency gate lifecycle.
+
+Singletons held here (one per server process):
+  _pools  — pre-warmed Deepgram + ElevenLabs connections (Step 6)
+  _gate   — Redis Lua-CAS concurrency gate (Step 9, optional)
+
+Lifecycle:
+  1. run_server.py calls await warmup_pools() then await init_gate() before uvicorn starts.
+  2. create_default_orchestrator() is called per incoming call by the WS route.
+  3. The /voice HTTP route calls get_gate() directly for the concurrency check
+     (before a WS is even opened, so the gate must be accessible here).
 """
 
-from stt.transcriber import Transcriber
-from tts.synthesizer import Synthesizer
-from orchestrator.manager import VoiceOrchestrator
-from orchestrator.session_manager import SessionManager
-from agent_logging import CallLogger
-from typing import Optional, Any
-import logging
-import random
-import asyncio
+import config
+from utils.connection_pool import ConnectionPools
+from utils.redis_gate import ConcurrencyGate
+from .manager import VoiceOrchestrator
 
-logger = logging.getLogger("OrchestratorFactory")
+_pools: ConnectionPools | None = None
+_gate:  ConcurrencyGate | None = None
 
-async def create_default_orchestrator(
-    session_id: str,
-    call_logger: Optional[CallLogger] = None, 
-    session_manager: Optional[SessionManager] = None,
-    websocket: Optional[any] = None,
-    session_metadata: Optional[dict] = None
-) -> VoiceOrchestrator:
+
+async def warmup_pools() -> None:
     """
-    Factory method to create a VoiceOrchestrator with pre-warmed pool providers.
-    
-    Args:
-        call_logger: Optional CallLogger instance for call event tracking
-        session_manager: Optional shared SessionManager
-        
-    Returns:
-        VoiceOrchestrator: Fully configured orchestrator with default providers
-        
-    Example:
-        >>> manager = await create_default_orchestrator(call_logger)
-        >>> await manager.handle_audio_stream(websocket)
+    Open pre-warmed STT WebSocket connections and fire a TTS warmup request.
+    Must be awaited before uvicorn.Server.serve().
     """
-    import os
-    from stt.stt_pool import stt_pool, PooledTranscriber
-    from tts.elevenlabs_pool import elevenlabs_pool, PooledTTSEngine
+    global _pools
+    _pools = ConnectionPools(stt_size=2)
+    await _pools.warmup()
 
-    # 1. Acquire STT (Deepgram Websockets)
-    # [PRD §5] Increased from 0.5s to 2.0s to allow for health-checks and one retry cycle.
-    stt_timeout = 2.0 
+
+async def init_gate() -> None:
+    """
+    Connect to Redis and initialise the concurrency gate singleton.
+
+    No-ops silently when CONCURRENCY_GATE_ENABLED=false (default) so the
+    server starts cleanly without Redis. On any connection error the gate
+    is left as None and the /voice route skips the cap check entirely.
+    """
+    global _gate
+    if not config.CONCURRENCY_GATE_ENABLED:
+        return
     try:
-        raw_stt = await stt_pool.acquire(timeout=stt_timeout)
+        import redis.asyncio as aioredis
+        client = aioredis.from_url(config.REDIS_URL, decode_responses=True)
+        await client.ping()
+        _gate = ConcurrencyGate(client, max_calls=config.MAX_CONCURRENT_CALLS)
+        print(f"[GATE] Concurrency gate ready — max {config.MAX_CONCURRENT_CALLS} concurrent calls")
     except Exception as e:
-        logger.warning(f"STT Pool Acquisition Failed: {e}. Falling back to fresh connection (Latency risk).")
-        # Safety Valve: Jitter to prevent "Thundering Herd" (CRITICAL-WS-01)
-        await asyncio.sleep(random.uniform(0.1, 0.5))
-        
-        from stt.stt_pool import create_transcriber
-        try:
-            # CTO Polish: Longer timeout for fresh fallback attempt (Hail Mary)
-            raw_stt = await asyncio.wait_for(create_transcriber(), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.error("STT Fallback (Fresh Connection) timed out after 5.0s.")
-            raise e
-        except Exception as fe:
-            logger.error(f"STT Fallback failed: {fe}")
-            raise e
-    logger.info("Orchestrator Factory: STT provider ready")
-    stt_provider = PooledTranscriber(stt_pool, raw_stt)
-    
-    # Pillar 2: Residency Guard - ensure provider knows the session context
-    if hasattr(raw_stt, 'session_metadata'):
-        raw_stt.session_metadata = session_metadata or {}
-
-    # 2. Acquire TTS
-    tts_provider_name = os.getenv("TTS_PROVIDER", "deepgram").lower()
-    if tts_provider_name == "elevenlabs":
-        # Relaxed from 300ms to 1.5s to allow for retry logic in the pool
-        tts_timeout = 1.5 
-        try:
-            raw_tts = await elevenlabs_pool.acquire(timeout=tts_timeout)
-        except Exception as e:
-            # WS-02: CRM Fallback & Soft Landing (CRITICAL Audit Point)
-            logger.error(f"TTS Pool Exhausted: {e}. Triggering CRM Ticket & Fallback Audio.")
-            from crm.client import CRMClient
-            crm_client = CRMClient()
-            asyncio.create_task(crm_client.create_ticket(
-                title="Dropped Call - Resource Exhaustion",
-                description=f"TTS Pool Exhaustion for session {session_id}. Error: {e}",
-                priority="HIGH"
-            ))
-            
-            # trigger a play_fallback_audio (or equivalent) before the exception is raised
-            if websocket:
-                temp_synth = Synthesizer()
-                await temp_synth.play_fallback_audio(websocket)
-            
-            # If TTS checkout fails, release STT back to pool
-            await stt_provider.close()
-            raise e
-        tts_provider = PooledTTSEngine(elevenlabs_pool, raw_tts)
-    else:
-        # Default testing path via Deepgram HTTP Sync Limit upgraded
-        tts_provider = Synthesizer()
-    
-    # Return configured orchestrator with dependency injection
-    return VoiceOrchestrator(
-        stt_provider=stt_provider,
-        tts_provider=tts_provider,
-        call_logger=call_logger,
-        session_manager=session_manager
-    )
+        print(f"[GATE] Redis init failed ({type(e).__name__}: {e}) — gate disabled, all calls admitted")
+        _gate = None
 
 
-def create_custom_orchestrator(
-    stt_provider_class,
-    tts_provider_class,
-    call_logger: Optional[CallLogger] = None,
-    **provider_kwargs
-) -> VoiceOrchestrator:
-    """
-    Factory method for creating an orchestrator with custom providers.
-    
-    This enables easy swapping of STT/TTS providers without modifying
-    the telephony or orchestrator layers.
-    
-    Args:
-        stt_provider_class: Class implementing STTProvider interface
-        tts_provider_class: Class implementing TTSProvider interface
-        call_logger: Optional CallLogger instance
-        **provider_kwargs: Additional kwargs to pass to provider constructors
-        
-    Returns:
-        VoiceOrchestrator: Configured orchestrator with custom providers
-        
-    Example:
-        >>> from external.google_stt import GoogleSTT
-        >>> from external.elevenlabs_tts import ElevenLabsTTS
-        >>> manager = create_custom_orchestrator(GoogleSTT, ElevenLabsTTS, call_logger)
-    """
-    stt = stt_provider_class(**provider_kwargs.get('stt_config', {}))
-    tts = tts_provider_class(**provider_kwargs.get('tts_config', {}))
-    
-    return VoiceOrchestrator(
-        stt_provider=stt,
-        tts_provider=tts,
-        call_logger=call_logger
-    )
+def get_gate() -> ConcurrencyGate | None:
+    """Return the active concurrency gate, or None if disabled / unavailable."""
+    return _gate
+
+
+async def create_default_orchestrator() -> VoiceOrchestrator:
+    """Return a fresh, fully wired VoiceOrchestrator ready to handle one call."""
+    return VoiceOrchestrator(pools=_pools)

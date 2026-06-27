@@ -1,62 +1,66 @@
--- Sprint 4 | Schema Version: 2.0
--- Initializes the PGVector database for the CILA Voice Agent
+-- db-init/01_schema.sql
+-- Executed automatically by the pgvector/pgvector:pg16 container on first boot
+-- (mounted to /docker-entrypoint-initdb.d/).
+-- The migrate_to_pgvector.py script handles table creation too (idempotently),
+-- so this file is a belt-and-suspenders init that ensures the schema exists
+-- even before the first migration run.
 
--- Enable extensions
+-- Enable required extensions
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Create dedicated RAG schema
+-- Isolate RAG tables under a dedicated schema
 CREATE SCHEMA IF NOT EXISTS rag;
+
+-- Set search_path for subsequent statements in this file
 SET search_path TO rag, public;
 
--- Documents table: tracks the source of each knowledge chunk
-CREATE TABLE IF NOT EXISTS documents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title TEXT,
-    source_uri TEXT,
-    doc_type TEXT,
+-- documents: one row per logical document / program
+CREATE TABLE IF NOT EXISTS rag.documents (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title       TEXT,
+    source_uri  TEXT,
+    doc_type    TEXT,
     ingested_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Chunks table: stores the actual text content
-CREATE TABLE IF NOT EXISTS chunks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    checksum TEXT UNIQUE,
-    source_id TEXT, -- M3: Preserves legacy Pinecone IDs for audit mapping
-    metadata JSONB
+-- chunks: raw text with SHA-256 checksum for deduplication
+CREATE TABLE IF NOT EXISTS rag.chunks (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID REFERENCES rag.documents(id) ON DELETE CASCADE,
+    content     TEXT,
+    checksum    TEXT UNIQUE,
+    source_id   TEXT,
+    metadata    JSONB
 );
 
--- Embeddings table: stores 1536-dim vectors (AWS Bedrock Titan v2 / local mock)
--- CRITICAL: vector(1536) — NOT 3072 (which was Pinecone's legacy dimension)
-CREATE TABLE IF NOT EXISTS embeddings (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chunk_id UUID REFERENCES chunks(id) ON DELETE CASCADE,
-    embedding vector(1536) NOT NULL,
+-- embeddings: vector(1536) stored separately to keep text queries lean
+CREATE TABLE IF NOT EXISTS rag.embeddings (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chunk_id      UUID REFERENCES rag.chunks(id) ON DELETE CASCADE,
+    embedding     vector(1536),
     model_version TEXT DEFAULT 'titan-v2'
 );
 
--- Governance metadata: tracks sensitivity, verification, and audit trails per chunk (H2 Compliance)
-CREATE TABLE IF NOT EXISTS governance_metadata (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    chunk_id UUID REFERENCES chunks(id) ON DELETE CASCADE,
-    sensitivity_level TEXT DEFAULT 'public',
-    is_sensitive_topic BOOLEAN DEFAULT FALSE,
-    topic_tags TEXT[],
-    kb_version_id TEXT DEFAULT 'v1.1',
-    hard_refusal_category TEXT,
-    is_dynamic_field BOOLEAN DEFAULT FALSE,
-    is_policy_locked BOOLEAN DEFAULT FALSE,
+-- governance_metadata: sensitivity, hard-refusal tags, QA/compliance fields
+CREATE TABLE IF NOT EXISTS rag.governance_metadata (
+    id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chunk_id                    UUID REFERENCES rag.chunks(id) ON DELETE CASCADE,
+    sensitivity_level           TEXT DEFAULT 'public',
+    is_sensitive_topic          BOOLEAN DEFAULT FALSE,
+    topic_tags                  TEXT[],
+    kb_version_id               TEXT DEFAULT 'v1.1',
+    hard_refusal_category       TEXT,
+    is_dynamic_field            BOOLEAN DEFAULT FALSE,
+    is_policy_locked            BOOLEAN DEFAULT FALSE,
     requires_human_verification BOOLEAN DEFAULT FALSE,
-    confidence_score DOUBLE PRECISION DEFAULT 1.0,
-    chunk_confidence_score DOUBLE PRECISION DEFAULT 1.0
+    confidence_score            DOUBLE PRECISION DEFAULT 1.0,
+    chunk_confidence_score      DOUBLE PRECISION DEFAULT 1.0
 );
 
--- HNSW Index for fast cosine similarity search
--- m=32 and ef_construction=128 are tuned for the current data size
-CREATE INDEX IF NOT EXISTS idx_hnsw_embeddings
-    ON embeddings USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 32, ef_construction = 128);
+-- HNSW index built by the migration script after data is loaded
+-- (pre-declaring here as a no-op if migration hasn't run yet)
+-- CREATE INDEX IF NOT EXISTS idx_hnsw_embeddings
+--     ON rag.embeddings USING hnsw (embedding vector_cosine_ops)
+--     WITH (m = 32, ef_construction = 128);
